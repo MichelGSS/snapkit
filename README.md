@@ -13,7 +13,6 @@
 
 <p align="center">
   <a href="https://github.com/MichelGSS/snapkit/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/MichelGSS/snapkit?style=flat-square&color=FF8A4C&label=release"></a>
-  <a href="https://github.com/MichelGSS/snapkit/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/MichelGSS/snapkit/total?style=flat-square&color=FF8A4C"></a>
   <a href="https://github.com/MichelGSS/snapkit/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/MichelGSS/snapkit/ci.yml?branch=main&style=flat-square&label=CI"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2F81F7?style=flat-square"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square">
