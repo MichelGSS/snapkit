@@ -1,0 +1,24 @@
+# Builds and tests on every push. The tests that depend on the vendor\ binaries (Tesseract,
+# neural models, FFmpeg) skip themselves when the CI variable is set, which GitHub Actions
+# does by default.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked

@@ -1,0 +1,54 @@
+name: Bug report
+description: Something in SnapKit doesn't work as expected.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem. Please search the existing issues first.
+        Remember to hide any private information in screenshots you attach.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What were you doing, what did you expect, and what happened instead?
+      placeholder: |
+        1. Pressed Alt+Shift+S
+        2. Dragged over an area on my second monitor
+        3. Expected… but…
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: SnapKit version
+      description: Shown in the installer file name, or in Settings > Apps > Installed apps.
+      placeholder: 0.5.2
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: input
+    id: monitors
+    attributes:
+      label: Monitors and scaling
+      description: How many monitors, and the scaling of each one (Settings > System > Display).
+      placeholder: "2 monitors: 2560×1440 at 125%, 1920×1080 at 100%"
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package
+      options:
+        - Installer
+        - Portable zip
+        - Built from source
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or recordings
+      description: Drag images or videos here, if they help.

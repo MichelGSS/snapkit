@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest an idea that would make SnapKit more useful.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        SnapKit is 100% local: features that need a server or an account don't fit the project.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the task or the problem, not only the solution.
+      placeholder: When I document a web app, I have to…
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would help?
+      description: How do you imagine SnapKit could help with it?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: How do you do it today?
+      description: Any workaround or other tool you use for this now.

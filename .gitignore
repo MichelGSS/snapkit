@@ -1,0 +1,7 @@
+/target
+
+# Third-party binaries (Tesseract, OCR models, FFmpeg): rebuilt by scripts/fetch-*.ps1
+/vendor/
+
+# Packages built by scripts/package.ps1
+/dist/

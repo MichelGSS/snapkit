@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: User guide
+    url: https://github.com/MichelGSS/snapkit/blob/main/docs/README.md
+    about: Tutorials, how-to guides and reference for SnapKit.
+  - name: Report a security vulnerability
+    url: https://github.com/MichelGSS/snapkit/security/advisories/new
+    about: Please report security problems privately, not in a public issue.
