@@ -397,6 +397,8 @@ const LIVE_PIXELS: u64 = 12_000_000;
 pub struct Editor {
     history: History,
     texture: TextureHandle,
+    /// Largest texture side the graphics card accepts (see [`texture_image`]).
+    max_texture: usize,
     /// Accent color of the current theme (outlines and control points).
     accent: Color32,
     tool: Tool,
@@ -453,10 +455,12 @@ const ZOOM_STEP: f32 = 1.25;
 
 impl Editor {
     pub fn new(ctx: &egui::Context, image: RgbaImage, accent: Color32) -> Self {
-        let texture = ctx.load_texture("editing", to_color_image(&image), TextureOptions::LINEAR);
+        let max_texture = ctx.input(|i| i.max_texture_side);
+        let texture = ctx.load_texture("editing", texture_image(&image, max_texture), TextureOptions::LINEAR);
         Self {
             history: History::new(image, default_font()),
             texture,
+            max_texture,
             accent,
             tool: Tool::Arrow,
             color: PALETTE[0],
@@ -558,7 +562,7 @@ impl Editor {
 
     /// Every change to the image goes through here.
     fn refresh_texture(&mut self) {
-        self.texture.set(to_color_image(self.history.image()), TextureOptions::LINEAR);
+        self.texture.set(texture_image(self.history.image(), self.max_texture), TextureOptions::LINEAR);
         self.revision += 1;
         self.changed_at = std::time::Instant::now();
     }
@@ -1694,9 +1698,35 @@ fn to_color_image(img: &RgbaImage) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
 }
 
+/// The image as a texture for the screen. Graphics cards accept textures only up to a size per
+/// side (16 384 or 32 768 px, depending on the card), and a larger one stops the program, which
+/// a long scrolling capture can reach. A larger image is shown reduced; the image itself, and
+/// everything copied or saved from it, keeps its full size.
+pub fn texture_image(img: &RgbaImage, max_side: usize) -> egui::ColorImage {
+    let max = max_side.clamp(1, u32::MAX as usize) as u32;
+    let (w, h) = img.dimensions();
+    if w <= max && h <= max {
+        return to_color_image(img);
+    }
+    let scale = max as f64 / w.max(h) as f64;
+    let fit = |side: u32| ((side as f64 * scale).floor() as u32).clamp(1, max);
+    to_color_image(&image::imageops::resize(img, fit(w), fit(h), image::imageops::FilterType::Triangle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn textures_never_exceed_the_cards_limit() {
+        let tall = RgbaImage::new(400, 33_000);
+        let tex = texture_image(&tall, 16_384);
+        assert!(tex.size[0] <= 16_384 && tex.size[1] <= 16_384, "{:?}", tex.size);
+        assert_eq!(tex.size[1], 16_384, "the long side fills the limit");
+        assert_eq!(tex.size[0], 198, "the proportions are kept");
+        let small = RgbaImage::new(800, 600);
+        assert_eq!(texture_image(&small, 16_384).size, [800, 600], "small images are untouched");
+    }
 
     const RED: Rgba = [255, 0, 0, 255];
     const WHITE: [u8; 4] = [255, 255, 255, 255];

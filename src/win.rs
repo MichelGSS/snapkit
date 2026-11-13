@@ -29,8 +29,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, EnumWindows, GetCursorInfo, GetCursorPos,
     GetIconInfo, GetWindowRect, ICONINFO, IsIconic, IsWindowVisible, SW_HIDE, SW_MINIMIZE,
     SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-    SetWindowPos, ShowWindow,
+    SetWindowPos, ShowWindow, MB_ICONERROR, MB_OK, MessageBoxW,
 };
+
+/// Shows a blocking error message. SnapKit has no console, so this is how it reports a failure
+/// to start.
+pub fn error_box(title: &str, text: &str) {
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let (title, text) = (wide(title), wide(text));
+    // SAFETY: both strings are null-terminated and outlive the call.
+    unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR) };
+}
 
 /// Rectangle in pixels: (left, top, right, bottom).
 pub type PxRect = (i32, i32, i32, i32);
@@ -285,6 +294,139 @@ pub fn show(hwnd: isize) {
             ShowWindow(h, SW_RESTORE);
         }
         SetForegroundWindow(h);
+    }
+}
+
+/// Marks the window as a tool window (or back to a normal one). During the selection the window
+/// covers every monitor; as a normal window, browsers take it for one that hides them and stop
+/// drawing the page, so videos pause. Tool windows don't count, and they also stay out of the
+/// taskbar and Alt+Tab while the layer is up.
+pub fn set_tool_window(hwnd: isize, on: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOMOVE, SetWindowLongPtrW, WS_EX_APPWINDOW,
+        WS_EX_TOOLWINDOW,
+    };
+    let h = hwnd as HWND;
+    // SAFETY: handle of our main window; only its extended style bits change.
+    unsafe {
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        let (tool, app) = (WS_EX_TOOLWINDOW as isize, WS_EX_APPWINDOW as isize);
+        let want = if on { (ex | tool) & !app } else { (ex & !tool) | app };
+        if want != ex {
+            SetWindowLongPtrW(h, GWL_EXSTYLE, want);
+            SetWindowPos(h, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+    }
+}
+
+/// Makes `child` end together with SnapKit. Windows doesn't do this by itself: if SnapKit
+/// closes during a recording (Quit in the tray, or a crash), FFmpeg would go on recording the
+/// screen in the background. The child joins a job that is closed, and its processes ended,
+/// when SnapKit's process ends.
+pub fn end_with_us(child: &std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    // One job for the whole run; its handle is never closed, so it closes when SnapKit exits.
+    static JOB: OnceLock<usize> = OnceLock::new();
+    // SAFETY: `info` is fully initialized (zeros plus the flag) and outlives the call.
+    let job = *JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return 0;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const info).cast(), size);
+        job as usize
+    });
+    if job != 0 {
+        // SAFETY: both handles are valid; the child's lives as long as `child`.
+        unsafe { AssignProcessToJobObject(job as _, child.as_raw_handle() as _) };
+    }
+}
+
+/// What a second copy of SnapKit asks the one already running to do.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InstanceRequest {
+    /// Show its window.
+    Show,
+    /// Start a region capture.
+    Select,
+}
+
+/// The right to be the only SnapKit running with these preferences, plus the two signals that a
+/// second copy uses to talk to it.
+pub struct Instance {
+    show: usize,
+    select: usize,
+}
+
+fn instance_names(key: &str) -> [Vec<u16>; 3] {
+    let wide = |s: String| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    [
+        wide(format!("Local\\SnapKit-{key}")),
+        wide(format!("Local\\SnapKit-{key}-show")),
+        wide(format!("Local\\SnapKit-{key}-select")),
+    ]
+}
+
+impl Instance {
+    /// Becomes the running copy, or returns `None` if another one already is.
+    pub fn claim(key: &str) -> Option<Self> {
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+        use windows_sys::Win32::System::Threading::{CreateEventW, CreateMutexW};
+        let [mutex, show, select] = instance_names(key);
+        // SAFETY: the names are null-terminated; the handles are kept for the whole run, on
+        // purpose (the mutex marks this copy as the running one until it exits).
+        unsafe {
+            let m = CreateMutexW(std::ptr::null(), 0, mutex.as_ptr());
+            if m.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
+                return None;
+            }
+            let show = CreateEventW(std::ptr::null(), 0, 0, show.as_ptr()) as usize;
+            let select = CreateEventW(std::ptr::null(), 0, 0, select.as_ptr()) as usize;
+            Some(Self { show, select })
+        }
+    }
+
+    /// Waits for the next request from a second copy.
+    pub fn wait(&self) -> Option<InstanceRequest> {
+        use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
+        let handles = [self.show as _, self.select as _];
+        // SAFETY: two valid event handles, owned by `self`.
+        match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) } {
+            0 => Some(InstanceRequest::Show),
+            1 => Some(InstanceRequest::Select),
+            _ => None,
+        }
+    }
+
+    /// From a second copy: passes the request on to the running one. Returns `false` if it
+    /// couldn't be reached.
+    pub fn send(key: &str, request: InstanceRequest) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+        let [_, show, select] = instance_names(key);
+        let name = if request == InstanceRequest::Show { show } else { select };
+        // The running copy may still be starting: it creates the signals right after the mutex.
+        for _ in 0..20 {
+            // SAFETY: the name is null-terminated; the handle is closed right after use.
+            unsafe {
+                let event = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+                if !event.is_null() {
+                    let ok = SetEvent(event) != 0;
+                    CloseHandle(event);
+                    return ok;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
     }
 }
 

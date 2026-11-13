@@ -21,7 +21,7 @@ mod win;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -100,10 +100,10 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
                 std::thread::sleep(Duration::from_secs(delay as u64));
             }
             let shot = if kind == CaptureKind::FullScreen {
-                capture::capture_monitor_at_cursor(hwnd, cursor)
+                guarded(|| capture::capture_monitor_at_cursor(hwnd, cursor))
             } else {
                 let all = win::virtual_screen();
-                capture::grab_virtual(all, cursor).map(|image| capture::Shot {
+                guarded(|| capture::grab_virtual(all, cursor)).map(|image| capture::Shot {
                     image,
                     windows: Vec::new(),
                     title,
@@ -314,6 +314,8 @@ struct App {
     settle: Option<Settle>,
     /// Open the save dialog as soon as the main window is back to normal.
     save_requested: bool,
+    /// Frames left before hiding the window, when SnapKit starts in the tray (`--minimized`).
+    hide_after_start: u8,
 }
 
 /// State of the small floating panel of the panoramic capture.
@@ -430,6 +432,7 @@ impl App {
 
         let hotkeys = GlobalHotKeyManager::new().ok();
         spawn_hotkey_listener(shared.clone(), cc.egui_ctx.clone());
+        spawn_instance_listener(shared.clone(), cc.egui_ctx.clone());
 
         let tray = {
             let (shared, ctx) = (shared.clone(), cc.egui_ctx.clone());
@@ -452,6 +455,10 @@ impl App {
             .ok()
         };
 
+        // The size it was created with, until the user moves or resizes it. Without it, a capture
+        // made before the window was ever shown (started in the tray) would leave it the size of
+        // every monitor.
+        let normal_rect = win::window_rect(shared.hwnd);
         let mut app = Self {
             shared,
             hotkey_draft: cfg.hotkey.clone(),
@@ -483,10 +490,11 @@ impl App {
             ocr_image: None,
             normal_size: None,
             normal_pos: None,
-            normal_rect: None,
+            normal_rect,
             restore_frames: 0,
             settle: None,
             save_requested: false,
+            hide_after_start: 0,
         };
         // `snapkit --select` opens straight into region selection (shortcuts and tests).
         if std::env::args().any(|a| a == "--select") {
@@ -496,6 +504,14 @@ impl App {
             Ok(()) => tf!("Pronto. Atalho global: {}", "Ready. Global shortcut: {}", app.cfg.hotkey.label()),
             Err(e) => tf!("Atalho {} indisponível: {e}", "Shortcut {} unavailable: {e}", app.cfg.hotkey.label()),
         };
+        // `--minimized` (Start with Windows): eframe shows the window after the first frame
+        // whatever was asked, so it's kept cloaked, invisible, and hidden right after that.
+        if std::env::args().any(|a| a == autostart::MINIMIZED_ARG) && app.shared.hwnd != 0 {
+            win::cloak(app.shared.hwnd, true);
+            app.hide_after_start = 2;
+            cc.egui_ctx.request_repaint();
+        }
+        RUNNING.store(true, Ordering::SeqCst);
         app
     }
 
@@ -694,7 +710,7 @@ impl App {
         self.ocr_image = Some(image.clone());
         let (pending, ctx) = (self.ocr_pending.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let result = ocr::recognize(&image, mode);
+            let result = guarded(|| ocr::recognize(&image, mode));
             *pending.lock().unwrap() = Some(result);
             ctx.request_repaint();
         });
@@ -782,7 +798,7 @@ impl App {
         }
         let image = editor.image().clone();
         let thumb = library::make_thumb(&image);
-        let texture = ctx.load_texture("thumbnail", to_color_image(&thumb), TextureOptions::LINEAR);
+        let texture = ctx.load_texture("thumbnail", editor::texture_image(&thumb, ctx.input(|i| i.max_texture_side)), TextureOptions::LINEAR);
         self.thumbs.insert(file.clone(), texture);
         self.library.set_size(file, image.width(), image.height());
         self.writer.save(&self.library, file, image, thumb);
@@ -829,7 +845,7 @@ impl App {
             .map(|i| i.to_rgba8())
             .or_else(|_| image::open(self.library.path(file)).map(|i| library::make_thumb(&i.to_rgba8())))
             .ok()?;
-        let texture = ctx.load_texture("thumbnail", to_color_image(&thumb), TextureOptions::LINEAR);
+        let texture = ctx.load_texture("thumbnail", editor::texture_image(&thumb, ctx.input(|i| i.max_texture_side)), TextureOptions::LINEAR);
         self.thumbs.insert(file.to_owned(), texture.clone());
         Some(texture)
     }
@@ -950,7 +966,7 @@ impl App {
         let image = editor.image().clone();
         let file = self.library.add(win::local_time(), title, image.width(), image.height());
         let thumb = library::make_thumb(&image);
-        let texture = ctx.load_texture("thumbnail", to_color_image(&thumb), TextureOptions::LINEAR);
+        let texture = ctx.load_texture("thumbnail", editor::texture_image(&thumb, ctx.input(|i| i.max_texture_side)), TextureOptions::LINEAR);
         self.thumbs.insert(file.clone(), texture);
         self.writer.save(&self.library, &file, image.clone(), thumb);
         self.current_file = Some(file);
@@ -992,7 +1008,7 @@ impl App {
             std::thread::sleep(Duration::from_millis(450));
             // Frame around the area while the scrolling happens.
             let frame = win::RegionFrame::show(rect);
-            let result = scroll::run(rect, direction);
+            let result = guarded(|| scroll::run(rect, direction));
             drop(frame);
             let result = result.map(|(image, note)| capture::Shot {
                 image,
@@ -1141,7 +1157,7 @@ impl App {
         self.status = format!("{label}…");
         let (pending, ctx) = (self.gif_pending.clone(), ctx.clone());
         std::thread::spawn(move || {
-            *pending.lock().unwrap() = Some(job());
+            *pending.lock().unwrap() = Some(guarded(job));
             ctx.request_repaint();
         });
     }
@@ -1399,6 +1415,7 @@ impl App {
         }
         self.shared.busy.store(false, Ordering::SeqCst);
         win::exclude_from_capture(self.shared.hwnd, false);
+        win::set_tool_window(self.shared.hwnd, false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
         // The frame comes back a few frames later; the rectangle is reapplied until then.
@@ -1419,7 +1436,7 @@ impl App {
                 win::minimize(shared.hwnd);
             }
             std::thread::sleep(Duration::from_secs(delay as u64));
-            let shot = capture::grab_virtual(rect, cursor).map(|image| capture::Shot {
+            let shot = guarded(|| capture::grab_virtual(rect, cursor)).map(|image| capture::Shot {
                 image,
                 windows: Vec::new(),
                 title,
@@ -1723,6 +1740,8 @@ impl App {
         // and the system can change its size in the meantime; that's why the check runs every
         // frame.
         let desktop = win::virtual_screen();
+        // Checked every frame: the system or winit can put the normal style back meanwhile.
+        win::set_tool_window(hwnd, true);
         let covering = win::window_rect(hwnd) == Some(desktop);
         if !covering {
             win::set_window_rect(hwnd, desktop);
@@ -2394,6 +2413,18 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.hide_after_start > 0 {
+            self.hide_after_start -= 1;
+            if self.hide_after_start == 0 {
+                win::hide(self.shared.hwnd);
+                win::cloak(self.shared.hwnd, false);
+            } else {
+                ctx.request_repaint();
+            }
+        }
+        if let Some(e) = self.writer.take_error() {
+            self.status = tf!("Não foi possível salvar na biblioteca: {e}", "Could not save to the library: {e}");
+        }
         if let Some((kind, title, was_on_screen)) = self.shared.select_request.lock().unwrap().take() {
             let hwnd = self.shared.hwnd;
             let windows = win::visible_windows(hwnd);
@@ -2481,6 +2512,31 @@ impl eframe::App for App {
     }
 }
 
+/// Listens for requests from a second copy of SnapKit (opened from the Start menu while this one
+/// is in the tray, for example) and carries them out here.
+fn spawn_instance_listener(shared: Arc<Shared>, ctx: egui::Context) {
+    let Some(instance) = INSTANCE.get() else { return };
+    std::thread::spawn(move || {
+        while let Some(request) = instance.wait() {
+            match request {
+                win::InstanceRequest::Show => {
+                    win::show(shared.hwnd);
+                    ctx.request_repaint();
+                }
+                win::InstanceRequest::Select => start_capture(CaptureKind::Region, shared.clone(), ctx.clone()),
+            }
+        }
+    });
+}
+
+/// Runs a background job. A panic becomes an error, so the job still reports back: otherwise
+/// SnapKit would stay "busy" (no more captures from the shortcut, or Read text disabled) until
+/// it's restarted. The panic itself is written to `error.log` by the hook set in `main`.
+fn guarded<T>(job: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+        .unwrap_or_else(|_| Err(t!("erro interno (detalhes em %APPDATA%\\SnapKit\\error.log)", "internal error (details in %APPDATA%\\SnapKit\\error.log)").to_owned()))
+}
+
 /// Listens for the global hotkey in the background and triggers the region capture.
 fn spawn_hotkey_listener(shared: Arc<Shared>, ctx: egui::Context) {
     std::thread::spawn(move || {
@@ -2502,13 +2558,6 @@ pub fn in_ci() -> bool {
 
 fn delay_label(secs: u32) -> String {
     if secs == 0 { t!("Sem atraso", "No delay").to_owned() } else { tf!("Atraso {secs} s", "Delay {secs} s") }
-}
-
-fn to_color_image(img: &RgbaImage) -> egui::ColorImage {
-    egui::ColorImage::from_rgba_unmultiplied(
-        [img.width() as usize, img.height() as usize],
-        img.as_raw(),
-    )
 }
 
 fn copy_to_clipboard(img: &RgbaImage) -> Result<(), String> {
@@ -2561,8 +2610,40 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
-    legacy::migrate();
+    // Without a console, a crash at startup would otherwise just look like "it doesn't open".
+    std::panic::set_hook(Box::new(|info| {
+        let detail = info.to_string();
+        log_error(&detail);
+        if std::thread::current().name() == Some("main") {
+            fatal_box(&detail);
+        }
+    }));
+
     let start_hidden = args.iter().any(|a| a == autostart::MINIMIZED_ARG);
+    // Only one SnapKit per set of preferences. A second copy (from the Start menu while this one
+    // is in the tray, say) would fight over the shortcut and the library index; it passes its
+    // request on and leaves.
+    let key = instance_key();
+    match win::Instance::claim(&key) {
+        Some(instance) => {
+            let _ = INSTANCE.set(instance);
+        }
+        None => {
+            let request = if args.iter().any(|a| a == "--select") {
+                Some(win::InstanceRequest::Select)
+            } else if start_hidden {
+                None
+            } else {
+                Some(win::InstanceRequest::Show)
+            };
+            if let Some(request) = request {
+                win::Instance::send(&key, request);
+            }
+            return Ok(());
+        }
+    }
+
+    legacy::migrate();
     let icon = egui::IconData { rgba: tray::icon_rgba(64), width: 64, height: 64 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -2577,5 +2658,71 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    let result = eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(App::new(cc)))));
+    if let Err(e) = &result {
+        // Usually the graphics driver: the window needs OpenGL 2 or later.
+        let detail = format!("{e}");
+        log_error(&detail);
+        fatal_box(&detail);
+    }
+    result
+}
+
+/// This copy's claim to be the only SnapKit running (see `main`).
+static INSTANCE: OnceLock<win::Instance> = OnceLock::new();
+
+/// Set once the interface is up: from then on, a fatal error isn't a failure to start.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Identifies the preferences in use (`%APPDATA%`), so that a separate profile, such as the one
+/// used for the documentation screenshots, can run alongside. A fixed hash (FNV-1a), the same in
+/// every version, so an old and a new SnapKit still recognize each other.
+fn instance_key() -> String {
+    let dir = std::env::var("APPDATA").unwrap_or_default().to_lowercase();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in dir.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Appends a line to `%APPDATA%\SnapKit\error.log`, so a failure can be reported later.
+fn log_error(detail: &str) {
+    use std::io::Write;
+    let Some(dir) = std::env::var_os("APPDATA").map(|d| std::path::PathBuf::from(d).join("SnapKit")) else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("error.log")) {
+        let (y, mo, d, h, mi, s) = win::local_time();
+        let _ = writeln!(f, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} SnapKit {}: {detail}", env!("CARGO_PKG_VERSION"));
+    }
+}
+
+/// Tells the user SnapKit couldn't start, or has to close. In both languages, because the
+/// preference may not be loaded yet.
+fn fatal_box(detail: &str) {
+    let text = if RUNNING.load(Ordering::SeqCst) {
+        format!(
+            "SnapKit ran into an error and has to close.\n\
+             Your captures are in the library. If this keeps happening, please report it with the \
+             file below.\n\n\
+             O SnapKit encontrou um erro e precisa fechar.\n\
+             Suas capturas estão na biblioteca. Se isso se repetir, informe o problema junto com o \
+             arquivo abaixo.\n\n\
+             {detail}\n\n\
+             Details / Detalhes: %APPDATA%\\SnapKit\\error.log"
+        )
+    } else {
+        format!(
+            "SnapKit could not start.\n\
+             If this keeps happening, update your graphics driver and install the latest \
+             Microsoft Visual C++ Redistributable (x64).\n\n\
+             O SnapKit não conseguiu iniciar.\n\
+             Se isso se repetir, atualize o driver de vídeo e instale o Microsoft Visual C++ \
+             Redistributable (x64) mais recente.\n\n\
+             {detail}\n\n\
+             Details / Detalhes: %APPDATA%\\SnapKit\\error.log"
+        )
+    };
+    win::error_box(APP_NAME, &text);
 }

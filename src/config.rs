@@ -113,16 +113,29 @@ impl Config {
         Some(PathBuf::from(std::env::var_os("APPDATA")?).join("SnapKit").join("config.json"))
     }
 
-    /// Loads the preferences; a missing or invalid file becomes the default.
+    /// Loads the preferences; a missing file becomes the default. A file that can't be read is
+    /// moved aside to `config.json.bad` first, so the next save doesn't destroy the styles in it.
     pub fn load() -> Self {
-        Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|text| Self::parse(&text))
-            .unwrap_or_default()
+        let Some(path) = Self::path() else { return Self::default() };
+        let Ok(text) = std::fs::read_to_string(&path) else { return Self::default() };
+        match Self::try_parse(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let _ = std::fs::rename(&path, path.with_extension("json.bad"));
+                crate::log_error(&format!("config.json could not be read ({e}); it was kept as config.json.bad"));
+                Self::default()
+            }
+        }
     }
 
+    fn try_parse(text: &str) -> Result<Self, serde_json::Error> {
+        // Notepad and PowerShell may save with a byte order mark, which JSON doesn't allow.
+        serde_json::from_str(text.trim_start_matches('\u{feff}'))
+    }
+
+    #[cfg(test)]
     fn parse(text: &str) -> Self {
-        serde_json::from_str(text).unwrap_or_default()
+        Self::try_parse(text).unwrap_or_default()
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -131,8 +144,18 @@ impl Config {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, text).map_err(|e| e.to_string())
+        write_atomic(&path, text.as_bytes()).map_err(|e| e.to_string())
     }
+}
+
+/// Writes the whole file or nothing: first to a temporary file beside it, then renamed over the
+/// old one. A write cut short (SnapKit closed or the computer turned off in the middle) leaves
+/// the old file intact instead of half a file.
+pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -175,6 +198,26 @@ mod tests {
         assert_eq!(partial.hotkey.key, "X");
         assert!(partial.hotkey.alt, "missing fields use the default");
         assert!(partial.close_to_tray);
+    }
+
+    #[test]
+    fn a_byte_order_mark_doesnt_reset_the_preferences() {
+        let mut c = Config::default();
+        c.include_cursor = true;
+        let text = format!("\u{feff}{}", serde_json::to_string(&c).unwrap());
+        assert_eq!(Config::try_parse(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_file_and_leaves_no_temporary() {
+        let dir = std::env::temp_dir().join(format!("snapkit-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.json");
+        write_atomic(&file, b"one").unwrap();
+        write_atomic(&file, b"two").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "two");
+        assert!(!dir.join("a.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

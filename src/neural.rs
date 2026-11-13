@@ -9,6 +9,10 @@
 //!    model, which returns a sequence of characters.
 //!
 //! The models are in the `ocr-neural` folder next to the executable (`det.onnx`, `rec.onnx`).
+//! ONNX Runtime itself is `onnxruntime\onnxruntime.dll`, loaded on the first read: it's
+//! Microsoft's official build, which chooses its code path for the processor at run time. A
+//! copy linked into the executable would run its start-up code before `main`, and the prebuilt
+//! static libraries need AVX2, so SnapKit wouldn't open on older processors.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -57,12 +61,39 @@ pub fn find_models() -> Option<PathBuf> {
     candidates.into_iter().find(|d| d.join("det.onnx").is_file() && d.join("rec.onnx").is_file())
 }
 
+/// `onnxruntime.dll`, if it exists. Always a full path: Windows has its own, older
+/// `onnxruntime.dll` in System32, which a bare file name could pick up.
+pub fn find_runtime() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::var_os("SNAPKIT_ONNXRUNTIME_DIR") {
+        candidates.push(PathBuf::from(dir));
+    }
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        candidates.push(exe_dir.join("onnxruntime"));
+    }
+    #[cfg(debug_assertions)]
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor").join("onnxruntime"));
+    candidates.into_iter().map(|d| d.join("onnxruntime.dll")).find(|f| f.is_file())
+}
+
+/// Loads ONNX Runtime and creates its environment.
+fn start_runtime() -> Result<Environment, String> {
+    let dll = find_runtime().ok_or_else(|| {
+        t!(
+            "motor neural não encontrado (pasta onnxruntime ao lado do snapkit.exe)",
+            "neural engine not found (the onnxruntime folder next to snapkit.exe)"
+        )
+        .to_owned()
+    })?;
+    ort::init_from(&dll).map_err(|e| e.to_string())?.build().map_err(|e| e.to_string())
+}
+
 /// Reads every line of text in the image.
 pub fn recognize(dir: &Path, img: &RgbaImage) -> Result<Vec<Line>, String> {
     let err = |e: ort::Error| tf!("falha no motor neural: {e}", "neural engine failure: {e}");
     // ONNX Runtime allows only one environment per process; it's created on the first read.
     static ENV: OnceLock<Result<Environment, String>> = OnceLock::new();
-    let env = ENV.get_or_init(|| ort::init().build().map_err(|e| e.to_string())).as_ref().map_err(String::clone)?;
+    let env = ENV.get_or_init(start_runtime).as_ref().map_err(String::clone)?;
     let mut det = Session::builder(env).map_err(err)?.commit_from_file(dir.join("det.onnx")).map_err(err)?;
     let mut rec = Session::builder(env).map_err(err)?.commit_from_file(dir.join("rec.onnx")).map_err(err)?;
     let alphabet = alphabet(&rec)?;
@@ -290,7 +321,8 @@ mod tests {
         assert_eq!(decode_ctc(&[0.0, 0.1, 0.9], 3, &alphabet), None, "only space");
     }
 
-    /// Uses the models in `vendor/ocr-neural`; run scripts/fetch-ocr-neural.ps1 if they're missing.
+    /// Uses the models in `vendor/ocr-neural` and the DLL in `vendor/onnxruntime`; run
+    /// scripts/fetch-ocr-neural.ps1 and scripts/fetch-onnxruntime.ps1 if they're missing.
     #[test]
     fn reads_rendered_text() {
         if crate::in_ci() {

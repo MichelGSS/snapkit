@@ -2,6 +2,27 @@
 
 All notable changes to SnapKit are listed here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.5.3] - 2026-11-13
+
+### Fixed
+
+- SnapKit didn't open on computers whose processor has no AVX2 (older processors, and many Pentium and Celeron models). The neural OCR runtime, ONNX Runtime, was built into `snapkit.exe` in a variant that needs AVX2. It's now Microsoft's official `onnxruntime.dll`, which works on any 64-bit processor and is loaded only when the neural engine is used: **Read as handwriting**, or **Read text** when Tesseract isn't available.
+- SnapKit didn't open on a Windows without the Visual C++ runtime. The packages now include it.
+- If SnapKit closed during a recording (**Quit** in the tray, or a crash), FFmpeg went on recording the screen in the background. It now ends together with SnapKit.
+- Opening a very tall image, such as a long scrolling capture, closed SnapKit when the image was taller than the graphics card's texture limit (16,384 or 32,768 pixels, depending on the card). The editor now shows it reduced; copies and saved files keep the full size.
+- Videos in Chrome, Edge and Firefox paused while a region was being selected: the browser took the selection layer for a window covering it. The layer no longer counts as one.
+- Opening SnapKit while it was already running (from the Start menu while it was in the tray, for example) started a second copy, with a second tray icon, no shortcut, and a library index that each copy saved over the other's. The second launch now brings up the copy already running, or starts a capture there with `--select`.
+- With **Start with Windows** (`--minimized`), the window opened instead of staying in the tray.
+- A capture taken before the window was ever shown left the window the size of every monitor afterwards.
+- A damaged or hand-edited `config.json` or `index.json` (cut short, or saved with a byte order mark) silently reset the preferences or emptied the library, and the next save made it permanent. Both files are now written in one step, a byte order mark is accepted, a file that can't be read is kept aside as `.bad`, and the library finds again the captures in its folder that its index lost.
+- A failure inside a background job (text recognition, scrolling capture, GIF) could leave SnapKit busy until restarted: no more captures from the shortcut, or **Read text** disabled. It's now reported as an error.
+- Captures that couldn't be saved to the library (a full disk, for example) failed without a word. The status bar now says so.
+- If SnapKit can't start, it now shows a message with the reason and writes it to `%APPDATA%\SnapKit\error.log`, instead of closing without a word. An error while it's running gets its own message.
+
+### Changed
+
+- `snapkit.exe` went from 46 MB to 25 MB, and it no longer depends on DirectML.
+
 ## [0.5.2] - 2026-11-12
 
 First public release.
@@ -34,4 +55,5 @@ First public release.
 - Nine color themes, a configurable global shortcut, tray icon and start with Windows.
 - Windows no longer flash on the screen when a capture starts or ends.
 
+[0.5.3]: https://github.com/MichelGSS/snapkit/releases/tag/v0.5.3
 [0.5.2]: https://github.com/MichelGSS/snapkit/releases/tag/v0.5.2

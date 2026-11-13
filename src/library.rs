@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
 
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
@@ -55,14 +56,51 @@ impl Library {
         home.join("Pictures").join("SnapKit")
     }
 
-    /// Opens the library, dropping from the index the entries whose file is gone.
+    /// Opens the library, dropping from the index the entries whose file is gone and adding the
+    /// captures in the folder that the index lost (a damaged index, or one saved over by another
+    /// copy of SnapKit). An index that can't be read is kept as `index.json.bad`.
     pub fn open(dir: PathBuf) -> Self {
-        let mut entries: Vec<Entry> = std::fs::read_to_string(dir.join(INDEX_FILE))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
+        let index = dir.join(INDEX_FILE);
+        let mut entries: Vec<Entry> = match std::fs::read_to_string(&index) {
+            Err(_) => Vec::new(),
+            Ok(text) => match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    let _ = std::fs::rename(&index, dir.join("index.json.bad"));
+                    crate::log_error(&format!("index.json could not be read ({e}); it was kept as index.json.bad"));
+                    Vec::new()
+                }
+            },
+        };
         entries.retain(|e| is_plain_file_name(&e.file) && dir.join(&e.file).is_file());
-        Self { dir, entries }
+        let mut library = Self { dir, entries };
+        if library.recover_lost_files() {
+            library.save_index();
+        }
+        library
+    }
+
+    /// Adds the captures in the folder that aren't in the index. Returns `true` if any was added.
+    fn recover_lost_files(&mut self) -> bool {
+        let Ok(files) = std::fs::read_dir(&self.dir) else { return false };
+        let mut lost: Vec<Entry> = files
+            .flatten()
+            .filter_map(|f| f.file_name().into_string().ok())
+            .filter(|name| capture_time(name).is_some() && !self.entries.iter().any(|e| &e.file == name))
+            .filter_map(|file| {
+                let (y, mo, d, h, mi) = capture_time(&file)?;
+                let (width, height) = image::image_dimensions(self.dir.join(&file)).ok()?;
+                let when = format!("{d}/{mo}/{y} {h}:{mi}");
+                Some(Entry { file, when, title: String::new(), width, height })
+            })
+            .collect();
+        if lost.is_empty() {
+            return false;
+        }
+        self.entries.append(&mut lost);
+        // The names are the capture time, so this is newest first, like the index.
+        self.entries.sort_by(|a, b| b.file.cmp(&a.file));
+        true
     }
 
     pub fn dir(&self) -> &Path {
@@ -124,9 +162,22 @@ impl Library {
     fn save_index(&self) {
         let _ = std::fs::create_dir_all(&self.dir);
         if let Ok(text) = serde_json::to_string_pretty(&self.entries) {
-            let _ = std::fs::write(self.dir.join(INDEX_FILE), text);
+            let _ = crate::config::write_atomic(&self.dir.join(INDEX_FILE), text.as_bytes());
         }
     }
+}
+
+/// Date and time in the name of a capture file (`2026-11-10_02-45-12.png`, or with `_2` for a
+/// second one in the same second), as text: year, month, day, hour, minute.
+fn capture_time(name: &str) -> Option<(&str, &str, &str, &str, &str)> {
+    let stem = name.strip_suffix(".png")?;
+    let (stamp, suffix) = stem.split_at_checked(19)?;
+    let b = stamp.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    let shape = digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10) && b[10] == b'_'
+        && digits(11..13) && b[13] == b'-' && digits(14..16) && b[16] == b'-' && digits(17..19);
+    let suffix_ok = suffix.is_empty() || suffix.strip_prefix('_').is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()));
+    (shape && suffix_ok).then(|| (&stamp[0..4], &stamp[5..7], &stamp[8..10], &stamp[11..13], &stamp[14..16]))
 }
 
 /// A tampered index must not point outside the library folder.
@@ -160,17 +211,28 @@ struct Job {
 /// capture is never overwritten by the earlier write.
 pub struct Writer {
     tx: Sender<Job>,
+    /// Last failure (a full disk, a folder without permission), for the interface to show.
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl Writer {
     pub fn spawn() -> Self {
         let (tx, rx) = channel::<Job>();
+        let error = Arc::new(Mutex::new(None));
+        let report = error.clone();
         std::thread::spawn(move || {
             for job in rx {
-                let _ = write_job(&job);
+                if let Err(e) = write_job(&job) {
+                    *report.lock().unwrap() = Some(format!("{}: {e}", job.path.display()));
+                }
             }
         });
-        Self { tx }
+        Self { tx, error }
+    }
+
+    /// The last failure to save, if there was one since the previous call.
+    pub fn take_error(&self) -> Option<String> {
+        self.error.lock().unwrap().take()
     }
 
     pub fn save(&self, library: &Library, file: &str, image: RgbaImage, thumb: RgbaImage) {
@@ -196,6 +258,36 @@ fn write_job(job: &Job) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_names_are_recognized() {
+        assert_eq!(capture_time("2026-11-10_02-45-12.png"), Some(("2026", "11", "10", "02", "45")));
+        assert!(capture_time("2026-11-10_02-45-12_2.png").is_some());
+        for other in ["holiday.png", "2026-11-10_02-45-12.jpg", "2026-11-10_02-45-12_.png", "2026-11-10_02-45-12_x.png", "index.json"] {
+            assert!(capture_time(other).is_none(), "{other}");
+        }
+    }
+
+    #[test]
+    fn captures_missing_from_the_index_come_back() {
+        let dir = std::env::temp_dir().join(format!("snapkit-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        RgbaImage::new(30, 20).save(dir.join("2026-11-10_02-45-12.png")).unwrap();
+        RgbaImage::new(40, 10).save(dir.join("2026-11-11_08-00-00.png")).unwrap();
+        RgbaImage::new(5, 5).save(dir.join("holiday.png")).unwrap();
+        // A damaged index: kept aside, and the captures are found again.
+        std::fs::write(dir.join(INDEX_FILE), b"[{\"file\": \"2026-11").unwrap();
+        let lib = Library::open(dir.clone());
+        let files: Vec<&str> = lib.search("").iter().map(|e| e.file.as_str()).collect();
+        assert_eq!(files, ["2026-11-11_08-00-00.png", "2026-11-10_02-45-12.png"], "newest first, no foreign files");
+        assert_eq!((lib.search("")[1].width, lib.search("")[1].height), (30, 20));
+        assert_eq!(lib.search("")[1].when, "10/11/2026 02:45");
+        assert!(dir.join("index.json.bad").is_file());
+        // The rebuilt index was saved and reads back the same.
+        assert_eq!(Library::open(dir.clone()).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const T1: LocalTime = (2026, 11, 10, 2, 45, 12);
 

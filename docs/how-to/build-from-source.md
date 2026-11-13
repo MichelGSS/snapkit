@@ -26,6 +26,7 @@ Text recognition and video recording use third-party programs that aren't stored
 |---|---|---|
 | OCR (Tesseract) | `scripts\fetch-tesseract.ps1` | winget, 7-Zip, Python with `pefile` |
 | Handwriting OCR (neural models) | `scripts\fetch-ocr-neural.ps1` | Python with pip |
+| Handwriting OCR (ONNX Runtime) | `scripts\fetch-onnxruntime.ps1` | Nothing else |
 | Video recording (FFmpeg) | `scripts\fetch-ffmpeg.ps1` | winget |
 
 Run each one from the repository root:
@@ -33,6 +34,7 @@ Run each one from the repository root:
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\fetch-tesseract.ps1
 powershell -ExecutionPolicy Bypass -File scripts\fetch-ocr-neural.ps1
+powershell -ExecutionPolicy Bypass -File scripts\fetch-onnxruntime.ps1
 powershell -ExecutionPolicy Bypass -File scripts\fetch-ffmpeg.ps1
 ```
 

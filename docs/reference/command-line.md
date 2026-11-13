@@ -9,6 +9,8 @@
 | `--select` | Opens straight into a region capture. |
 | `--test-capture <file.png>` | Captures the monitor under the pointer, including the pointer, saves it to `<file.png>` and exits without opening a window. The exit code is `0` on success and `1` on error. |
 
+Only one SnapKit runs at a time. Starting `snapkit.exe` again while it's running brings up the window of the copy already running; with `--select`, it starts a region capture there instead; with `--minimized`, it does nothing. Copies with different preferences folders (`%APPDATA%`) count as different.
+
 ## Examples
 
 Start a region capture from a desktop shortcut or a launcher:

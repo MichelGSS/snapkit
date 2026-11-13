@@ -1,5 +1,5 @@
 # Builds and tests on every push. The tests that depend on the vendor\ binaries (Tesseract,
-# neural models, FFmpeg) skip themselves when the CI variable is set, which GitHub Actions
+# neural models, ONNX Runtime, FFmpeg) skip themselves when the CI variable is set, which GitHub Actions
 # does by default.
 name: CI
 

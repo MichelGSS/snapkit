@@ -23,7 +23,7 @@ body:
     attributes:
       label: SnapKit version
       description: Shown in the installer file name, or in Settings > Apps > Installed apps.
-      placeholder: 0.5.2
+      placeholder: 0.5.3
     validations:
       required: true
   - type: input

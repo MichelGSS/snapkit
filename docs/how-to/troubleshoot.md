@@ -12,15 +12,21 @@ The installer isn't digitally signed yet. Select **More info**, and then select 
 
 ## SnapKit doesn't open, or opens with a black window
 
+If SnapKit can't start, it shows a **SnapKit could not start** message with the reason, and writes it to `%APPDATA%\SnapKit\error.log`. Include that file when you [report a bug](https://github.com/MichelGSS/snapkit/issues/new/choose).
+
 SnapKit draws its window with OpenGL, which it needs for the transparent capture overlay. Some remote desktop sessions and virtual machines don't provide OpenGL.
 
 - Update your graphics driver.
 - In a virtual machine, turn on 3D acceleration.
 - In a remote session, run SnapKit on the local computer instead.
 
+If Windows reports that `MSVCP140.dll` or `VCRUNTIME140.dll` is missing, files are missing from the SnapKit folder. Reinstall SnapKit or extract the full zip again, or install the latest [Microsoft Visual C++ Redistributable (x64)](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist).
+
 ## Text recognition isn't available
 
 If **Read text** reports that no OCR engine was found, the `tesseract` and `ocr-neural` folders are missing next to `snapkit.exe`. Reinstall SnapKit, or extract the full zip again. If you built SnapKit yourself, run the scripts in [Build SnapKit from source](build-from-source.md#add-ocr-and-video).
+
+If **Read as handwriting** reports that the **neural engine** wasn't found, the `onnxruntime` folder is missing. The same fix applies.
 
 ## Video recording isn't available
 

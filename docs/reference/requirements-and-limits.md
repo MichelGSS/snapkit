@@ -6,6 +6,7 @@
 |---|---|
 | Operating system | Windows 10 version 2004 (build 19041) or later, or Windows 11 |
 | Architecture | 64-bit (x64) |
+| Processor | Any 64-bit processor. No AVX2 needed. |
 | Graphics | OpenGL support (any current graphics driver). Needed for the transparent capture overlay. |
 | Disk space | About 200 MB for the program, plus your captures and recordings |
 | Permissions | A standard user account. No administrator rights needed. |
@@ -17,11 +18,11 @@
 |---|---|
 | Installer download | About 66 MB |
 | Portable zip download | About 85 MB |
-| `snapkit.exe` | About 46 MB, including the neural OCR runtime |
+| `snapkit.exe` | About 25 MB |
 | Memory while idle in the tray | About 100 MB |
 | Background services | None. SnapKit runs only while its own process is open. |
 
-The installed size breaks down as follows: FFmpeg about 110 MB, Tesseract about 28 MB, the neural OCR models about 13 MB, and the program itself.
+The installed size breaks down as follows: FFmpeg about 110 MB, Tesseract about 28 MB, the neural OCR models about 13 MB, ONNX Runtime about 17 MB, and the program itself.
 
 ## Capture limits
 
@@ -45,6 +46,7 @@ The installed size breaks down as follows: FFmpeg about 110 MB, Tesseract about 
 - On setups that mix monitors with different scaling, a recording area can come out slightly shifted.
 - Video recording doesn't support a webcam overlay; trimming keeps one clip, from a start to an end time.
 - In remote sessions or virtual machines without OpenGL, SnapKit may not open.
+- Over Remote Desktop, the area around the selection can show black instead of the darkened screen. The capture itself isn't affected.
 
 ## Related
 

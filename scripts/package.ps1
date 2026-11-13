@@ -2,14 +2,14 @@
 #   SnapKit-<version>-windows-x64.zip   (portable: unzip and run)
 #   SnapKit-<version>-setup.exe         (installer, if Inno Setup 6 is installed)
 #
-# Before running it, the three vendor\ folders must exist (scripts\fetch-*.ps1).
+# Before running it, the four vendor\ folders must exist (scripts\fetch-*.ps1).
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts\package.ps1
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-foreach ($dir in 'tesseract', 'ocr-neural', 'ffmpeg') {
+foreach ($dir in 'tesseract', 'ocr-neural', 'onnxruntime', 'ffmpeg') {
     if (-not (Test-Path "vendor\$dir")) { throw "vendor\$dir is missing - run the matching scripts\fetch-*.ps1" }
 }
 
@@ -24,7 +24,18 @@ if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force $stage | Out-Null
 
 Copy-Item 'target\release\snapkit.exe' $stage
-foreach ($dir in 'tesseract', 'ocr-neural', 'ffmpeg') { Copy-Item "vendor\$dir" "$stage\$dir" -Recurse }
+
+# snapkit.exe and onnxruntime.dll need the Visual C++ runtime. A clean Windows 10 may not have
+# it, and then SnapKit doesn't even start, so its DLLs ship next to the executable (app-local
+# deployment, allowed by the Visual Studio redistribution terms).
+$crt = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT", "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory -ErrorAction SilentlyContinue |
+    Sort-Object { [version]$_.Parent.Parent.Name } | Select-Object -Last 1
+if (-not $crt) { throw 'Visual C++ redistributable files not found (install the "MSVC v14x - VS C++ x64/x86 build tools" component)' }
+"Visual C++ runtime from $($crt.FullName)"
+foreach ($dll in 'msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') {
+    Copy-Item (Join-Path $crt.FullName $dll) $stage
+}
+foreach ($dir in 'tesseract', 'ocr-neural', 'onnxruntime', 'ffmpeg') { Copy-Item "vendor\$dir" "$stage\$dir" -Recurse }
 Copy-Item 'licenses' "$stage\licenses" -Recurse
 # .txt and .md extensions so they open with one click on any Windows machine.
 Copy-Item 'LICENSE' "$stage\LICENSE.txt"

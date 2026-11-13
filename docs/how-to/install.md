@@ -30,7 +30,7 @@ SnapKit installs to `%LOCALAPPDATA%\Programs\SnapKit`, for your user account onl
 2. Right-click the file, select **Extract All**, and choose a folder.
 3. Open the `SnapKit` folder and run `snapkit.exe`.
 
-Keep the `tesseract`, `ocr-neural` and `ffmpeg` folders next to `snapkit.exe`. Without them, SnapKit still opens, but text recognition or video recording isn't available.
+Keep the `tesseract`, `ocr-neural`, `onnxruntime` and `ffmpeg` folders and the `.dll` files next to `snapkit.exe`. Without them, SnapKit still opens, but text recognition or video recording isn't available.
 
 > [!NOTE]
 > The portable version still saves its preferences in `%APPDATA%\SnapKit` and your captures in your **Pictures** folder. See [Files and folders](../reference/files-and-folders.md).

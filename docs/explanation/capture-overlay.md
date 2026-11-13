@@ -14,6 +14,10 @@ The overlay is SnapKit's own window. To keep it out of the picture, SnapKit asks
 
 The same technique hides the small panels and the orange frames shown during recordings and scrolling captures.
 
+## Videos keep playing
+
+Chrome, Edge and Firefox stop drawing a page when another window covers theirs completely, to save power, and a video then looks paused. They can't tell that SnapKit's overlay is transparent. While the overlay is up, SnapKit marks it as a tool window, a kind of window browsers don't count as covering them. That also keeps the overlay out of the taskbar and Alt+Tab.
+
 ## No flicker between modes
 
 Switching the main window into the overlay means resizing it to cover every monitor and removing its frame, which takes a few frames. To avoid showing the in-between states, SnapKit cloaks the window (it stays active but the compositor doesn't draw it) until it has been drawn a few times at the right size. The same happens on the way back, so the editor never flashes on the screen before a quick annotation copy hides SnapKit again.

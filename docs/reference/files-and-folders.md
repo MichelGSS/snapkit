@@ -4,11 +4,13 @@ SnapKit keeps everything on your computer, in ordinary files and folders you can
 
 | What | Location | Notes |
 |---|---|---|
-| Program (installer) | `%LOCALAPPDATA%\Programs\SnapKit` | `snapkit.exe` plus the `tesseract`, `ocr-neural`, `ffmpeg` and `licenses` folders |
+| Program (installer) | `%LOCALAPPDATA%\Programs\SnapKit` | `snapkit.exe`, the Visual C++ runtime DLLs and the `tesseract`, `ocr-neural`, `onnxruntime`, `ffmpeg` and `licenses` folders |
 | Program (zip) | The folder you extracted it to | Same contents as the installed program |
 | Preferences and styles | `%APPDATA%\SnapKit\config.json` | See [Preferences](preferences.md#configjson) |
+| Preferences that couldn't be read | `%APPDATA%\SnapKit\config.json.bad` | Kept aside, instead of being overwritten, when `config.json` is damaged |
+| Error log | `%APPDATA%\SnapKit\error.log` | Errors that stopped SnapKit or a background job. Include it in bug reports |
 | Capture library | `Pictures\SnapKit` | One PNG per capture |
-| Library index | `Pictures\SnapKit\index.json` | Titles, dates and sizes used by the search |
+| Library index | `Pictures\SnapKit\index.json` | Titles, dates and sizes used by the search. If it's lost or damaged, the captures in the folder are listed again (without their window titles), and a damaged copy is kept as `index.json.bad` |
 | Thumbnails | `Pictures\SnapKit\.miniaturas` | Rebuilt automatically if deleted |
 | Recordings | `Videos\SnapKit` | MP4 videos, trimmed clips and GIFs |
 | Start with Windows | Registry: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`, value `SnapKit` | Created only when you turn on **Start with Windows** |

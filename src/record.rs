@@ -154,7 +154,10 @@ impl Recorder {
             .stderr(Stdio::piped())
             .spawn();
         match child {
-            Ok(child) => Ok(Self { ffmpeg, child, audio, path, video_part, audio_part, started: Instant::now(), warnings }),
+            Ok(child) => {
+                crate::win::end_with_us(&child);
+                Ok(Self { ffmpeg, child, audio, path, video_part, audio_part, started: Instant::now(), warnings })
+            }
             Err(e) => {
                 if let Some(a) = audio {
                     let _ = a.stop();
