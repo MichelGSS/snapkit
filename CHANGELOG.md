@@ -2,6 +2,17 @@
 
 All notable changes to SnapKit are listed here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.6.0] - 2026-11-13
+
+### Added
+
+- **Preferences** > **Updates**: the installed version, a **Check for updates** button and **Update now**, which downloads the new installer from GitHub, checks its SHA-256 checksum, installs it and opens SnapKit again. A portable copy opens the download page instead.
+- **Check automatically (once a day)**, off by default. It only tells you about a new version, with a **⬆ Version** button in the top bar; nothing is installed without a click.
+
+### Changed
+
+- SnapKit can now go online, only to check for updates, and only when you ask it to. Nothing but its name and version is sent.
+
 ## [0.5.3] - 2026-11-13
 
 ### Fixed
@@ -55,5 +66,6 @@ First public release.
 - Nine color themes, a configurable global shortcut, tray icon and start with Windows.
 - Windows no longer flash on the screen when a capture starts or ends.
 
+[0.6.0]: https://github.com/MichelGSS/snapkit/releases/tag/v0.6.0
 [0.5.3]: https://github.com/MichelGSS/snapkit/releases/tag/v0.5.3
 [0.5.2]: https://github.com/MichelGSS/snapkit/releases/tag/v0.5.2

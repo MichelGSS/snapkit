@@ -89,6 +89,11 @@ pub struct Config {
     pub theme: String,
     /// Interface language; with no choice, follows the Windows one.
     pub language: Option<crate::i18n::Lang>,
+    /// Look for a new version on GitHub once a day. Off by default: SnapKit uses the internet
+    /// only when the user asks.
+    pub check_updates: bool,
+    /// When updates were last checked (seconds since 1970), so the daily check really is daily.
+    pub last_update_check: u64,
 }
 
 impl Default for Config {
@@ -104,6 +109,8 @@ impl Default for Config {
             styles: Vec::new(),
             theme: "Padrão".to_owned(),
             language: None,
+            check_updates: false,
+            last_update_check: 0,
         }
     }
 }
@@ -198,6 +205,12 @@ mod tests {
         assert_eq!(partial.hotkey.key, "X");
         assert!(partial.hotkey.alt, "missing fields use the default");
         assert!(partial.close_to_tray);
+    }
+
+    #[test]
+    fn the_update_check_is_off_unless_turned_on() {
+        assert!(!Config::default().check_updates);
+        assert!(!Config::parse("{}").check_updates, "an older config.json leaves it off");
     }
 
     #[test]

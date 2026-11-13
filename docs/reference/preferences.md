@@ -10,6 +10,7 @@ Select **Preferences** in the top bar to open the **Preferences** window. Every 
 | **Interface theme** | See [Interface themes](#interface-themes) | **Default** |
 | **Closing the window keeps SnapKit in the tray** | On or off | On |
 | **Start with Windows (in the tray)** | On or off | Off |
+| **Check automatically (once a day)** | On or off | Off |
 
 ## Global capture shortcut
 
@@ -20,6 +21,18 @@ Starts a region capture from any app.
 - A letter or digit needs at least one of **Ctrl**, **Alt** or **Win**, so it doesn't block normal typing. Function keys and **PrintScreen** can be used alone.
 
 Select **Apply shortcut** to register the new combination. If Windows or another app already uses it, SnapKit keeps the previous shortcut and shows a message.
+
+## Updates
+
+The **Updates** section shows the installed version.
+
+- **Check for updates** asks GitHub for the latest version. Only SnapKit's name and version are sent.
+- When a newer version is out, SnapKit shows **Version** *x.y.z* **is available**, and a **⬆ Version** *x.y.z* button appears in the top bar.
+  - **Update now** downloads the installer, checks it against the SHA-256 checksum published with the release, installs it and opens SnapKit again. Your preferences, styles and library are kept. A portable copy (extracted from the zip) shows **Open the download page** instead.
+  - **What's new** opens the release notes.
+- **Check automatically (once a day)** does the same check in the background, at most once a day. It only tells you about a new version: nothing is installed without a click from you.
+
+See [Why SnapKit is 100% local](../explanation/local-first.md#updates).
 
 ## Interface themes
 
@@ -64,7 +77,9 @@ SnapKit also remembers these choices in the same file:
   "quick_annotate": true,
   "styles": [],
   "theme": "Padrão",
-  "language": "en"
+  "language": "en",
+  "check_updates": false,
+  "last_update_check": 0
 }
 ```
 
@@ -80,6 +95,8 @@ SnapKit also remembers these choices in the same file:
 | `styles` | array | Saved editor styles |
 | `theme` | string | Theme identifier. The identifiers are the Portuguese names, so a choice holds in both languages: `Padrão` (Default), `Dracula`, `Nord`, `One Dark`, `Monokai`, `Gruvbox Escuro`, `Tokyo Noite`, `Catppuccin Mocha`, `Solarized Claro`. |
 | `language` | string or `null` | `pt` or `en`. `null` means "follow the Windows display language". |
+| `check_updates` | boolean | Check for a new version once a day |
+| `last_update_check` | number | When updates were last checked, in seconds since 1970 |
 
 **Start with Windows** isn't stored in this file. It's an entry named `SnapKit` under `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`.
 

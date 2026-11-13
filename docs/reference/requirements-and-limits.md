@@ -10,7 +10,7 @@
 | Graphics | OpenGL support (any current graphics driver). Needed for the transparent capture overlay. |
 | Disk space | About 200 MB for the program, plus your captures and recordings |
 | Permissions | A standard user account. No administrator rights needed. |
-| Network | None. SnapKit never connects to the internet. |
+| Network | None. SnapKit works fully offline. It connects to GitHub only to check for updates, when you ask it to. |
 
 ## Size and resource use
 

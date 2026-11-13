@@ -1,6 +1,8 @@
 # Why SnapKit is 100% local
 
-SnapKit doesn't have an account, a cloud service, an update checker, analytics or telemetry. It never opens a network connection. Everything it does, including text recognition and video encoding, runs on your computer.
+SnapKit doesn't have an account, a cloud service, analytics or telemetry. Everything it does, including text recognition and video encoding, runs on your computer, and your captures never leave it.
+
+The one exception is checking for updates, and it's yours to decide. See [Updates](#updates).
 
 ## Screenshots are sensitive by nature
 
@@ -22,6 +24,17 @@ SnapKit takes the opposite approach: if a feature can't run locally, SnapKit doe
 | Preferences | A JSON file in `%APPDATA%\SnapKit` |
 
 Because nothing depends on a server, SnapKit works the same on a plane, in an air-gapped network or behind a strict proxy.
+
+## Updates
+
+SnapKit can check whether a newer version is out. It's the only time it goes online, and it does so only when you ask:
+
+- **Check for updates**, in **Preferences**, asks once.
+- **Check automatically (once a day)** is off by default. When on, SnapKit only tells you about a new version. It never installs anything without a click from you.
+
+The check reads the latest release from GitHub's public API. The request carries SnapKit's name and version and nothing else: no identifier, no settings, nothing about your captures. GitHub, like any website, sees the request's IP address.
+
+When you select **Update now**, SnapKit downloads the installer from the same GitHub release, compares it with the SHA-256 checksum GitHub publishes for it, and runs it only if they match. A copy extracted from the zip opens the download page instead.
 
 ## Free and open
 

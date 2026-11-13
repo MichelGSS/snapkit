@@ -45,7 +45,7 @@
   <tr>
     <td width="50%" valign="top">
       <h3>🔒 100% local</h3>
-      Capture, annotation, text recognition and video encoding all run on your machine. SnapKit never opens a network connection, so it's safe for internal tools, customer data and air-gapped networks.
+      Capture, annotation, text recognition and video encoding all run on your machine. SnapKit only goes online to check for updates, and only when you ask it to, so it's safe for internal tools, customer data and air-gapped networks.
     </td>
     <td width="50%" valign="top">
       <h3>💸 Free, for real</h3>
@@ -189,7 +189,9 @@ Yes. SnapKit is released under the MIT License. There's no paid version, no tria
 <details>
 <summary><b>Does SnapKit send anything over the internet?</b></summary>
 <br>
-No. SnapKit has no network code at all: no telemetry, no update checks and no cloud features. Text recognition and video encoding run locally with bundled engines.
+No. There's no telemetry, no account and no cloud feature, and your captures never leave your computer. Text recognition and video encoding run locally with bundled engines.
+
+The only connection SnapKit can make is the update check: it asks GitHub for the latest version number, sending only SnapKit's name and version. It happens when you select **Check for updates** in **Preferences**, or once a day if you turn on **Check automatically**, which is off by default.
 </details>
 
 <details>

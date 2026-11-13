@@ -48,7 +48,16 @@ Name: "{userdesktop}\SnapKit"; Filename: "{app}\snapkit.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\snapkit.exe"; Description: "{cm:LaunchProgram,SnapKit}"; Flags: nowait postinstall skipifsilent
+; When SnapKit updates itself, it runs this installer silently with /relaunch=1 and has
+; already closed: open it again at the end.
+Filename: "{app}\snapkit.exe"; Flags: nowait; Check: RelaunchAfterUpdate
 
 [Registry]
 ; If the user turned on "Start with Windows", the entry is removed on uninstall.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "SnapKit"; Flags: dontcreatekey uninsdeletevalue
+
+[Code]
+function RelaunchAfterUpdate: Boolean;
+begin
+  Result := WizardSilent and (ExpandConstant('{param:relaunch|0}') = '1');
+end;

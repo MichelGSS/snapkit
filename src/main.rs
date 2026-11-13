@@ -17,6 +17,7 @@ mod scroll;
 mod steps;
 mod theme;
 mod tray;
+mod update;
 mod win;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -159,6 +160,24 @@ struct Selecting {
     ready_frames: u8,
     /// The layer has already been shown (the window starts invisible; see `win::cloak`).
     revealed: bool,
+}
+
+/// Where the update check stands.
+enum UpdateState {
+    Idle,
+    Checking,
+    /// Checked: this is the latest version.
+    Latest,
+    /// A newer version is published.
+    Available(update::Release),
+    /// Downloading the installer of that version.
+    Downloading(update::Release),
+}
+
+/// A result from the update work in the background.
+enum UpdateMsg {
+    Checked { manual: bool, result: Result<update::Release, String> },
+    Downloaded { release: update::Release, result: Result<std::path::PathBuf, String> },
 }
 
 /// The main window, invisible while it returns from the selection to its normal size.
@@ -316,6 +335,12 @@ struct App {
     save_requested: bool,
     /// Frames left before hiding the window, when SnapKit starts in the tray (`--minimized`).
     hide_after_start: u8,
+    /// Where the update check stands (Preferences > Updates).
+    update_state: UpdateState,
+    /// Last update problem, shown under the update buttons.
+    update_note: String,
+    /// Results of the update check and download, from the background.
+    update_pending: Arc<Mutex<Option<UpdateMsg>>>,
 }
 
 /// State of the small floating panel of the panoramic capture.
@@ -495,6 +520,9 @@ impl App {
             settle: None,
             save_requested: false,
             hide_after_start: 0,
+            update_state: UpdateState::Idle,
+            update_note: String::new(),
+            update_pending: Arc::new(Mutex::new(None)),
         };
         // `snapkit --select` opens straight into region selection (shortcuts and tests).
         if std::env::args().any(|a| a == "--select") {
@@ -553,6 +581,182 @@ impl App {
     fn save_cfg(&mut self) {
         if let Err(e) = self.cfg.save() {
             self.status = tf!("Não foi possível salvar as preferências: {e}", "Could not save the preferences: {e}");
+        }
+    }
+
+    /// Asks GitHub for the latest version, in the background. `manual`: the user clicked
+    /// **Check for updates** (rather than the daily automatic check), so failures are shown.
+    fn start_update_check(&mut self, ctx: &egui::Context, manual: bool) {
+        if matches!(self.update_state, UpdateState::Checking | UpdateState::Downloading(_)) {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        self.update_note.clear();
+        let (pending, ctx) = (self.update_pending.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = guarded(update::latest);
+            *pending.lock().unwrap() = Some(UpdateMsg::Checked { manual, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Downloads and checks the installer of `release`, in the background; then it's run.
+    fn start_update_download(&mut self, ctx: &egui::Context, release: update::Release) {
+        if self.video.is_some() {
+            self.update_note = t!("Termine a gravação antes de atualizar.", "Finish the recording before updating.").to_owned();
+            return;
+        }
+        let Some(asset) = release.installer.clone() else {
+            self.update_note = t!("Essa versão não tem instalador; use a página de download.", "That release has no installer; use the download page.").to_owned();
+            return;
+        };
+        self.update_state = UpdateState::Downloading(release.clone());
+        self.update_note.clear();
+        let (pending, ctx) = (self.update_pending.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = guarded(|| update::download(&asset));
+            *pending.lock().unwrap() = Some(UpdateMsg::Downloaded { release, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Takes in the results of the update work, and starts the daily check when it's due.
+    fn update_logic(&mut self, ctx: &egui::Context) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if self.cfg.check_updates
+            && matches!(self.update_state, UpdateState::Idle | UpdateState::Latest)
+            && now.saturating_sub(self.cfg.last_update_check) >= 24 * 60 * 60
+        {
+            // Recorded before the answer: a check that fails isn't retried on every frame.
+            self.cfg.last_update_check = now;
+            self.save_cfg();
+            self.start_update_check(ctx, false);
+        }
+        let Some(msg) = self.update_pending.lock().unwrap().take() else { return };
+        match msg {
+            UpdateMsg::Checked { manual, result } => {
+                self.cfg.last_update_check = now;
+                self.save_cfg();
+                match result {
+                    Ok(release) if update::is_newer(&release.version, update::CURRENT) => {
+                        self.status = tf!(
+                            "SnapKit {} disponível. Veja em Preferências > Atualizações.",
+                            "SnapKit {} is available. See Preferences > Updates.",
+                            release.version
+                        );
+                        self.update_state = UpdateState::Available(release);
+                    }
+                    Ok(_) => {
+                        self.update_state = UpdateState::Latest;
+                    }
+                    Err(e) => {
+                        self.update_state = UpdateState::Idle;
+                        if manual {
+                            self.update_note = e;
+                        } else {
+                            log_error(&format!("automatic update check: {e}"));
+                        }
+                    }
+                }
+            }
+            UpdateMsg::Downloaded { release, result } => match result.and_then(|path| {
+                // Captures still being written finish first; then the installer takes over.
+                self.writer.wait_idle(Duration::from_secs(10));
+                update::run_installer(&path)
+            }) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    self.update_note = e;
+                    self.update_state = UpdateState::Available(release);
+                }
+            },
+        }
+    }
+
+    /// Preferences > Updates: the version, the check button and the daily check.
+    fn updates_ui(&mut self, ui: &mut egui::Ui) {
+        ui.strong(t!("Atualizações", "Updates"));
+        ui.label(tf!("Versão instalada: {}", "Installed version: {}", update::CURRENT));
+        let mut check = false;
+        let mut install = None;
+        let mut page = None;
+        ui.horizontal(|ui| {
+            let busy = matches!(self.update_state, UpdateState::Checking | UpdateState::Downloading(_));
+            check = ui
+                .add_enabled(!busy, egui::Button::new(t!("Verificar atualização", "Check for updates")))
+                .on_hover_text(t!(
+                    "Consulta a versão mais recente no GitHub. Só o nome e a versão do SnapKit são enviados.",
+                    "Looks up the latest version on GitHub. Only SnapKit's name and version are sent."
+                ))
+                .clicked();
+            match &self.update_state {
+                UpdateState::Idle => {}
+                UpdateState::Checking => {
+                    ui.spinner();
+                    ui.label(t!("Verificando…", "Checking…"));
+                }
+                UpdateState::Latest => {
+                    ui.label(t!("Você tem a versão mais recente.", "You have the latest version."));
+                }
+                UpdateState::Available(release) => {
+                    ui.colored_label(self.accent(), tf!("Versão {} disponível.", "Version {} is available.", release.version));
+                }
+                UpdateState::Downloading(release) => {
+                    ui.spinner();
+                    ui.label(tf!("Baixando a versão {}…", "Downloading version {}…", release.version));
+                }
+            }
+        });
+        if let UpdateState::Available(release) = &self.update_state {
+            ui.horizontal(|ui| {
+                if update::is_installed() {
+                    if ui
+                        .button(t!("Atualizar agora", "Update now"))
+                        .on_hover_text(t!(
+                            "Baixa o instalador, confere o SHA-256, instala e abre o SnapKit de novo. Preferências, estilos e biblioteca são mantidos.",
+                            "Downloads the installer, checks its SHA-256, installs it and opens SnapKit again. Preferences, styles and library are kept."
+                        ))
+                        .clicked()
+                    {
+                        install = Some(release.clone());
+                    }
+                } else if ui
+                    .button(t!("Abrir a página de download", "Open the download page"))
+                    .on_hover_text(t!(
+                        "Esta cópia é a portátil (zip): baixe o zip novo e extraia por cima.",
+                        "This is the portable copy (zip): download the new zip and extract it over this one."
+                    ))
+                    .clicked()
+                {
+                    page = Some(release.page.clone());
+                }
+                if ui.button(t!("Novidades", "What's new")).clicked() {
+                    page = Some(release.page.clone());
+                }
+            });
+        }
+        if !self.update_note.is_empty() {
+            ui.colored_label(ui.visuals().warn_fg_color, &self.update_note);
+        }
+        let mut auto = self.cfg.check_updates;
+        ui.checkbox(&mut auto, t!("Verificar automaticamente (uma vez por dia)", "Check automatically (once a day)"))
+            .on_hover_text(t!(
+                "Só avisa quando houver versão nova: nada é instalado sem um clique seu. Desligado, o SnapKit não usa a internet.",
+                "Only tells you when there's a new version: nothing is installed without a click from you. When off, SnapKit doesn't use the internet."
+            ));
+        if auto != self.cfg.check_updates {
+            self.cfg.check_updates = auto;
+            self.save_cfg();
+        }
+        let ctx = ui.ctx().clone();
+        if check {
+            self.start_update_check(&ctx, true);
+        }
+        if let Some(release) = install {
+            self.start_update_download(&ctx, release);
+        }
+        if let Some(url) = page {
+            update::open_page(&url);
         }
     }
 
@@ -692,6 +896,8 @@ impl App {
                 if !tray_ok {
                     ui.label(t!("O ícone da bandeja não pôde ser criado nesta sessão.", "The tray icon could not be created in this session."));
                 }
+                ui.separator();
+                self.updates_ui(ui);
             });
         self.show_prefs = open;
     }
@@ -2319,6 +2525,16 @@ impl App {
                         self.show_prefs = !self.show_prefs;
                         self.hotkey_draft = self.cfg.hotkey.clone();
                     }
+                    if let UpdateState::Available(release) = &self.update_state {
+                        let label = tf!("⬆ Versão {}", "⬆ Version {}", release.version);
+                        if ui
+                            .button(egui::RichText::new(label).color(self.accent()))
+                            .on_hover_text(t!("Há uma versão nova. Abre Preferências > Atualizações.", "A new version is out. Opens Preferences > Updates."))
+                            .clicked()
+                        {
+                            self.show_prefs = true;
+                        }
+                    }
                     ui.toggle_value(&mut self.show_library, t!("Biblioteca", "Library"));
                     ui.separator();
                     let has_capture = self.editor.is_some();
@@ -2425,6 +2641,7 @@ impl eframe::App for App {
         if let Some(e) = self.writer.take_error() {
             self.status = tf!("Não foi possível salvar na biblioteca: {e}", "Could not save to the library: {e}");
         }
+        self.update_logic(ctx);
         if let Some((kind, title, was_on_screen)) = self.shared.select_request.lock().unwrap().take() {
             let hwnd = self.shared.hwnd;
             let windows = win::visible_windows(hwnd);

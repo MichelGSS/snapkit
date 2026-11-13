@@ -37,6 +37,10 @@ Keep the `tesseract`, `ocr-neural`, `onnxruntime` and `ffmpeg` folders and the `
 
 ## Update SnapKit
 
+The quickest way is from SnapKit itself: open **Preferences**, select **Check for updates**, and then **Update now**. SnapKit downloads the new installer, checks it, installs it and opens again. To be told about new versions, turn on **Check automatically (once a day)**.
+
+You can also update by hand:
+
 - **Installer:** download the new `setup.exe` and run it. It replaces the old version and keeps your preferences, styles and library. If SnapKit is running in the tray, the installer closes it first.
 - **Zip:** extract the new zip over the old folder, or into a new folder.
 

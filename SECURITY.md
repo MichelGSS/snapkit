@@ -18,4 +18,4 @@ You can expect an acknowledgment within a week. Once a fix is ready, it's releas
 
 ## Scope
 
-SnapKit doesn't open network connections, so most issues will involve local files, the bundled third-party programs (Tesseract, FFmpeg, ONNX Runtime) or the way SnapKit starts them. Vulnerabilities in those components should also be reported to their own projects.
+SnapKit's only network connection is the optional update check, which reads the latest release from GitHub over HTTPS and verifies a downloaded installer against its published SHA-256 before running it (`src/update.rs`). Issues there are in scope. Most other issues will involve local files, the bundled third-party programs (Tesseract, FFmpeg, ONNX Runtime) or the way SnapKit starts them. Vulnerabilities in those components should also be reported to their own projects.

@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, channel};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use image::RgbaImage;
@@ -213,21 +214,33 @@ pub struct Writer {
     tx: Sender<Job>,
     /// Last failure (a full disk, a folder without permission), for the interface to show.
     error: Arc<Mutex<Option<String>>>,
+    /// Captures handed over and not written yet.
+    pending: Arc<AtomicUsize>,
 }
 
 impl Writer {
     pub fn spawn() -> Self {
         let (tx, rx) = channel::<Job>();
         let error = Arc::new(Mutex::new(None));
-        let report = error.clone();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (report, done) = (error.clone(), pending.clone());
         std::thread::spawn(move || {
             for job in rx {
                 if let Err(e) = write_job(&job) {
                     *report.lock().unwrap() = Some(format!("{}: {e}", job.path.display()));
                 }
+                done.fetch_sub(1, Ordering::SeqCst);
             }
         });
-        Self { tx, error }
+        Self { tx, error, pending }
+    }
+
+    /// Waits (up to `limit`) for the captures still being written, before SnapKit closes.
+    pub fn wait_idle(&self, limit: std::time::Duration) {
+        let end = std::time::Instant::now() + limit;
+        while self.pending.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// The last failure to save, if there was one since the previous call.
@@ -236,6 +249,7 @@ impl Writer {
     }
 
     pub fn save(&self, library: &Library, file: &str, image: RgbaImage, thumb: RgbaImage) {
+        self.pending.fetch_add(1, Ordering::SeqCst);
         let _ = self.tx.send(Job {
             path: library.path(file),
             thumb_path: library.thumb_path(file),
