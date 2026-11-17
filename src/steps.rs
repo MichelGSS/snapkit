@@ -90,9 +90,21 @@ impl Recorder {
                     _ => continue,
                 };
                 let at = win::cursor_pos();
-                let on_panel = win::window_rect(own_hwnd).is_some_and(|panel| contains(panel, at));
-                // A click has to land in the area; Enter counts with the cursor anywhere.
-                let in_area = trigger == Trigger::Enter || contains(rect, at);
+                // SAFETY: read-only query of the active window handle.
+                let fg = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } as isize;
+                let on_panel = win::window_rect(own_hwnd).is_some_and(|panel| contains(panel, at))
+                    || (trigger == Trigger::Enter && own_hwnd != 0 && fg == own_hwnd);
+                // A click has to land in the area; Enter counts when the cursor or active window
+                // overlaps the area.
+                let fg_in_area = fg != 0
+                    && win::window_rect(fg).is_some_and(|w| {
+                        w.0 < rect.2 && w.2 > rect.0 && w.1 < rect.3 && w.3 > rect.1
+                    });
+                let in_area = if trigger == Trigger::Enter {
+                    contains(rect, at) || fg_in_area
+                } else {
+                    contains(rect, at)
+                };
                 if !in_area || on_panel || list.lock().unwrap().len() >= MAX_STEPS {
                     continue;
                 }

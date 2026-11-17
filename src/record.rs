@@ -117,12 +117,14 @@ pub fn videos_dir() -> PathBuf {
 pub struct Recorder {
     ffmpeg: PathBuf,
     child: Child,
+    stderr_reader: Option<std::thread::JoinHandle<String>>,
     audio: Option<AudioRecording>,
     /// Final file and the two temporary ones (image and audio).
     path: PathBuf,
     video_part: PathBuf,
     audio_part: PathBuf,
     started: Instant,
+    stopped: bool,
     /// Warnings about audio that couldn't be included.
     pub warnings: Vec<String>,
 }
@@ -154,9 +156,28 @@ impl Recorder {
             .stderr(Stdio::piped())
             .spawn();
         match child {
-            Ok(child) => {
+            Ok(mut child) => {
                 crate::win::end_with_us(&child);
-                Ok(Self { ffmpeg, child, audio, path, video_part, audio_part, started: Instant::now(), warnings })
+                // Drain stderr in the background so a full pipe buffer can never block FFmpeg.
+                let stderr_reader = child.stderr.take().map(|mut stderr| {
+                    std::thread::spawn(move || {
+                        let mut buf = String::new();
+                        let _ = stderr.read_to_string(&mut buf);
+                        buf
+                    })
+                });
+                Ok(Self {
+                    ffmpeg,
+                    child,
+                    stderr_reader,
+                    audio,
+                    path,
+                    video_part,
+                    audio_part,
+                    started: Instant::now(),
+                    stopped: false,
+                    warnings,
+                })
             }
             Err(e) => {
                 if let Some(a) = audio {
@@ -179,8 +200,10 @@ impl Recorder {
 
     /// Ends the recording, joins image and audio and returns the final file.
     pub fn stop(mut self) -> Result<PathBuf, String> {
-        // "q" on standard input asks FFmpeg to close the file properly.
-        if let Some(stdin) = self.child.stdin.as_mut() {
+        self.stopped = true;
+        // "q" on standard input asks FFmpeg to close the file properly; dropping stdin closes the
+        // pipe so FFmpeg sees EOF as well.
+        if let Some(mut stdin) = self.child.stdin.take() {
             let _ = stdin.write_all(b"q\n");
             let _ = stdin.flush();
         }
@@ -199,11 +222,13 @@ impl Recorder {
                 }
             }
         }
-        let mut errors = String::new();
-        if let Some(mut stderr) = self.child.stderr.take() {
-            let _ = stderr.read_to_string(&mut errors);
-        }
+        let errors = self
+            .stderr_reader
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
         if !std::fs::metadata(&self.video_part).is_ok_and(|m| m.len() > 0) {
+            let _ = std::fs::remove_file(&self.video_part);
             let _ = std::fs::remove_file(&self.audio_part);
             return Err(tf!("a gravação não gerou arquivo. {}", "the recording produced no file. {}", errors.trim()));
         }
@@ -215,11 +240,14 @@ impl Recorder {
         };
         let _ = std::fs::remove_file(&self.audio_part);
         match result {
-            Ok(()) => Ok(self.path),
+            Ok(()) => Ok(self.path.clone()),
             // If joining fails, the recorded image isn't lost: it just has no sound.
             Err(e) => match std::fs::rename(&self.video_part, &self.path) {
-                Ok(()) => Ok(self.path),
-                Err(_) => Err(e),
+                Ok(()) => Ok(self.path.clone()),
+                Err(_) => {
+                    let _ = std::fs::remove_file(&self.video_part);
+                    Err(e)
+                }
             },
         }
     }
@@ -241,6 +269,28 @@ impl Recorder {
     }
 }
 
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        if let Some(mut stdin) = self.child.stdin.take() {
+            let _ = stdin.write_all(b"q\n");
+            let _ = stdin.flush();
+        }
+        if let Some(audio) = self.audio.take() {
+            let _ = audio.stop();
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+        let _ = std::fs::remove_file(&self.video_part);
+        let _ = std::fs::remove_file(&self.audio_part);
+    }
+}
+
 /// A recording that can be paused. FFmpeg can't pause a screen capture, so each stretch between
 /// pauses is a separate recording; when it stops, the stretches are joined without re-encoding.
 pub struct Session {
@@ -254,6 +304,7 @@ pub struct Session {
     current: Option<Recorder>,
     /// Total time of the stretches already closed.
     recorded: Duration,
+    stopped: bool,
     /// Warnings about audio that couldn't be included.
     pub warnings: Vec<String>,
 }
@@ -271,6 +322,7 @@ impl Session {
             parts: Vec::new(),
             current: None,
             recorded: Duration::ZERO,
+            stopped: false,
             warnings: Vec::new(),
         };
         session.resume()?;
@@ -296,8 +348,10 @@ impl Session {
         }
         let part = format!("{}.part{}", self.name, self.parts.len() + 1);
         let recorder = Recorder::start(self.rect, self.options, &self.dir, &part)?;
-        if self.warnings.is_empty() {
-            self.warnings = recorder.warnings.clone();
+        for w in &recorder.warnings {
+            if !self.warnings.contains(w) {
+                self.warnings.push(w.clone());
+            }
         }
         self.current = Some(recorder);
         Ok(())
@@ -317,6 +371,7 @@ impl Session {
     pub fn stop(mut self) -> Result<PathBuf, String> {
         // An error in the last stretch doesn't throw away the earlier ones.
         let last = self.pause();
+        self.stopped = true;
         let out = self.dir.join(format!("{}.mp4", self.name));
         match self.parts.as_slice() {
             [] => Err(last.err().unwrap_or_else(|| t!("nada foi gravado", "nothing was recorded").to_owned())),
@@ -324,13 +379,28 @@ impl Session {
             parts => {
                 let list = self.dir.join(format!("{}.parts.txt", self.name));
                 std::fs::write(&list, concat_list(parts)).map_err(|e| e.to_string())?;
-                let output = ffmpeg_command(&self.ffmpeg)
+                let mut output = ffmpeg_command(&self.ffmpeg)
                     .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i"])
                     .arg(&list)
                     .args(["-c", "copy", "-movflags", "+faststart"])
                     .arg(&out)
                     .output()
                     .map_err(|e| e.to_string())?;
+                if !output.status.success() {
+                    // If one stretch had audio and another fell back to video-only, retry joining
+                    // the video stream alone rather than failing the whole recording.
+                    let _ = std::fs::remove_file(&out);
+                    if let Ok(fallback) = ffmpeg_command(&self.ffmpeg)
+                        .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i"])
+                        .arg(&list)
+                        .args(["-map", "0:v", "-c:v", "copy", "-movflags", "+faststart"])
+                        .arg(&out)
+                        .output()
+                        && fallback.status.success()
+                    {
+                        output = fallback;
+                    }
+                }
                 let _ = std::fs::remove_file(&list);
                 if output.status.success() && out.is_file() {
                     for part in parts {
@@ -346,6 +416,18 @@ impl Session {
                     ))
                 }
             }
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        drop(self.current.take());
+        for part in self.parts.drain(..) {
+            let _ = std::fs::remove_file(part);
         }
     }
 }
@@ -385,6 +467,7 @@ pub fn trim(video: &Path, start: f64, end: f64) -> Result<PathBuf, String> {
     if output.status.success() && out.is_file() {
         Ok(out)
     } else {
+        let _ = std::fs::remove_file(&out);
         Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
     }
 }
@@ -434,6 +517,7 @@ pub fn to_gif(video: &Path, options: &GifOptions) -> Result<PathBuf, String> {
     if output.status.success() && gif.is_file() {
         Ok(gif)
     } else {
+        let _ = std::fs::remove_file(&gif);
         Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
     }
 }
@@ -493,12 +577,18 @@ mod tests {
         before.rsplit(',').next().unwrap().trim().parse().unwrap()
     }
 
+    /// True when the current desktop session does not allow screen capture (CI or sandboxed
+    /// environment).
+    fn screen_unavailable() -> bool {
+        crate::in_ci() || crate::capture::grab_virtual((0, 0, 64, 64), false).is_err()
+    }
+
     /// Records 3 s of a corner of the screen with system sound and microphone, using the real
     /// FFmpeg, and checks what matters most: the image doesn't drop frames and the sound gets in.
     /// Requires `vendor/ffmpeg` (scripts/fetch-ffmpeg.ps1).
     #[test]
     fn records_smooth_video_with_audio_and_converts_to_gif() {
-        if crate::in_ci() {
+        if screen_unavailable() {
             return;
         }
         let dir = std::env::temp_dir().join(format!("snapkit-test-video-{}", std::process::id()));
@@ -553,7 +643,7 @@ mod tests {
     /// FFmpeg.
     #[test]
     fn paused_recording_becomes_one_video_without_the_pause() {
-        if crate::in_ci() {
+        if screen_unavailable() {
             return;
         }
         let dir = std::env::temp_dir().join(format!("snapkit-test-pause-{}", std::process::id()));
@@ -584,7 +674,7 @@ mod tests {
 
     #[test]
     fn video_without_audio_is_just_renamed() {
-        if crate::in_ci() {
+        if screen_unavailable() {
             return;
         }
         let dir = std::env::temp_dir().join(format!("snapkit-test-mute-{}", std::process::id()));

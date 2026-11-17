@@ -124,11 +124,26 @@ impl Config {
     /// moved aside to `config.json.bad` first, so the next save doesn't destroy the styles in it.
     pub fn load() -> Self {
         let Some(path) = Self::path() else { return Self::default() };
-        let Ok(text) = std::fs::read_to_string(&path) else { return Self::default() };
-        match Self::try_parse(&text) {
+        Self::load_from(&path)
+    }
+
+    fn load_from(path: &std::path::Path) -> Self {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                let _ = std::fs::rename(path, path.with_extension("json.bad"));
+                crate::log_error(&format!("config.json could not be read ({e}); it was kept as config.json.bad"));
+                return Self::default();
+            }
+        };
+        match std::str::from_utf8(&bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|text| Self::try_parse(text).map_err(|e| e.to_string()))
+        {
             Ok(cfg) => cfg,
             Err(e) => {
-                let _ = std::fs::rename(&path, path.with_extension("json.bad"));
+                let _ = std::fs::rename(path, path.with_extension("json.bad"));
                 crate::log_error(&format!("config.json could not be read ({e}); it was kept as config.json.bad"));
                 Self::default()
             }
@@ -155,13 +170,20 @@ impl Config {
     }
 }
 
-/// Writes the whole file or nothing: first to a temporary file beside it, then renamed over the
-/// old one. A write cut short (SnapKit closed or the computer turned off in the middle) leaves
-/// the old file intact instead of half a file.
+/// Writes the whole file or nothing: first to a temporary file beside it, flushed to disk, then
+/// renamed over the old one. A write cut short (SnapKit closed or the computer turned off in the
+/// middle) leaves the old file intact instead of half a file.
 pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
-    std::fs::write(&tmp, data)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    if let Err(e) = file.write_all(data).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(file);
     std::fs::rename(&tmp, path)
 }
 
@@ -215,8 +237,7 @@ mod tests {
 
     #[test]
     fn a_byte_order_mark_doesnt_reset_the_preferences() {
-        let mut c = Config::default();
-        c.include_cursor = true;
+        let c = Config { include_cursor: true, ..Config::default() };
         let text = format!("\u{feff}{}", serde_json::to_string(&c).unwrap());
         assert_eq!(Config::try_parse(&text).unwrap(), c);
     }
@@ -234,10 +255,24 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_config_is_backed_up_to_bad() {
+        let dir = std::env::temp_dir().join(format!("snapkit-cfg-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.json");
+        std::fs::write(&file, [0xff, 0xfe, 0x00]).unwrap();
+        assert_eq!(Config::load_from(&file), Config::default());
+        assert!(dir.join("config.json.bad").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn config_round_trips_through_json() {
-        let mut c = Config::default();
-        c.hotkey.key = "PrintScreen".into();
-        c.include_cursor = true;
+        let c = Config {
+            hotkey: HotkeyCfg { key: "PrintScreen".into(), ..HotkeyCfg::default() },
+            include_cursor: true,
+            ..Config::default()
+        };
         let text = serde_json::to_string(&c).unwrap();
         assert_eq!(Config::parse(&text), c);
     }

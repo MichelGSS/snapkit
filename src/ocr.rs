@@ -52,25 +52,43 @@ impl Engine {
 /// Recognizes the text in the image and says which engine was used. Must be called off the
 /// interface thread: it can take a few seconds.
 pub fn recognize(img: &RgbaImage, mode: Mode) -> Result<(String, Engine), String> {
-    if mode == Mode::Printed {
-        match find_tesseract().map(|dir| tesseract_words(&dir, img)) {
-            Some(Ok(words)) => return Ok((layout(&words), Engine::Tesseract)),
+    if img.width() == 0 || img.height() == 0 {
+        let engine = match mode {
+            Mode::Printed => Engine::Tesseract,
+            Mode::Handwriting => Engine::Neural,
+        };
+        return Ok((String::new(), engine));
+    }
+    let mut tess_err = None;
+    if mode == Mode::Printed
+        && let Some(res) = find_tesseract().map(|dir| tesseract_words(&dir, img))
+    {
+        match res {
+            Ok(words) => return Ok((layout(&words), Engine::Tesseract)),
             // Without Tesseract, or with it failing, the neural engine can still read the image.
-            Some(Err(_)) | None => {}
+            Err(e) => tess_err = Some(e),
         }
     }
-    let dir = crate::neural::find_models().ok_or_else(|| match mode {
-        Mode::Printed => t!(
-            "nenhum motor de OCR encontrado (pastas tesseract e ocr-neural)",
-            "no OCR engine found (tesseract and ocr-neural folders)"
-        )
-        .to_owned(),
-        Mode::Handwriting => t!(
-            "os modelos do motor neural não foram encontrados (pasta ocr-neural)",
-            "the neural engine models were not found (ocr-neural folder)"
-        )
-        .to_owned(),
-    })?;
+    let dir = match crate::neural::find_models() {
+        Some(dir) => dir,
+        None => {
+            if let Some(e) = tess_err {
+                return Err(e);
+            }
+            return Err(match mode {
+                Mode::Printed => t!(
+                    "nenhum motor de OCR encontrado (pastas tesseract e ocr-neural)",
+                    "no OCR engine found (tesseract and ocr-neural folders)"
+                )
+                .to_owned(),
+                Mode::Handwriting => t!(
+                    "os modelos do motor neural não foram encontrados (pasta ocr-neural)",
+                    "the neural engine models were not found (ocr-neural folder)"
+                )
+                .to_owned(),
+            });
+        }
+    };
     // Each line read goes in as a single fragment; the layout takes care of order and indentation.
     let words: Vec<Word> = crate::neural::recognize(&dir, img)?
         .into_iter()
@@ -144,10 +162,12 @@ fn tesseract_words(dir: &Path, img: &RgbaImage) -> Result<Vec<Word>, String> {
         return Err(t!("nenhum idioma em tessdata", "no language in tessdata").to_owned());
     }
 
+    static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let run_id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut words = Vec::new();
     for (index, (top, bottom)) in split_rows(&prepared, 6000).into_iter().enumerate() {
         let tile = image::imageops::crop_imm(&prepared, 0, top, prepared.width(), bottom - top).to_image();
-        let path = std::env::temp_dir().join(format!("snapkit-ocr-{}-{index}.png", std::process::id()));
+        let path = std::env::temp_dir().join(format!("snapkit-ocr-{}-{run_id}-{index}.png", std::process::id()));
         tile.save(&path).map_err(|e| e.to_string())?;
         let output = Command::new(dir.join("tesseract.exe"))
             .arg(&path)
@@ -282,6 +302,9 @@ fn layout(words: &[Word]) -> String {
 /// Prepares the image for OCR: light background, text enlarged `scale` times, a guaranteed minimum
 /// size and a width within `max`.
 fn prepare(img: &RgbaImage, scale: u32, max: u32) -> RgbaImage {
+    if img.width() == 0 || img.height() == 0 {
+        return img.clone();
+    }
     let mut out = img.clone();
     // The engines read dark text on a light background better: dark images are inverted.
     if is_dark(&out) {
@@ -327,7 +350,7 @@ fn is_dark(img: &RgbaImage) -> bool {
 
 /// Splits the height into chunks of up to `tile` rows, cutting preferably at a row of uniform color
 /// (between two lines of text) so letters aren't split in half.
-fn split_rows(img: &RgbaImage, tile: u32) -> Vec<(u32, u32)> {
+pub(crate) fn split_rows(img: &RgbaImage, tile: u32) -> Vec<(u32, u32)> {
     let h = img.height();
     let mut parts = Vec::new();
     let mut top = 0;
@@ -344,9 +367,13 @@ fn split_rows(img: &RgbaImage, tile: u32) -> Vec<(u32, u32)> {
 
 fn row_is_uniform(img: &RgbaImage, y: u32) -> bool {
     let w = img.width() as usize;
+    if w == 0 {
+        return true;
+    }
     let row = &img.as_raw()[y as usize * w * 4..(y as usize + 1) * w * 4];
-    let first = &row[..3];
-    row.chunks_exact(4).all(|px| &px[..3] == first)
+    let (pixels, _) = row.as_chunks::<4>();
+    let first = &pixels[0][..3];
+    pixels.iter().all(|px| &px[..3] == first)
 }
 
 #[cfg(test)]
@@ -388,6 +415,8 @@ mod tests {
 
     #[test]
     fn prepare_scales_caps_and_pads() {
+        assert_eq!(prepare(&white(0, 0), 2, 10_000).dimensions(), (0, 0));
+        assert_eq!(recognize(&white(0, 10), Mode::Printed).unwrap().0, "");
         assert_eq!(prepare(&white(300, 100), 2, 10_000).dimensions(), (600, 200));
         assert_eq!(prepare(&white(300, 100), 3, 10_000).dimensions(), (900, 300));
         assert_eq!(prepare(&white(300, 100), 1, 10_000).dimensions(), (300, 100));

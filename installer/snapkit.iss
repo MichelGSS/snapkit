@@ -56,7 +56,39 @@ Filename: "{app}\snapkit.exe"; Flags: nowait; Check: RelaunchAfterUpdate
 ; If the user turned on "Start with Windows", the entry is removed on uninstall.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "SnapKit"; Flags: dontcreatekey uninsdeletevalue
 
+[UninstallRun]
+Filename: "{app}\snapkit.exe"; Parameters: "--quit"; RunOnceId: "QuitSnapKit"; Flags: runhidden
+
 [Code]
+procedure StopRunningSnapKit(const ExePath: String);
+var
+  ResultCode: Integer;
+begin
+  if FileExists(ExePath) then
+  begin
+    Exec(ExePath, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(300);
+  end;
+end;
+
+function InitializeSetup: Boolean;
+begin
+  StopRunningSnapKit(ExpandConstant('{localappdata}\Programs\SnapKit\snapkit.exe'));
+  Result := True;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopRunningSnapKit(ExpandConstant('{app}\snapkit.exe'));
+  Result := '';
+end;
+
+function InitializeUninstall: Boolean;
+begin
+  StopRunningSnapKit(ExpandConstant('{app}\snapkit.exe'));
+  Result := True;
+end;
+
 function RelaunchAfterUpdate: Boolean;
 begin
   Result := WizardSilent and (ExpandConstant('{param:relaunch|0}') = '1');

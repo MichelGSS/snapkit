@@ -79,7 +79,7 @@ struct Converter {
 
 impl Converter {
     fn new(rate: u32, channels: u16) -> Self {
-        Self { channels: channels.max(1) as usize, step: rate as f64 / RATE as f64, pos: 0.0, prev: [0.0; 2] }
+        Self { channels: channels.max(1) as usize, step: rate.max(1) as f64 / RATE as f64, pos: 0.0, prev: [0.0; 2] }
     }
 
     fn convert(&mut self, input: &[f32], out: &mut VecDeque<f32>) {
@@ -155,10 +155,15 @@ fn open_stream(source: Source, ring: Ring) -> Result<cpal::Stream, String> {
     Ok(stream)
 }
 
+/// How many samples (counting both channels) correspond to `elapsed`.
+fn samples_for(elapsed: Duration) -> u64 {
+    let frames = (elapsed.as_secs_f64() * RATE as f64) as u64;
+    frames * CHANNELS as u64
+}
+
 /// How many samples (counting both channels) should have been recorded after `elapsed`.
 fn samples_due(elapsed: Duration) -> u64 {
-    let frames = (elapsed.saturating_sub(DELAY).as_secs_f64() * RATE as f64) as u64;
-    frames * CHANNELS as u64
+    samples_for(elapsed.saturating_sub(DELAY))
 }
 
 /// Takes `count` samples from each queue, adds them and clamps; whatever is missing becomes
@@ -180,7 +185,7 @@ fn wav_header(data_bytes: u32) -> [u8; 44] {
     let block = CHANNELS * 2;
     let mut h = [0u8; 44];
     h[0..4].copy_from_slice(b"RIFF");
-    h[4..8].copy_from_slice(&(36 + data_bytes).to_le_bytes());
+    h[4..8].copy_from_slice(&36u32.saturating_add(data_bytes).to_le_bytes());
     h[8..16].copy_from_slice(b"WAVEfmt ");
     h[16..20].copy_from_slice(&16u32.to_le_bytes());
     h[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
@@ -202,7 +207,8 @@ fn write_wav(path: &Path, rings: &[Ring], stop: &AtomicBool) -> std::io::Result<
     let mut written: u64 = 0;
     loop {
         let stopping = stop.load(Ordering::Relaxed);
-        let due = samples_due(start.elapsed());
+        let elapsed = start.elapsed();
+        let due = if stopping { samples_for(elapsed) } else { samples_due(elapsed) };
         if due > written {
             for sample in mix_due(rings, (due - written) as usize) {
                 file.write_all(&sample.to_le_bytes())?;
@@ -214,7 +220,7 @@ fn write_wav(path: &Path, rings: &[Ring], stop: &AtomicBool) -> std::io::Result<
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let data_bytes = (written * 2) as u32;
+    let data_bytes = (written * 2).min(u32::MAX as u64 - 36) as u32;
     // Now that the size is known, the header is written again.
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&wav_header(data_bytes))?;
@@ -226,7 +232,7 @@ fn write_wav(path: &Path, rings: &[Ring], stop: &AtomicBool) -> std::io::Result<
 pub struct AudioRecording {
     stop: Arc<AtomicBool>,
     captures: Vec<JoinHandle<()>>,
-    writer: JoinHandle<std::io::Result<u32>>,
+    writer: Option<JoinHandle<std::io::Result<u32>>>,
     path: PathBuf,
 }
 
@@ -244,13 +250,16 @@ impl AudioRecording {
         ];
         for (_, source, label) in wanted.into_iter().filter(|w| w.0) {
             let ring: Ring = Arc::new(Mutex::new(VecDeque::new()));
+            let source_stop = Arc::new(AtomicBool::new(false));
             // Each capture lives on its own thread: a `cpal` stream can't change threads.
             let (tx, rx) = channel::<Result<(), String>>();
-            let (stop_c, ring_c) = (stop.clone(), ring.clone());
+            let (stop_c, source_stop_c, ring_c) = (stop.clone(), source_stop.clone(), ring.clone());
             let handle = std::thread::spawn(move || {
                 let stream = match open_stream(source, ring_c) {
                     Ok(stream) => {
-                        let _ = tx.send(Ok(()));
+                        if source_stop_c.load(Ordering::Relaxed) || tx.send(Ok(())).is_err() {
+                            return;
+                        }
                         stream
                     }
                     Err(e) => {
@@ -258,7 +267,7 @@ impl AudioRecording {
                         return;
                     }
                 };
-                while !stop_c.load(Ordering::Relaxed) {
+                while !stop_c.load(Ordering::Relaxed) && !source_stop_c.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 drop(stream);
@@ -268,32 +277,59 @@ impl AudioRecording {
                     rings.push(ring);
                     captures.push(handle);
                 }
-                Ok(Err(e)) => warnings.push(tf!("sem {label}: {e}", "no {label}: {e}")),
-                Err(_) => warnings.push(tf!("sem {label}: a captura não respondeu", "no {label}: the capture did not respond")),
+                Ok(Err(e)) => {
+                    source_stop.store(true, Ordering::Relaxed);
+                    warnings.push(tf!("sem {label}: {e}", "no {label}: {e}"));
+                }
+                Err(_) => {
+                    source_stop.store(true, Ordering::Relaxed);
+                    warnings.push(tf!("sem {label}: a captura não respondeu", "no {label}: the capture did not respond"));
+                }
             }
         }
         if rings.is_empty() {
+            stop.store(true, Ordering::Relaxed);
             return (None, warnings);
+        }
+        // Discard samples collected by an earlier source while a later source was still opening,
+        // so all sources start together at `write_wav`'s clock zero.
+        for ring in &rings {
+            ring.lock().unwrap().clear();
         }
         let (stop_w, path_w) = (stop.clone(), path.to_owned());
         let writer = std::thread::spawn(move || write_wav(&path_w, &rings, &stop_w));
-        let recording = Self { stop, captures, writer, path: path.to_owned() };
+        let recording = Self { stop, captures, writer: Some(writer), path: path.to_owned() };
         (Some(recording), warnings)
     }
 
     /// Stops recording and returns the file and its length.
-    pub fn stop(self) -> Result<(PathBuf, Duration), String> {
+    pub fn stop(mut self) -> Result<(PathBuf, Duration), String> {
         self.stop.store(true, Ordering::Relaxed);
-        for t in self.captures {
+        for t in self.captures.drain(..) {
             let _ = t.join();
         }
-        let data_bytes = self
+        let writer = self
             .writer
+            .take()
+            .ok_or_else(|| t!("a gravação de áudio falhou", "the audio recording failed").to_owned())?;
+        let data_bytes = writer
             .join()
             .map_err(|_| t!("a gravação de áudio falhou", "the audio recording failed").to_owned())?
             .map_err(|e| e.to_string())?;
         let seconds = data_bytes as f64 / (RATE as f64 * CHANNELS as f64 * 2.0);
-        Ok((self.path, Duration::from_secs_f64(seconds)))
+        Ok((self.path.clone(), Duration::from_secs_f64(seconds)))
+    }
+}
+
+impl Drop for AudioRecording {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for t in self.captures.drain(..) {
+            let _ = t.join();
+        }
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
     }
 }
 

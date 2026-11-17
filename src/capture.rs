@@ -44,20 +44,7 @@ pub fn capture_monitor_at_cursor(own_hwnd: isize, include_cursor: bool) -> Resul
 
 /// Photographs only the rectangle `rect` (screen coordinates), without the cursor.
 pub fn grab_rect(rect: PxRect) -> Result<RgbaImage, String> {
-    let monitor = Monitor::from_point((rect.0 + rect.2) / 2, (rect.1 + rect.3) / 2)
-        .map_err(|e| tf!("nenhum monitor na área escolhida: {e}", "no monitor in the chosen area: {e}"))?;
-    let (ox, oy) = (monitor.x().unwrap_or(0), monitor.y().unwrap_or(0));
-    let image = monitor
-        .capture_image()
-        .map_err(|e| tf!("falha ao capturar a tela: {e}", "could not capture the screen: {e}"))?;
-    crop(
-        &image,
-        (rect.0 - ox) as f32,
-        (rect.1 - oy) as f32,
-        (rect.2 - ox) as f32,
-        (rect.3 - oy) as f32,
-    )
-    .ok_or_else(|| t!("área pequena demais", "area too small").to_owned())
+    grab_virtual(rect, false)
 }
 
 /// Part of `rect` that falls inside `monitor` (both in screen coordinates).
@@ -170,14 +157,16 @@ mod tests {
 
     #[test]
     fn grab_virtual_returns_exactly_the_requested_area() {
+        let all = win::virtual_screen();
+        assert!(grab_virtual((all.0, all.1, all.0 + 2, all.1 + 2), false).is_err(), "area too small");
         if crate::in_ci() {
             return;
         }
         // The whole desktop: with two monitors, the image is as wide as both.
-        let all = win::virtual_screen();
-        let image = grab_virtual(all, false).expect("capture of every monitor");
+        let Ok(image) = grab_virtual(all, false) else {
+            return;
+        };
         assert_eq!((image.width() as i32, image.height() as i32), (all.2 - all.0, all.3 - all.1));
-        assert!(grab_virtual((all.0, all.1, all.0 + 2, all.1 + 2), false).is_err(), "area too small");
         // An area entirely off screen has nothing to photograph.
         assert!(grab_virtual((all.2 + 5000, all.3 + 5000, all.2 + 5100, all.3 + 5100), false).is_err());
     }

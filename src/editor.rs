@@ -324,9 +324,19 @@ impl History {
     pub fn rebase(&mut self, original: RgbaImage, dx: f32, dy: f32) {
         self.original = original;
         if dx != 0.0 || dy != 0.0 {
-            let saved = self.undo.iter_mut().chain(self.redo.iter_mut()).flatten();
-            for op in self.ops.iter_mut().chain(saved) {
-                op.translate(dx, dy);
+            let shift_list = |list: &mut [Op]| {
+                for op in list {
+                    op.rebase_translate(dx, dy);
+                    // Operations after a crop or whole-image transform are already in the
+                    // coordinate system of that transform, not the original capture's.
+                    if matches!(op, Op::Crop { .. } | Op::Rotate { .. } | Op::Flip { .. } | Op::Resize { .. }) {
+                        break;
+                    }
+                }
+            };
+            shift_list(&mut self.ops);
+            for saved in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+                shift_list(saved);
             }
         }
         self.rerender();
@@ -509,12 +519,13 @@ impl Editor {
     pub fn annotations_image(&self) -> egui::ColorImage {
         let (w, h) = self.history.image().dimensions();
         let clear = RgbaImage::new(w, h);
-        to_color_image(&render::render_all(&clear, self.history.ops(), self.history.font()))
+        texture_image(&render::render_all(&clear, self.history.ops(), self.history.font()), self.max_texture)
     }
 
     /// Replaces the photo underneath (the quick annotation area was moved or resized) and keeps the
     /// annotations, shifted by `(dx, dy)` pixels, along with undo and redo.
     pub fn rebase(&mut self, image: RgbaImage, dx: f32, dy: f32) {
+        self.commit_pending_text();
         self.history.rebase(image, dx, dy);
         self.drag_start = None;
         self.pen_points.clear();
@@ -548,6 +559,7 @@ impl Editor {
     /// The part of the image marked with Grab text, if there's a pending request.
     pub fn take_text_request(&mut self) -> Option<RgbaImage> {
         let (a, b) = self.text_request.take()?;
+        self.commit_pending_text();
         crate::capture::crop(self.history.image(), a.0, a.1, b.0, b.1)
     }
 
@@ -568,21 +580,26 @@ impl Editor {
     }
 
     fn commit(&mut self, op: Op) {
+        self.gesture_open = false;
         self.history.push(op);
         self.refresh_texture();
     }
 
     fn undo(&mut self) {
+        self.pending_text = None;
         self.selected = None;
         self.drag = None;
+        self.gesture_open = false;
         if self.history.undo() {
             self.refresh_texture();
         }
     }
 
     fn redo(&mut self) {
+        self.pending_text = None;
         self.selected = None;
         self.drag = None;
+        self.gesture_open = false;
         if self.history.redo() {
             self.refresh_texture();
         }
@@ -625,8 +642,8 @@ impl Editor {
                         let clicked =
                             ui.selectable_label(self.tool == *tool, tool_label(*tool)).on_hover_text(tool_hint(*tool)).clicked();
                         if clicked {
+                            self.commit_pending_text();
                             self.tool = *tool;
-                            self.pending_text = None;
                             self.selected = None;
                             self.drag = None;
                         }
@@ -677,6 +694,7 @@ impl Editor {
 
     /// Switches to the style's tool, with its options already set.
     fn apply_style(&mut self, style: &Style) {
+        self.commit_pending_text();
         let [r, g, b, a] = style.color;
         self.tool = style.tool;
         self.color = Color32::from_rgba_unmultiplied(r, g, b, a);
@@ -684,7 +702,6 @@ impl Editor {
         (self.filled, self.boxed, self.dashed, self.double) = (style.filled, style.boxed, style.dashed, style.double);
         (self.stamp, self.step_shape, self.step_glyph) = (style.stamp, style.step_shape, style.step_glyph);
         self.callout_style = style.callout_style;
-        self.pending_text = None;
         self.selected = None;
         self.drag = None;
     }
@@ -772,8 +789,16 @@ impl Editor {
                 if self.resize_lock {
                     if w_changed {
                         h = scaled_side(w, iw, ih);
+                        if h > 20_000 {
+                            h = 20_000;
+                            w = scaled_side(h, ih, iw).min(20_000);
+                        }
                     } else if h_changed {
                         w = scaled_side(h, ih, iw);
+                        if w > 20_000 {
+                            w = 20_000;
+                            h = scaled_side(w, iw, ih).min(20_000);
+                        }
                     }
                 }
                 self.resize_to = (w, h);
@@ -800,7 +825,7 @@ impl Editor {
             }
         });
         if let Some(op) = op {
-            self.pending_text = None;
+            self.commit_pending_text();
             self.selected = None;
             self.drag = None;
             self.commit(op);
@@ -913,34 +938,33 @@ impl Editor {
             if self.width != before.1 {
                 op.set_thickness(self.width);
             }
-            if self.filled != before.2 {
-                if let Op::Rect { filled, .. } | Op::Ellipse { filled, .. } = &mut op {
-                    *filled = self.filled;
-                }
+            if self.filled != before.2
+                && let Op::Rect { filled, .. } | Op::Ellipse { filled, .. } = &mut op
+            {
+                *filled = self.filled;
             }
-            if self.boxed != before.3 {
-                if let Op::Text { boxed, .. } = &mut op {
-                    *boxed = self.boxed;
-                }
+            if self.boxed != before.3
+                && let Op::Text { boxed, .. } = &mut op
+            {
+                *boxed = self.boxed;
             }
-            if self.dashed != before.4 {
-                if let Op::Arrow { dashed, .. }
+            if self.dashed != before.4
+                && let Op::Arrow { dashed, .. }
                 | Op::Line { dashed, .. }
                 | Op::Rect { dashed, .. }
                 | Op::Ellipse { dashed, .. } = &mut op
-                {
-                    *dashed = self.dashed;
-                }
+            {
+                *dashed = self.dashed;
             }
-            if self.double != before.5 {
-                if let Op::Arrow { double, .. } = &mut op {
-                    *double = self.double;
-                }
+            if self.double != before.5
+                && let Op::Arrow { double, .. } = &mut op
+            {
+                *double = self.double;
             }
-            if self.stamp != before.6 {
-                if let Op::Stamp { kind, .. } = &mut op {
-                    *kind = self.stamp;
-                }
+            if self.stamp != before.6
+                && let Op::Stamp { kind, .. } = &mut op
+            {
+                *kind = self.stamp;
             }
             if (self.step_shape, self.step_glyph, self.callout_style) != before_style {
                 match &mut op {
@@ -967,6 +991,12 @@ impl Editor {
         self.pending_text.is_some()
     }
 
+    /// Alias for [`Self::is_typing`]: whether a text annotation is currently being edited.
+    #[allow(dead_code)]
+    pub fn is_editing_text(&self) -> bool {
+        self.pending_text.is_some()
+    }
+
     /// An annotation is selected with the Select tool.
     pub fn has_selection(&self) -> bool {
         self.selection().is_some()
@@ -978,8 +1008,8 @@ impl Editor {
         for tool in QUICK_TOOLS {
             let clicked = ui.selectable_label(self.tool == tool, tool_label(tool)).on_hover_text(tool_hint(tool)).clicked();
             if clicked {
+                self.commit_pending_text();
                 self.tool = tool;
-                self.pending_text = None;
                 self.selected = None;
                 self.drag = None;
             }
@@ -1068,7 +1098,8 @@ impl Editor {
             None => self.layout_view(ui, &ctx, img_size),
         };
         self.view_scale = scale;
-        let response = ui.allocate_rect(img_rect.intersect(avail), Sense::click_and_drag());
+        let interact_rect = self.fixed_rect.map_or(avail, |r| r.intersect(avail));
+        let response = ui.allocate_rect(interact_rect, Sense::click_and_drag());
         let painter = ui.painter_at(avail.expand(8.0));
         self.canvas_body(&ctx, response, painter, img_rect, img_size, scale);
     }
@@ -1076,7 +1107,7 @@ impl Editor {
     /// Position and scale of the image in the regular editor, with zoom and offset.
     fn layout_view(&mut self, ui: &egui::Ui, ctx: &egui::Context, img_size: Vec2) -> (Rect, f32, Rect) {
         let avail = ui.available_rect_before_wrap().shrink(8.0);
-        let fit = (avail.width() / img_size.x).min(avail.height() / img_size.y).min(1.0).max(0.01);
+        let fit = (avail.width() / img_size.x).min(avail.height() / img_size.y).clamp(0.01, 1.0);
         let mut scale = self.zoom.unwrap_or(fit);
         // Ctrl + wheel zooms at the point under the cursor; the wheel alone or the middle button
         // pans.
@@ -1128,8 +1159,8 @@ impl Editor {
                 let v = (p - img_rect.min) / scale;
                 (v.x, v.y)
             };
-            self.select_ui(&ctx, &response, &painter, free, to_screen, scale);
             self.pending_text_ui(&ctx, to_screen, scale);
+            self.select_ui(&ctx, &response, &painter, free, to_screen, scale);
             return;
         }
 
@@ -1146,11 +1177,11 @@ impl Editor {
             if let Some(p) = response.hover_pos() {
                 painter.circle_stroke(p, radius * scale, Stroke::new(2.0, self.color));
             }
-            if response.clicked() {
-                if let Some(p) = response.interact_pointer_pos() {
-                    let color = self.rgba();
-                    self.commit(Op::Stamp { kind: self.stamp, center: to_img(p), radius, color });
-                }
+            if response.clicked()
+                && let Some(p) = response.interact_pointer_pos()
+            {
+                let color = self.rgba();
+                self.commit(Op::Stamp { kind: self.stamp, center: to_img(p), radius, color });
             }
             return;
         }
@@ -1161,20 +1192,22 @@ impl Editor {
             if let Some(p) = response.hover_pos() {
                 painter.circle_filled(p, radius * scale, self.color.gamma_multiply(0.55));
                 let [r, g, b, _] = render::step_text_color(self.rgba());
+                let label = render::step_label(number, self.step_glyph);
+                let font_size = render::step_label_size(&label, radius) * scale;
                 painter.text(
                     p,
                     egui::Align2::CENTER_CENTER,
-                    render::step_label(number, self.step_glyph),
-                    egui::FontId::proportional(render::step_font_size(number, radius) * scale),
+                    label,
+                    egui::FontId::proportional(font_size),
                     Color32::from_rgb(r, g, b),
                 );
             }
-            if response.clicked() {
-                if let Some(p) = response.interact_pointer_pos() {
-                    let color = self.rgba();
-                    let (shape, glyph) = (self.step_shape, self.step_glyph);
-                    self.commit(Op::Step { center: to_img(p), number, color, radius, shape, glyph });
-                }
+            if response.clicked()
+                && let Some(p) = response.interact_pointer_pos()
+            {
+                let color = self.rgba();
+                let (shape, glyph) = (self.step_shape, self.step_glyph);
+                self.commit(Op::Step { center: to_img(p), number, color, radius, shape, glyph });
             }
             return;
         }
@@ -1283,6 +1316,8 @@ impl Editor {
     }
 
     fn delete(&mut self, index: usize) {
+        self.pending_text = None;
+        self.gesture_open = false;
         self.history.remove(index);
         self.selected = None;
         self.drag = None;
@@ -1323,6 +1358,7 @@ impl Editor {
         };
 
         if response.drag_started() {
+            self.commit_pending_text();
             // A drag is only recognized after the mouse moves a little; what counts is where it was
             // pressed.
             let origin = ctx.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos()).map(&to_img);
@@ -1357,6 +1393,11 @@ impl Editor {
             let live = img.width() as u64 * img.height() as u64 <= LIVE_PIXELS;
             if live || stop {
                 self.change(d.index, d.current.clone());
+                if d.handle.is_some()
+                    && let Some(t) = d.current.thickness()
+                {
+                    self.width = t.clamp(1.0, 24.0);
+                }
             }
             if response.dragged() && !stop {
                 self.drag = Some(d);
@@ -1365,6 +1406,7 @@ impl Editor {
 
         let click_pos = response.interact_pointer_pos().map(&to_img);
         if response.double_clicked() {
+            self.commit_pending_text();
             if let Some(i) = click_pos.and_then(|p| self.pick(p, tol)) {
                 let editable = match &self.history.ops()[i] {
                     Op::Text { pos, text, .. } => Some((*pos, text.clone(), None)),
@@ -1379,42 +1421,44 @@ impl Editor {
                 }
             }
         } else if response.clicked() {
+            self.commit_pending_text();
             match click_pos.and_then(|p| self.pick(p, tol)) {
                 Some(i) => self.select(i),
                 None => self.selected = None,
             }
         }
 
-        if self.pending_text.is_none() && !ctx.egui_wants_keyboard_input() {
-            if let Some(i) = self.selection() {
-                let (delete, escape, duplicate, dx, dy) = ctx.input_mut(|inp| {
-                    let step = if inp.modifiers.shift { 10.0 } else { 1.0 };
-                    let axis = |neg: egui::Key, pos: egui::Key| {
-                        step * (inp.key_pressed(pos) as i32 - inp.key_pressed(neg) as i32) as f32
-                    };
-                    let (dx, dy) = (
-                        axis(egui::Key::ArrowLeft, egui::Key::ArrowRight),
-                        axis(egui::Key::ArrowUp, egui::Key::ArrowDown),
-                    );
-                    (
-                        inp.key_pressed(egui::Key::Delete) || inp.key_pressed(egui::Key::Backspace),
-                        inp.key_pressed(egui::Key::Escape),
-                        inp.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
-                        dx,
-                        dy,
-                    )
-                });
-                if delete {
-                    self.delete(i);
-                } else if escape {
-                    self.selected = None;
-                } else if duplicate {
-                    self.duplicate(i);
-                } else if dx != 0.0 || dy != 0.0 {
-                    let mut op = self.history.ops()[i].clone();
-                    op.translate(dx, dy);
-                    self.change(i, op);
-                }
+        if self.pending_text.is_none()
+            && !ctx.egui_wants_keyboard_input()
+            && let Some(i) = self.selection()
+        {
+            let (delete, escape, duplicate, dx, dy) = ctx.input_mut(|inp| {
+                let step = if inp.modifiers.shift { 10.0 } else { 1.0 };
+                let axis = |neg: egui::Key, pos: egui::Key| {
+                    step * (inp.key_pressed(pos) as i32 - inp.key_pressed(neg) as i32) as f32
+                };
+                let (dx, dy) = (
+                    axis(egui::Key::ArrowLeft, egui::Key::ArrowRight),
+                    axis(egui::Key::ArrowUp, egui::Key::ArrowDown),
+                );
+                (
+                    inp.key_pressed(egui::Key::Delete) || inp.key_pressed(egui::Key::Backspace),
+                    inp.key_pressed(egui::Key::Escape),
+                    inp.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
+                    dx,
+                    dy,
+                )
+            });
+            if delete {
+                self.delete(i);
+            } else if escape {
+                self.selected = None;
+            } else if duplicate {
+                self.duplicate(i);
+            } else if dx != 0.0 || dy != 0.0 {
+                let mut op = self.history.ops()[i].clone();
+                op.translate(dx, dy);
+                self.change(i, op);
             }
         }
 
@@ -1434,11 +1478,11 @@ impl Editor {
             None => self.selection().map(|i| self.history.ops()[i].clone()),
         };
         if let Some(op) = shown {
-            if !matches!(op, Op::Arrow { .. } | Op::Line { .. }) {
-                if let Some((min, max)) = op.bounds(&font) {
-                    let frame = Rect::from_min_max(to_screen(min), to_screen(max)).expand(3.0);
-                    painter.rect_stroke(frame, 2.0, Stroke::new(1.5, self.accent), StrokeKind::Middle);
-                }
+            if !matches!(op, Op::Arrow { .. } | Op::Line { .. })
+                && let Some((min, max)) = op.bounds(&font)
+            {
+                let frame = Rect::from_min_max(to_screen(min), to_screen(max)).expand(3.0);
+                painter.rect_stroke(frame, 2.0, Stroke::new(1.5, self.accent), StrokeKind::Middle);
             }
             for (_, hp) in op.handles(&font) {
                 let knob = Rect::from_center_size(to_screen(hp), Vec2::splat(9.0));
@@ -1478,12 +1522,18 @@ impl Editor {
                 let (da, db) = render::magnify_dest(a, b, render::magnify_zoom_for(width), size);
                 Op::Magnify { src: (a, b), a: da, b: db }
             }),
-            Tool::Crop => area_ok.then_some(Op::Crop { a, b }),
+            Tool::Crop => {
+                let img = self.history.image();
+                (area_ok && render::has_crop(img, a, b)).then_some(Op::Crop { a, b })
+            }
             Tool::CutOut => {
                 // The direction of the drag says which strip goes: downward, rows; sideways,
                 // columns.
                 let (dx, dy) = ((b.0 - a.0).abs(), (b.1 - a.1).abs());
-                (dx.max(dy) >= 3.0).then_some(Op::CutOut { from: a, to: b, rows: dy >= dx })
+                let rows = dy >= dx;
+                let img = self.history.image();
+                (dx.max(dy) >= 3.0 && render::cut_out_range(img, a, b, rows).is_some())
+                    .then_some(Op::CutOut { from: a, to: b, rows })
             }
             Tool::Text | Tool::GrabText | Tool::Step | Tool::Select | Tool::Callout | Tool::Stamp => None,
         }
@@ -1508,15 +1558,23 @@ impl Editor {
                 let len = dir.length();
                 if len > 1.0 {
                     let u = dir / len;
-                    let head = (render::arrow_head_len(self.width) * scale).min(len);
-                    let base = sb - u * head;
+                    let head = (render::arrow_head_len(self.width) * scale).min(if self.double { len / 2.0 } else { len });
+                    let end = sb - u * head;
+                    let start = if self.double { sa + u * head } else { sa };
                     let n = Vec2::new(-u.y, u.x) * head * 0.45;
-                    painter.line_segment([sa, base], stroke);
+                    painter.line_segment([start, end], stroke);
                     painter.add(egui::Shape::convex_polygon(
-                        vec![sb, base + n, base - n],
+                        vec![sb, end + n, end - n],
                         self.color,
                         Stroke::NONE,
                     ));
+                    if self.double {
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![sa, start - n, start + n],
+                            self.color,
+                            Stroke::NONE,
+                        ));
+                    }
                 }
             }
             Tool::Line => {
@@ -1594,7 +1652,7 @@ impl Editor {
         }
     }
 
-    fn commit_pending_text(&mut self) {
+    pub fn commit_pending_text(&mut self) {
         let Some(p) = self.pending_text.take() else { return };
         match p.edit {
             Some(i) => {
@@ -1934,5 +1992,40 @@ mod tests {
         let mut h = history();
         assert!(!h.can_undo());
         assert!(!h.undo());
+    }
+
+    #[test]
+    fn rebase_shifts_magnify_source_and_preserves_post_crop_coords() {
+        let mut h = history();
+        h.push(Op::Magnify { src: ((10.0, 10.0), (30.0, 30.0)), a: (50.0, 50.0), b: (90.0, 90.0) });
+        h.rebase(RgbaImage::from_pixel(120, 120, image::Rgba(WHITE)), 10.0, 20.0);
+        assert_eq!(
+            h.ops()[0],
+            Op::Magnify { src: ((20.0, 30.0), (40.0, 50.0)), a: (60.0, 70.0), b: (100.0, 110.0) }
+        );
+
+        let mut h = history();
+        h.push(Op::Crop { a: (10.0, 10.0), b: (50.0, 50.0) });
+        h.push(Op::Line { from: (5.0, 20.0), to: (35.0, 20.0), color: RED, width: 6.0, dashed: false });
+        h.rebase(RgbaImage::from_pixel(120, 120, image::Rgba(WHITE)), 10.0, 10.0);
+        assert_eq!(h.ops()[0], Op::Crop { a: (20.0, 20.0), b: (60.0, 60.0) });
+        assert_eq!(
+            h.ops()[1],
+            Op::Line { from: (5.0, 20.0), to: (35.0, 20.0), color: RED, width: 6.0, dashed: false }
+        );
+        assert_eq!(h.image().get_pixel(20, 20).0, RED);
+    }
+
+    #[test]
+    fn noop_cut_out_or_crop_is_not_built() {
+        let ctx = egui::Context::default();
+        let img = RgbaImage::from_pixel(100, 100, image::Rgba(WHITE));
+        let mut ed = Editor::new(&ctx, img, Color32::WHITE);
+        ed.tool = Tool::CutOut;
+        assert!(ed.build_op((0.0, 0.0), (0.0, 100.0)).is_none(), "removing the whole height is rejected");
+        assert!(ed.build_op((0.0, 10.0), (0.0, 40.0)).is_some());
+        ed.tool = Tool::Crop;
+        assert!(ed.build_op((0.0, 0.0), (100.0, 100.0)).is_none(), "cropping the whole image is a no-op");
+        assert!(ed.build_op((10.0, 10.0), (80.0, 80.0)).is_some());
     }
 }

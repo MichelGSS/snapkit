@@ -90,6 +90,9 @@ fn start_runtime() -> Result<Environment, String> {
 
 /// Reads every line of text in the image.
 pub fn recognize(dir: &Path, img: &RgbaImage) -> Result<Vec<Line>, String> {
+    if img.width() == 0 || img.height() == 0 {
+        return Ok(Vec::new());
+    }
     let err = |e: ort::Error| tf!("falha no motor neural: {e}", "neural engine failure: {e}");
     // ONNX Runtime allows only one environment per process; it's created on the first read.
     static ENV: OnceLock<Result<Environment, String>> = OnceLock::new();
@@ -98,18 +101,21 @@ pub fn recognize(dir: &Path, img: &RgbaImage) -> Result<Vec<Line>, String> {
     let mut rec = Session::builder(env).map_err(err)?.commit_from_file(dir.join("rec.onnx")).map_err(err)?;
     let alphabet = alphabet(&rec)?;
 
-    let boxes = detect(&mut det, img)?;
     let mut lines = Vec::new();
-    for b in boxes {
-        let crop = image::imageops::crop_imm(img, b.0, b.1, b.2 - b.0, b.3 - b.1).to_image();
-        if let Some(text) = read_line(&mut rec, &crop, &alphabet)? {
-            lines.push(Line {
-                x: b.0 as f32,
-                y: b.1 as f32,
-                w: (b.2 - b.0) as f32,
-                h: (b.3 - b.1) as f32,
-                text,
-            });
+    for (top, bottom) in crate::ocr::split_rows(img, DET_MAX_SIDE as u32) {
+        let tile = image::imageops::crop_imm(img, 0, top, img.width(), bottom - top).to_image();
+        let boxes = detect(&mut det, &tile)?;
+        for b in boxes {
+            let crop = image::imageops::crop_imm(&tile, b.0, b.1, b.2 - b.0, b.3 - b.1).to_image();
+            if let Some(text) = read_line(&mut rec, &crop, &alphabet)? {
+                lines.push(Line {
+                    x: b.0 as f32,
+                    y: (top + b.1) as f32,
+                    w: (b.2 - b.0) as f32,
+                    h: (b.3 - b.1) as f32,
+                    text,
+                });
+            }
         }
     }
     Ok(lines)
@@ -143,6 +149,9 @@ fn to_tensor(img: &image::RgbImage) -> Result<Tensor<f32>, String> {
 
 /// Rectangles (left, top, right, bottom) of the lines of text, top to bottom.
 fn detect(det: &mut Session, img: &RgbaImage) -> Result<Vec<(u32, u32, u32, u32)>, String> {
+    if img.width() == 0 || img.height() == 0 {
+        return Ok(Vec::new());
+    }
     let (w, h) = (img.width() as f32, img.height() as f32);
     // Small images are enlarged (tiny text disappears in detection); huge ones are reduced.
     let mut scale = if w.min(h) < DET_MIN_SIDE { DET_MIN_SIDE / w.min(h) } else { 1.0 };
@@ -237,7 +246,10 @@ fn read_line(rec: &mut Session, crop: &RgbaImage, alphabet: &[String]) -> Result
     let input = to_tensor(&resized)?;
     let outputs = rec.run(ort::inputs![input]).map_err(|e| e.to_string())?;
     let (shape, probs) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-    let classes = *shape.last().ok_or(t!("saída inesperada do modelo de reconhecimento", "unexpected output from the recognition model"))? as usize;
+    let classes = shape
+        .last()
+        .and_then(|&c| usize::try_from(c).ok())
+        .ok_or(t!("saída inesperada do modelo de reconhecimento", "unexpected output from the recognition model"))?;
     if classes == 0 || probs.len() % classes != 0 {
         return Err(t!("saída inesperada do modelo de reconhecimento", "unexpected output from the recognition model").to_owned());
     }
@@ -255,12 +267,13 @@ fn decode_ctc(probs: &[f32], classes: usize, alphabet: &[String]) -> Option<Stri
             .iter()
             .enumerate()
             .fold((0, f32::MIN), |acc, (i, &p)| if p > acc.1 { (i, p) } else { acc });
-        if best != 0 && best != previous {
-            if let Some(ch) = alphabet.get(best) {
-                text.push_str(ch);
-                confidence += p;
-                chars += 1;
-            }
+        if best != 0
+            && best != previous
+            && let Some(ch) = alphabet.get(best)
+        {
+            text.push_str(ch);
+            confidence += p;
+            chars += 1;
         }
         previous = best;
     }

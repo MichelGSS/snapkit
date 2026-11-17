@@ -62,7 +62,7 @@ pub fn latest() -> Result<Release, String> {
 fn parse_release(json: &str) -> Result<Release, String> {
     let bad = || t!("resposta inesperada do GitHub", "unexpected answer from GitHub").to_owned();
     let v: serde_json::Value = serde_json::from_str(json).map_err(|_| bad())?;
-    let version = v["tag_name"].as_str().ok_or_else(bad)?.trim_start_matches('v').to_owned();
+    let version = v["tag_name"].as_str().ok_or_else(bad)?.trim_start_matches(['v', 'V']).to_owned();
     let page = v["html_url"].as_str().unwrap_or_default().to_owned();
     let installer = v["assets"].as_array().and_then(|assets| {
         assets.iter().find_map(|a| {
@@ -79,10 +79,16 @@ fn parse_release(json: &str) -> Result<Release, String> {
 }
 
 /// Is `candidate` a later version than `current`? Compares the numbers ("0.10.0" is later than
-/// "0.9.9"); anything after a "-" (such as "-beta") is ignored.
+/// "0.9.9"); anything after a "-" or "+" (such as "-beta" or "+build") is ignored.
 pub fn is_newer(candidate: &str, current: &str) -> bool {
     let parts = |v: &str| -> Vec<u64> {
-        v.split('-').next().unwrap_or_default().split('.').map(|n| n.trim().parse().unwrap_or(0)).collect()
+        v.trim_start_matches(['v', 'V'])
+            .split(['-', '+'])
+            .next()
+            .unwrap_or_default()
+            .split('.')
+            .map(|n| n.trim().parse().unwrap_or(0))
+            .collect()
     };
     let (a, b) = (parts(candidate), parts(current));
     for i in 0..a.len().max(b.len()) {
@@ -110,8 +116,11 @@ pub fn download(asset: &Asset) -> Result<PathBuf, String> {
         .sha256
         .clone()
         .ok_or_else(|| t!("a versão não informa o SHA-256 do instalador", "the release doesn't give the installer's SHA-256").to_owned())?;
-    if asset.name.contains(['/', '\\', ':']) {
+    if asset.name.contains(['/', '\\', ':']) || asset.name == "." || asset.name == ".." {
         return Err(t!("nome de arquivo inválido", "invalid file name").to_owned());
+    }
+    if !asset.url.starts_with("https://") {
+        return Err(t!("endereço de download inválido", "invalid download URL").to_owned());
     }
     let dir = std::env::temp_dir().join("SnapKit-update");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -139,9 +148,12 @@ fn save_checked(mut reader: impl Read, path: &Path, expected: &str, size: u64) -
         if n == 0 {
             break;
         }
+        written += n as u64;
+        if size != 0 && written > size {
+            return Err(t!("o download veio corrompido (maior que o esperado)", "the download is corrupted (larger than expected)").to_owned());
+        }
         hasher.update(&buf[..n]);
         file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        written += n as u64;
     }
     file.flush().map_err(|e| e.to_string())?;
     if size != 0 && written != size {
@@ -184,6 +196,7 @@ mod tests {
         assert!(is_newer("0.5.4", "0.5.3"));
         assert!(is_newer("0.10.0", "0.9.9"));
         assert!(is_newer("1.0", "0.99.99"));
+        assert!(is_newer("V0.6.1+build42", "0.6.0"));
         assert!(!is_newer("0.5.3", "0.5.3"));
         assert!(!is_newer("0.5.2", "0.5.3"));
         assert!(!is_newer("0.5.3-beta", "0.5.3"));
@@ -218,6 +231,17 @@ mod tests {
         assert!(save_checked(&b"hello"[..], &file, good, 5).is_ok());
         assert!(save_checked(&b"hellO"[..], &file, good, 5).is_err(), "a different file is refused");
         assert!(save_checked(&b"hell"[..], &file, good, 5).is_err(), "a short download is refused");
+        assert!(save_checked(&b"hello!"[..], &file, good, 5).is_err(), "an oversized download is refused");
+        assert!(
+            download(&Asset {
+                name: "SnapKit-0.6.0-setup.exe".into(),
+                url: "http://example.com/setup.exe".into(),
+                size: 5,
+                sha256: Some(good.into()),
+            })
+            .is_err(),
+            "non-HTTPS download URL is refused"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

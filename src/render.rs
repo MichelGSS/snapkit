@@ -245,7 +245,11 @@ impl Op {
                 let (w, h) = text_extent(text, *size, font);
                 Some((*pos, (pos.0 + w, pos.1 + h)))
             }
-            Op::Step { center, radius, .. } | Op::Stamp { center, radius, .. } => {
+            Op::Step { center, radius, shape, .. } => {
+                let bottom = if *shape == StepShape::Pin { radius * 1.55 } else { *radius };
+                Some(((center.0 - radius, center.1 - radius), (center.0 + radius, center.1 + bottom)))
+            }
+            Op::Stamp { center, radius, .. } => {
                 Some(((center.0 - radius, center.1 - radius), (center.0 + radius, center.1 + radius)))
             }
             Op::Callout { pos, text, size, .. } => Some(callout_box(*pos, text, *size, font)),
@@ -294,8 +298,17 @@ impl Op {
                 if rx < 1.0 || ry < 1.0 {
                     return false;
                 }
-                let d = (((p.0 - min.0 - rx) / rx).powi(2) + ((p.1 - min.1 - ry) / ry).powi(2)).sqrt();
-                (*filled && d <= 1.0) || (d - 1.0).abs() * rx.min(ry) <= width / 2.0 + tol
+                let (nx, ny) = ((p.0 - min.0 - rx) / rx, (p.1 - min.1 - ry) / ry);
+                let d = (nx * nx + ny * ny).sqrt();
+                if *filled && d <= 1.0 {
+                    return true;
+                }
+                let dist = if d < 1e-6 {
+                    rx.min(ry)
+                } else {
+                    (d - 1.0).abs() * d / ((nx / rx).powi(2) + (ny / ry).powi(2)).sqrt()
+                };
+                dist <= width / 2.0 + tol
             }
             _ => self.frame(font).is_some_and(|f| in_box(p, f, tol)),
         }
@@ -344,6 +357,24 @@ impl Op {
             | Op::Shadow { .. }
             | Op::CutOut { .. } => {}
         }
+    }
+
+    /// Shifts coordinates when the underlying capture is replaced (`History::rebase`), including
+    /// the source region of a magnifier and the strip of a cut-out.
+    pub fn rebase_translate(&mut self, dx: f32, dy: f32) {
+        if let Op::Magnify { src, .. } = self {
+            src.0.0 += dx;
+            src.0.1 += dy;
+            src.1.0 += dx;
+            src.1.1 += dy;
+        }
+        if let Op::CutOut { from, to, .. } = self {
+            from.0 += dx;
+            from.1 += dy;
+            to.0 += dx;
+            to.1 += dy;
+        }
+        self.translate(dx, dy);
     }
 
     /// The object's control points, in image pixels.
@@ -404,9 +435,20 @@ impl Op {
                 if let Some(f) = frame {
                     let (fixed, grabbed) = (corner(f, i + 2), corner(f, i));
                     // A nearly straight stroke can't be stretched in the direction in which it's
-                    // thin.
+                    // thin; a minimum span keeps the stroke from collapsing to a single point.
                     let ratio = |to: f32, fixed: f32, grabbed: f32| {
-                        if (grabbed - fixed).abs() < 1.0 { 1.0 } else { (to - fixed) / (grabbed - fixed) }
+                        let span = grabbed - fixed;
+                        if span.abs() < 1.0 {
+                            1.0
+                        } else {
+                            let delta = to - fixed;
+                            let clamped = if delta.abs() < 2.0 {
+                                2.0_f32.copysign(if delta == 0.0 { span } else { delta })
+                            } else {
+                                delta
+                            };
+                            clamped / span
+                        }
                     };
                     let (sx, sy) = (ratio(to.0, fixed.0, grabbed.0), ratio(to.1, fixed.1, grabbed.1));
                     for p in points.iter_mut() {
@@ -613,18 +655,28 @@ fn with_shadow(img: &RgbaImage, size: u32) -> RgbaImage {
     out
 }
 
-/// Removes the rows (or columns) between `from` and `to` and joins what remains.
-fn cut_out(img: &mut RgbaImage, from: Point, to: Point, rows: bool) {
-    let (w, h) = (img.width(), img.height());
-    let limit = if rows { h } else { w } as f32;
+/// Start and end of the strip removed by [`cut_out`], or `None` if nothing (or the whole image)
+/// would be removed.
+pub fn cut_out_range(img: &RgbaImage, from: Point, to: Point, rows: bool) -> Option<(u32, u32)> {
+    let limit = if rows { img.height() } else { img.width() } as f32;
     let (a, b) = if rows { (from.1, to.1) } else { (from.0, to.0) };
     let start = a.min(b).clamp(0.0, limit).round() as u32;
     let end = a.max(b).clamp(0.0, limit).round() as u32;
     let removed = end - start;
     // Some image has to remain.
-    if removed == 0 || removed >= limit as u32 {
-        return;
-    }
+    (removed > 0 && removed < limit as u32).then_some((start, end))
+}
+
+/// Whether a crop between `a` and `b` leaves a valid non-empty area smaller than the whole image.
+pub fn has_crop(img: &RgbaImage, a: Point, b: Point) -> bool {
+    pixel_rect(img, a, b).is_some_and(|(_, _, w, h)| w < img.width() || h < img.height())
+}
+
+/// Removes the rows (or columns) between `from` and `to` and joins what remains.
+fn cut_out(img: &mut RgbaImage, from: Point, to: Point, rows: bool) {
+    let Some((start, end)) = cut_out_range(img, from, to, rows) else { return };
+    let (w, h) = (img.width(), img.height());
+    let removed = end - start;
     let out = if rows {
         let mut out = RgbaImage::new(w, h - removed);
         image::imageops::replace(&mut out, &image::imageops::crop_imm(img, 0, 0, w, start).to_image(), 0, 0);
@@ -669,9 +721,16 @@ pub fn apply(img: &mut RgbaImage, op: &Op, font: &FontArc) {
         Op::Erase { .. } => {}
         Op::Highlight { a, b, color } => {
             if let Some(r) = skia_rect(*a, *b) {
-                let mut paint = paint(*color);
-                paint.blend_mode = BlendMode::Multiply;
-                with_pixmap(img, |pm| pm.fill_rect(r, &paint, Transform::identity(), None));
+                let on_clear = img.pixels().next().is_some_and(|p| p.0[3] == 0);
+                if on_clear {
+                    let translucent = [color[0], color[1], color[2], (color[3] as u16 * 110 / 255) as u8];
+                    let paint = paint(translucent);
+                    with_pixmap(img, |pm| pm.fill_rect(r, &paint, Transform::identity(), None));
+                } else {
+                    let mut paint = paint(*color);
+                    paint.blend_mode = BlendMode::Multiply;
+                    with_pixmap(img, |pm| pm.fill_rect(r, &paint, Transform::identity(), None));
+                }
             }
         }
         Op::Text { pos, text, color, size, boxed } => {
@@ -781,8 +840,8 @@ fn erase(img: &mut RgbaImage, clean: &RgbaImage, points: &[Point], width: f32) {
         let src = clean.get_pixel(x, y).0;
         let dst = img.get_pixel_mut(x, y);
         let t = alpha as f32 / 255.0;
-        for c in 0..4 {
-            dst.0[c] = (src[c] as f32 * t + dst.0[c] as f32 * (1.0 - t)).round() as u8;
+        for (d, s) in dst.0.iter_mut().zip(src) {
+            *d = (s as f32 * t + *d as f32 * (1.0 - t)).round() as u8;
         }
     }
 }
@@ -996,6 +1055,7 @@ fn fill_rounded(img: &mut RgbaImage, (min, max): (Point, Point), radius: f32, co
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn callout(
     img: &mut RgbaImage,
     tip: Point,
@@ -1095,12 +1155,12 @@ fn pixelate(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32) {
     for by in (y..y + h).step_by(PIXEL_BLOCK as usize) {
         for bx in (x..x + w).step_by(PIXEL_BLOCK as usize) {
             let (ex, ey) = ((bx + PIXEL_BLOCK).min(x + w), (by + PIXEL_BLOCK).min(y + h));
-            let mut sum = [0u32; 3];
+            let mut sum = [0u32; 4];
             for py in by..ey {
                 for px in bx..ex {
                     let p = img.get_pixel(px, py).0;
-                    for c in 0..3 {
-                        sum[c] += p[c] as u32;
+                    for (s, ch) in sum.iter_mut().zip(p) {
+                        *s += ch as u32;
                     }
                 }
             }
@@ -1109,7 +1169,7 @@ fn pixelate(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32) {
                 (sum[0] / n) as u8,
                 (sum[1] / n) as u8,
                 (sum[2] / n) as u8,
-                255,
+                (sum[3] / n) as u8,
             ]);
             for py in by..ey {
                 for px in bx..ex {
@@ -1242,10 +1302,19 @@ fn draw_text(img: &mut RgbaImage, pos: Point, text: &str, color: Rgba, size: f32
                 if px < 0 || py < 0 || px >= w || py >= h {
                     return;
                 }
-                let alpha = coverage.clamp(0.0, 1.0) * (color[3] as f32 / 255.0);
+                let src_a = coverage.clamp(0.0, 1.0) * (color[3] as f32 / 255.0);
+                if src_a <= 0.0 {
+                    return;
+                }
                 let dst = img.get_pixel_mut(px as u32, py as u32);
-                for c in 0..3 {
-                    dst.0[c] = (color[c] as f32 * alpha + dst.0[c] as f32 * (1.0 - alpha)).round() as u8;
+                let dst_a = dst.0[3] as f32 / 255.0;
+                let out_a = src_a + dst_a * (1.0 - src_a);
+                if out_a > 0.0 {
+                    let keep = dst_a * (1.0 - src_a);
+                    for (d, &s) in dst.0[..3].iter_mut().zip(&color[..3]) {
+                        *d = ((s as f32 * src_a + *d as f32 * keep) / out_a).round() as u8;
+                    }
+                    dst.0[3] = (out_a * 255.0).round() as u8;
                 }
             });
         }
@@ -1745,6 +1814,39 @@ mod tests {
             apply(&mut img, &op, &f);
         }
         assert_eq!((img.width(), img.height()), (20, 20));
+    }
+
+    #[test]
+    fn text_and_highlight_keep_alpha_on_transparent_overlay() {
+        let f = test_font();
+        let mut clear = RgbaImage::new(120, 60);
+        apply(&mut clear, &Op::Text { pos: (10.0, 10.0), text: "Visível".into(), color: RED, size: 24.0, boxed: false }, &f);
+        assert!(clear.pixels().any(|p| p.0[0] == 255 && p.0[3] > 200), "unboxed text must have non-zero alpha on transparent canvas");
+
+        let mut clear = RgbaImage::new(60, 60);
+        apply(&mut clear, &Op::Highlight { a: (10.0, 10.0), b: (50.0, 50.0), color: [255, 235, 60, 255] }, &f);
+        let a = clear.get_pixel(30, 30).0[3];
+        assert!(a > 0 && a < 200, "highlight on transparent canvas stays translucent: {a}");
+    }
+
+    #[test]
+    fn wide_ellipse_outline_does_not_hit_inside_or_far_outside() {
+        let f = test_font();
+        let ellipse = Op::Ellipse { a: (50.0, 90.0), b: (450.0, 110.0), color: RED, width: 4.0, filled: false, dashed: false };
+        assert!(ellipse.hit((450.0, 100.0), 2.0, &f), "right tip of the outline");
+        assert!(ellipse.hit((250.0, 90.0), 2.0, &f), "top of the outline");
+        assert!(!ellipse.hit((100.0, 100.0), 2.0, &f), "well inside the unfilled ellipse");
+        assert!(!ellipse.hit((480.0, 100.0), 2.0, &f), "30 px outside the right tip");
+    }
+
+    #[test]
+    fn pen_stroke_never_collapses_when_dragged_onto_fixed_corner() {
+        let f = test_font();
+        let pen = Op::Pen { points: vec![(10.0, 10.0), (50.0, 50.0)], color: RED, width: 3.0 };
+        let shrunk = pen.with_handle(Handle::Corner(2), (10.0, 10.0), &f);
+        let regrown = shrunk.with_handle(Handle::Corner(2), (90.0, 70.0), &f);
+        let Op::Pen { points, .. } = regrown else { panic!() };
+        assert_eq!(points, vec![(10.0, 10.0), (90.0, 70.0)]);
     }
 
     /// Generates `target/demo.png` for visual inspection: `cargo test demo_png -- --ignored`.

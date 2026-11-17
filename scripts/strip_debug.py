@@ -10,6 +10,7 @@ import pefile
 
 src, dst = sys.argv[1], sys.argv[2]
 pe = pefile.PE(src)
+IMAGE_SCN_CNT_INITIALIZED_DATA = 0x00000040
 IMAGE_SCN_MEM_DISCARDABLE = 0x02000000
 
 sections = list(pe.sections)
@@ -30,14 +31,22 @@ last = sections[keep - 1]
 end_of_data = last.PointerToRawData + last.SizeOfRawData
 align = pe.OPTIONAL_HEADER.SectionAlignment
 size_of_image = (last.VirtualAddress + last.Misc_VirtualSize + align - 1) // align * align
+size_of_init_data = sum(
+    s.SizeOfRawData for s in sections[:keep] if s.Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA
+)
 
 pe.FILE_HEADER.NumberOfSections = keep
 pe.FILE_HEADER.PointerToSymbolTable = 0
 pe.FILE_HEADER.NumberOfSymbols = 0
 pe.OPTIONAL_HEADER.SizeOfImage = size_of_image
+pe.OPTIONAL_HEADER.SizeOfInitializedData = size_of_init_data
+pe.OPTIONAL_HEADER.CheckSum = 0
 # Zero the headers of the removed sections.
 for s in removed:
     pe.set_bytes_at_offset(s.get_file_offset(), b"\0" * 40)
 data = pe.write()[:end_of_data]
+stripped = pefile.PE(data=data, fast_load=True)
+stripped.OPTIONAL_HEADER.CheckSum = stripped.generate_checksum()
+data = stripped.write()
 open(dst, "wb").write(data)
 print(f"removed {len(removed)} sections; {len(data) / 1e6:.1f} MB")

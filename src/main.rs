@@ -71,6 +71,12 @@ struct Shared {
     include_cursor: AtomicBool,
     /// Identifier of the global hotkey in effect (0 = none).
     hotkey_id: AtomicU32,
+    /// True while the window is cloaked (`DWMWA_CLOAK`), so it isn't mistaken for visible.
+    cloaked: AtomicBool,
+    /// Asked to show the main window from the tray or a second copy.
+    open_requested: AtomicBool,
+    /// Asked to close the program cleanly from the tray or `--quit`.
+    quit_requested: AtomicBool,
 }
 
 /// Triggers a capture. Full screen takes the shot right away; the other modes open the selection,
@@ -80,9 +86,9 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
         return;
     }
     std::thread::spawn(move || {
-        // Read before anything of ours takes the focus.
-        let title = win::foreground_window_title();
         let hwnd = shared.hwnd;
+        // Read before anything of ours takes the focus.
+        let mut title = win::foreground_window_title_except(hwnd);
         if matches!(kind, CaptureKind::FullScreen | CaptureKind::AllScreens) {
             let delay = shared.delay_secs.load(Ordering::Relaxed);
             let cursor = shared.include_cursor.load(Ordering::Relaxed);
@@ -100,8 +106,19 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
             if delay > 0 {
                 std::thread::sleep(Duration::from_secs(delay as u64));
             }
+            if delay > 0 || title.is_empty() {
+                let current = win::foreground_window_title_except(hwnd);
+                if !current.is_empty() {
+                    title = current;
+                }
+            }
             let shot = if kind == CaptureKind::FullScreen {
-                guarded(|| capture::capture_monitor_at_cursor(hwnd, cursor))
+                guarded(|| capture::capture_monitor_at_cursor(hwnd, cursor)).map(|mut s| {
+                    if s.title.is_empty() || s.title == APP_NAME {
+                        s.title = title;
+                    }
+                    s
+                })
             } else {
                 let all = win::virtual_screen();
                 guarded(|| capture::grab_virtual(all, cursor)).map(|image| capture::Shot {
@@ -117,11 +134,13 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
                 win::show(hwnd);
             }
         } else {
-            let was_on_screen = hwnd != 0 && win::is_on_screen(hwnd);
+            let was_on_screen =
+                hwnd != 0 && win::is_on_screen(hwnd) && !shared.cloaked.load(Ordering::SeqCst);
             *shared.select_request.lock().unwrap() = Some((kind, title, was_on_screen));
             if hwnd != 0 {
                 // Invisible while it changes size and loses its frame: without this the editor
                 // flashes on the screen before the selection layer is ready.
+                shared.cloaked.store(true, Ordering::SeqCst);
                 win::cloak(hwnd, true);
             }
             // The window becomes the selection layer; if it was in the tray or minimized, it comes
@@ -229,24 +248,21 @@ fn handles(area: Rect) -> [Rect; 8] {
 /// Resizes `start` by pulling the handle `handle` to `to`, without leaving `bounds`.
 fn apply_handle(start: Rect, handle: usize, to: Pos2, bounds: Rect) -> Rect {
     let to = to.clamp(bounds.min, bounds.max);
-    let mut r = match handle {
-        0 => Rect::from_two_pos(to, start.max),                           // northwest
-        1 => Rect::from_two_pos(Pos2::new(start.min.x, to.y), start.max), // north
-        2 => Rect::from_two_pos(to, Pos2::new(start.min.x, start.max.y)), // northeast
-        3 => Rect::from_two_pos(start.min, Pos2::new(to.x, start.max.y)), // east
-        4 => Rect::from_two_pos(start.min, to),                           // southeast
-        5 => Rect::from_two_pos(Pos2::new(start.max.x, to.y), start.min), // south
-        6 => Rect::from_two_pos(to, Pos2::new(start.max.x, start.min.y)), // southwest
-        _ => Rect::from_two_pos(start.max, Pos2::new(to.x, start.min.y)), // west
-    };
     // Pulled past the minimum: locks the moving edge at the minimum distance from the fixed one.
-    if r.width() < MIN_REGION {
-        if matches!(handle, 0 | 6 | 7) { r.min.x = r.max.x - MIN_REGION; } else { r.max.x = r.min.x + MIN_REGION; }
+    let west = to.x.min(start.max.x - MIN_REGION).max(bounds.min.x);
+    let east = to.x.max(start.min.x + MIN_REGION).min(bounds.max.x);
+    let north = to.y.min(start.max.y - MIN_REGION).max(bounds.min.y);
+    let south = to.y.max(start.min.y + MIN_REGION).min(bounds.max.y);
+    match handle {
+        0 => Rect::from_min_max(Pos2::new(west, north), start.max),                            // northwest
+        1 => Rect::from_min_max(Pos2::new(start.min.x, north), start.max),                     // north
+        2 => Rect::from_min_max(Pos2::new(start.min.x, north), Pos2::new(east, start.max.y)),  // northeast
+        3 => Rect::from_min_max(start.min, Pos2::new(east, start.max.y)),                      // east
+        4 => Rect::from_min_max(start.min, Pos2::new(east, south)),                            // southeast
+        5 => Rect::from_min_max(start.min, Pos2::new(start.max.x, south)),                     // south
+        6 => Rect::from_min_max(Pos2::new(west, start.min.y), Pos2::new(start.max.x, south)),  // southwest
+        _ => Rect::from_min_max(Pos2::new(west, start.min.y), start.max),                      // west
     }
-    if r.height() < MIN_REGION {
-        if matches!(handle, 0 | 1 | 2) { r.min.y = r.max.y - MIN_REGION; } else { r.max.y = r.min.y + MIN_REGION; }
-    }
-    r
 }
 
 /// Moves `start` by `delta`, keeping the whole region inside `bounds`.
@@ -277,6 +293,8 @@ enum QuickAction {
     Editor,
     Cancel,
 }
+
+type OcrResult = Result<(String, ocr::Engine), String>;
 
 struct App {
     shared: Arc<Shared>,
@@ -314,7 +332,7 @@ struct App {
     gif_pending: Arc<Mutex<Option<Result<std::path::PathBuf, String>>>>,
     gif_running: bool,
     /// Result of the OCR in progress, delivered by the recognition thread.
-    ocr_pending: Arc<Mutex<Option<Result<(String, ocr::Engine), String>>>>,
+    ocr_pending: Arc<Mutex<Option<OcrResult>>>,
     ocr_running: bool,
     /// Extracted text, shown in a window until the user closes it.
     ocr_text: Option<String>,
@@ -453,6 +471,9 @@ impl App {
             delay_secs: AtomicU32::new(cfg.delay_secs),
             include_cursor: AtomicBool::new(cfg.include_cursor),
             hotkey_id: AtomicU32::new(0),
+            cloaked: AtomicBool::new(false),
+            open_requested: AtomicBool::new(false),
+            quit_requested: AtomicBool::new(false),
         });
 
         let hotkeys = GlobalHotKeyManager::new().ok();
@@ -471,10 +492,15 @@ impl App {
                         start_capture(CaptureKind::FullScreen, shared.clone(), ctx.clone());
                     }
                     tray::TrayAction::Open => {
+                        shared.open_requested.store(true, Ordering::SeqCst);
                         win::show(shared.hwnd);
                         ctx.request_repaint();
                     }
-                    tray::TrayAction::Quit => std::process::exit(0),
+                    tray::TrayAction::Quit => {
+                        shared.quit_requested.store(true, Ordering::SeqCst);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ctx.request_repaint();
+                    }
                 }),
             )
             .ok()
@@ -535,6 +561,7 @@ impl App {
         // `--minimized` (Start with Windows): eframe shows the window after the first frame
         // whatever was asked, so it's kept cloaked, invisible, and hidden right after that.
         if std::env::args().any(|a| a == autostart::MINIMIZED_ARG) && app.shared.hwnd != 0 {
+            app.shared.cloaked.store(true, Ordering::SeqCst);
             win::cloak(app.shared.hwnd, true);
             app.hide_after_start = 2;
             cc.egui_ctx.request_repaint();
@@ -661,7 +688,7 @@ impl App {
             }
             UpdateMsg::Downloaded { release, result } => match result.and_then(|path| {
                 // Captures still being written finish first; then the installer takes over.
-                self.writer.wait_idle(Duration::from_secs(10));
+                self.shutdown(ctx);
                 update::run_installer(&path)
             }) {
                 Ok(()) => std::process::exit(0),
@@ -978,10 +1005,8 @@ impl App {
                 Err(e) => tf!("Não foi possível copiar: {e}", "Could not copy: {e}"),
             };
         }
-        if reread {
-            if let Some(image) = self.ocr_image.clone() {
-                self.start_ocr(ctx, image, ocr::Mode::Handwriting);
-            }
+        if reread && let Some(image) = self.ocr_image.clone() {
+            self.start_ocr(ctx, image, ocr::Mode::Handwriting);
         }
         if !open {
             self.ocr_text = None;
@@ -989,17 +1014,12 @@ impl App {
         }
     }
 
-    /// Saves the editor's current image to the library, if it changed since the last save. Waits
-    /// for the edit to settle so the PNG isn't rewritten on every stroke.
-    fn autosave(&mut self, ctx: &egui::Context) {
-        let (Some(editor), Some(file)) = (&self.editor, &self.current_file) else { return };
+    /// Saves the editor's current image to the library right away, if it changed since the last
+    /// save.
+    fn flush_autosave(&mut self, ctx: &egui::Context) {
+        let (Some(editor), Some(file)) = (&mut self.editor, &self.current_file) else { return };
+        editor.commit_pending_text();
         if editor.revision() == self.saved_revision {
-            return;
-        }
-        let settle = Duration::from_millis(900);
-        let idle = editor.idle_time();
-        if idle < settle {
-            ctx.request_repaint_after(settle - idle);
             return;
         }
         let image = editor.image().clone();
@@ -1011,8 +1031,38 @@ impl App {
         self.saved_revision = editor.revision();
     }
 
+    /// Saves the editor's current image to the library, if it changed since the last save. Waits
+    /// for the edit to settle so the PNG isn't rewritten on every stroke.
+    fn autosave(&mut self, ctx: &egui::Context) {
+        let (Some(editor), Some(_)) = (&self.editor, &self.current_file) else { return };
+        if editor.revision() == self.saved_revision {
+            return;
+        }
+        let settle = Duration::from_millis(900);
+        let idle = editor.idle_time();
+        if idle < settle {
+            ctx.request_repaint_after(settle - idle);
+            return;
+        }
+        self.flush_autosave(ctx);
+    }
+
+    /// Stops any active recording or capture session and finishes writing pending captures before
+    /// the program exits.
+    fn shutdown(&mut self, ctx: &egui::Context) {
+        if let Some(session) = self.video.take().and_then(|v| v.recorder) {
+            let _ = session.stop();
+        }
+        self.pano = None;
+        self.steps = None;
+        self.selecting = None;
+        self.flush_autosave(ctx);
+        self.writer.wait_idle(Duration::from_secs(10));
+    }
+
     /// Opens a capture kept in the library in the editor.
     fn open_from_library(&mut self, ctx: &egui::Context, file: &str) {
+        self.flush_autosave(ctx);
         match image::open(self.library.path(file)) {
             Ok(img) => {
                 let editor = editor::Editor::new(ctx, img.to_rgba8(), self.accent());
@@ -1168,7 +1218,9 @@ impl App {
     }
 
     /// Saves the editor's image to the library, copies it and shows it in the main editor.
-    fn adopt_editor(&mut self, ctx: &egui::Context, editor: editor::Editor, title: String) {
+    fn adopt_editor(&mut self, ctx: &egui::Context, mut editor: editor::Editor, title: String) {
+        self.flush_autosave(ctx);
+        editor.commit_pending_text();
         let image = editor.image().clone();
         let file = self.library.add(win::local_time(), title, image.width(), image.height());
         let thumb = library::make_thumb(&image);
@@ -1339,12 +1391,12 @@ impl App {
                 Some(Err(e)) => self.status = tf!("A gravação falhou: {e}", "The recording failed: {e}"),
                 None => {}
             }
-        } else if toggle_pause {
-            if let Some(session) = self.video.as_mut().and_then(|v| v.recorder.as_mut()) {
-                let result = if session.is_paused() { session.resume() } else { session.pause() };
-                if let Err(e) = result {
-                    self.status = tf!("Não foi possível pausar ou continuar: {e}", "Could not pause or resume: {e}");
-                }
+        } else if toggle_pause
+            && let Some(session) = self.video.as_mut().and_then(|v| v.recorder.as_mut())
+        {
+            let result = if session.is_paused() { session.resume() } else { session.pause() };
+            if let Err(e) = result {
+                self.status = tf!("Não foi possível pausar ou continuar: {e}", "Could not pause or resume: {e}");
             }
         } else if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) && idle {
             self.leave_pano_hud(&ctx);
@@ -1359,6 +1411,9 @@ impl App {
         label: &str,
         job: impl FnOnce() -> Result<std::path::PathBuf, String> + Send + 'static,
     ) {
+        if self.gif_running {
+            return;
+        }
         self.gif_running = true;
         self.status = format!("{label}…");
         let (pending, ctx) = (self.gif_pending.clone(), ctx.clone());
@@ -1466,6 +1521,7 @@ impl App {
         self.pano = None;
         self.video = None;
         self.steps = None;
+        self.restore_frames = 0;
         self.shared.busy.store(false, Ordering::SeqCst);
         win::exclude_from_capture(self.shared.hwnd, false);
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
@@ -1531,10 +1587,8 @@ impl App {
         if start {
             let repaint = ctx.clone();
             steps.recorder = Some(steps::Recorder::start(steps.rect, hwnd, move || repaint.request_repaint()));
-        } else if undo {
-            if let Some(recorder) = &steps.recorder {
-                recorder.undo_last();
-            }
+        } else if undo && let Some(recorder) = &steps.recorder {
+            recorder.undo_last();
         } else if finish {
             let Some(StepsUi { title, recorder: Some(recorder), .. }) = self.steps.take() else { return };
             let shots = recorder.finish();
@@ -1617,6 +1671,7 @@ impl App {
     /// Leaves the selection and puts the window back at its normal size and place.
     fn end_selection(&mut self, ctx: &egui::Context) {
         if self.selecting.take().is_some_and(|s| !s.revealed) {
+            self.shared.cloaked.store(false, Ordering::SeqCst);
             win::cloak(self.shared.hwnd, false);
         }
         self.shared.busy.store(false, Ordering::SeqCst);
@@ -1624,13 +1679,16 @@ impl App {
         win::set_tool_window(self.shared.hwnd, false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        if let Some(r) = self.normal_rect {
+            win::set_window_rect(self.shared.hwnd, r);
+        }
         // The frame comes back a few frames later; the rectangle is reapplied until then.
         self.restore_frames = 10;
         ctx.request_repaint();
     }
 
     /// Photographs `rect` after the configured delay, with the window out of the way.
-    fn capture_after_delay(&mut self, ctx: &egui::Context, rect: win::PxRect, title: String, delay: u32, cursor: bool) {
+    fn capture_after_delay(&mut self, ctx: &egui::Context, rect: win::PxRect, mut title: String, delay: u32, cursor: bool) {
         if self.shared.busy.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -1642,6 +1700,10 @@ impl App {
                 win::minimize(shared.hwnd);
             }
             std::thread::sleep(Duration::from_secs(delay as u64));
+            let current = win::foreground_window_title_except(shared.hwnd);
+            if !current.is_empty() {
+                title = current;
+            }
             let shot = guarded(|| capture::grab_virtual(rect, cursor)).map(|image| capture::Shot {
                 image,
                 windows: Vec::new(),
@@ -1673,16 +1735,22 @@ impl App {
         let to_px = |p: Pos2| -> (i32, i32) {
             (ox + ((p.x - rect.min.x) * scale).round() as i32, oy + ((p.y - rect.min.y) * scale).round() as i32)
         };
+        let px_to_screen = |r: win::PxRect| {
+            Rect::from_min_max(
+                rect.min + egui::vec2((r.0 - ox) as f32 / scale, (r.1 - oy) as f32 / scale),
+                rect.min + egui::vec2((r.2 - ox) as f32 / scale, (r.3 - oy) as f32 / scale),
+            )
+        };
         let pointer = ctx.pointer_latest_pos();
 
         // Adjustment in progress: the area follows the cursor, showing the live screen; on release,
         // the new place is photographed again and the annotations remain editable. Moving takes the
         // annotations along with the frame; resizing leaves them over the same spot on the screen.
         if let Some(adj) = quick.adjust {
-            if pointer.is_some() && ctx.input(|i| i.pointer.primary_down()) {
+            if let Some(p) = pointer.filter(|_| ctx.input(|i| i.pointer.primary_down())) {
                 match adj {
-                    Adjust::Move { grab, start } => quick.area = clamp_move(start, pointer.unwrap() - grab, rect),
-                    Adjust::Resize { handle, start } => quick.area = apply_handle(start, handle, pointer.unwrap(), rect),
+                    Adjust::Move { grab, start } => quick.area = clamp_move(start, p - grab, rect),
+                    Adjust::Resize { handle, start } => quick.area = apply_handle(start, handle, p, rect),
                 }
             } else {
                 quick.adjust = None;
@@ -1695,8 +1763,9 @@ impl App {
                         (s.0 - a.0, s.1 - a.1)
                     }
                 };
-                let cursor = self.shared.include_cursor.load(Ordering::Relaxed);
-                if let Ok(image) = capture::grab_virtual((a.0, a.1, b.0, b.1), cursor) {
+                if let Ok(image) = capture::grab_virtual((a.0, a.1, b.0, b.1), false) {
+                    quick.area = px_to_screen((a.0, a.1, b.0, b.1));
+                    quick.editor.commit_pending_text();
                     quick.editor.rebase(image, dx as f32, dy as f32);
                 }
             }
@@ -1716,8 +1785,9 @@ impl App {
             painter.rect_filled(r, 0.0, dim);
         }
 
-        // Esc and Enter serve the text being typed or the selected annotation first.
-        let busy_before = quick.editor.is_typing() || quick.editor.has_selection();
+        // Esc and Enter serve the text being typed first; Esc also deselects an annotation first.
+        let typing_before = quick.editor.is_typing();
+        let selected_before = quick.editor.has_selection();
         // Moving or resizing: the area is hollow and shows the live screen, with only the
         // annotations on top; the old photo dragged along looked like a loose image. On release,
         // the new place is photographed (above) and the image shows again.
@@ -1749,10 +1819,9 @@ impl App {
             if h.hovered() {
                 ctx.set_cursor_icon(egui::CursorIcon::Move);
             }
-            if h.drag_started() {
-                if let Some(p) = pointer {
-                    quick.adjust = Some(Adjust::Move { grab: p, start: quick.area });
-                }
+            if h.drag_started() && let Some(p) = pointer {
+                quick.editor.commit_pending_text();
+                quick.adjust = Some(Adjust::Move { grab: p, start: quick.area });
             }
         }
         {
@@ -1765,6 +1834,7 @@ impl App {
                     ctx.set_cursor_icon(HANDLE_CURSORS[handle]);
                 }
                 if h.drag_started() {
+                    quick.editor.commit_pending_text();
                     quick.adjust = Some(Adjust::Resize { handle, start: quick.area });
                 }
             }
@@ -1816,7 +1886,7 @@ impl App {
                 });
             });
 
-        if action.is_none() && !busy_before && !quick.editor.is_typing() && !ctx.egui_wants_keyboard_input() {
+        if action.is_none() && !typing_before && !quick.editor.is_typing() && !ctx.egui_wants_keyboard_input() {
             action = ctx.input_mut(|i| {
                 let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
@@ -1828,7 +1898,7 @@ impl App {
                     Some(QuickAction::Save)
                 } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::E) {
                     Some(QuickAction::Editor)
-                } else if i.key_pressed(egui::Key::Escape) {
+                } else if !selected_before && i.key_pressed(egui::Key::Escape) {
                     Some(QuickAction::Cancel)
                 } else {
                     None
@@ -1889,6 +1959,7 @@ impl App {
         if self.shared.hwnd == 0 {
             return;
         }
+        self.shared.cloaked.store(true, Ordering::SeqCst);
         win::cloak(self.shared.hwnd, true);
         self.settle = Some(Settle { put_away, hidden: false, deadline: Instant::now() + Duration::from_millis(600) });
     }
@@ -1903,6 +1974,7 @@ impl App {
         let restored = self.restore_frames == 0 || now >= deadline;
         if !put_away {
             if restored {
+                self.shared.cloaked.store(false, Ordering::SeqCst);
                 win::cloak(hwnd, false);
                 self.settle = None;
             }
@@ -1915,6 +1987,7 @@ impl App {
                 self.settle = Some(Settle { put_away, hidden: true, deadline: now + Duration::from_millis(300) });
             }
         } else if now >= deadline {
+            self.shared.cloaked.store(false, Ordering::SeqCst);
             win::cloak(hwnd, false);
             self.settle = None;
         } else {
@@ -1957,6 +2030,7 @@ impl App {
         if let Some(sel) = self.selecting.as_mut().filter(|s| !s.revealed) {
             sel.ready_frames = if covering { sel.ready_frames + 1 } else { 0 };
             if sel.ready_frames >= 3 || sel.started.elapsed() > Duration::from_millis(500) {
+                self.shared.cloaked.store(false, Ordering::SeqCst);
                 win::cloak(hwnd, false);
                 sel.revealed = true;
             }
@@ -1966,10 +2040,10 @@ impl App {
             return;
         }
         // While a button is pressed, remember where the press started.
-        if let Some(sel) = &mut self.selecting {
-            if let Some(origin) = ctx.input(|i| i.pointer.press_origin()) {
-                sel.drag_origin = Some(origin);
-            }
+        if let Some(sel) = &mut self.selecting
+            && let Some(origin) = ctx.input(|i| i.pointer.press_origin())
+        {
+            sel.drag_origin = Some(origin);
         }
         let Some(sel) = &self.selecting else { return };
         let (kind, title) = (sel.kind, sel.title.clone());
@@ -2011,25 +2085,27 @@ impl App {
         // away. In region mode, it goes straight into quick annotation: a single step, with the
         // arrows at hand.
         let mut quick_now = None;
-        if response.drag_stopped() && drawn.is_none() {
-            if let Some(r) = drag_rect.filter(|r| r.width() >= 4.0 && r.height() >= 4.0) {
-                if kind == CaptureKind::Region
-                    && self.cfg.quick_annotate
-                    && self.shared.delay_secs.load(Ordering::Relaxed) == 0
-                {
-                    quick_now = Some(r);
-                } else {
-                    drawn = Some(r);
-                    adjust = None;
-                }
+        if response.drag_stopped()
+            && drawn.is_none()
+            && let Some(r) = drag_rect.filter(|r| r.width() >= 4.0 && r.height() >= 4.0)
+        {
+            if kind == CaptureKind::Region
+                && self.cfg.quick_annotate
+                && self.shared.delay_secs.load(Ordering::Relaxed) == 0
+            {
+                quick_now = Some(r);
+            } else {
+                drawn = Some(r);
+                adjust = None;
             }
         }
         // A new drag outside the armed region: back to drawing over it.
-        if let Some(area) = drawn {
-            if response.drag_started() && press_origin.is_some_and(|p| !area.contains(p)) {
-                drawn = None;
-                adjust = None;
-            }
+        if let Some(area) = drawn
+            && response.drag_started()
+            && press_origin.is_some_and(|p| !area.contains(p))
+        {
+            drawn = None;
+            adjust = None;
         }
         // No armed region: highlights the window under the cursor.
         let hovered_window = if drawn.is_none() {
@@ -2065,10 +2141,8 @@ impl App {
             if inside.hovered() {
                 hover_cursor = Some(egui::CursorIcon::Move);
             }
-            if inside.drag_started() {
-                if let Some(p) = pointer {
-                    adjust = Some(Adjust::Move { grab: p, start: area });
-                }
+            if inside.drag_started() && let Some(p) = pointer {
+                adjust = Some(Adjust::Move { grab: p, start: area });
             }
             if inside.double_clicked() {
                 confirm = true;
@@ -2086,10 +2160,10 @@ impl App {
         // Adjusting: the region follows the cursor; when the button is released, the adjustment
         // ends.
         if let Some(a) = adjust {
-            if pointer.is_some() && ctx.input(|i| i.pointer.primary_down()) {
+            if let Some(p) = pointer.filter(|_| ctx.input(|i| i.pointer.primary_down())) {
                 match a {
-                    Adjust::Move { grab, start } => drawn = Some(clamp_move(start, pointer.unwrap() - grab, rect)),
-                    Adjust::Resize { handle, start } => drawn = Some(apply_handle(start, handle, pointer.unwrap(), rect)),
+                    Adjust::Move { grab, start } => drawn = Some(clamp_move(start, p - grab, rect)),
+                    Adjust::Resize { handle, start } => drawn = Some(apply_handle(start, handle, p, rect)),
                 }
             } else {
                 adjust = None;
@@ -2546,23 +2620,26 @@ impl App {
                             "Recognizes all the text in the image and copies it. For a single area, use the Grab text tool."
                         ))
                         .clicked()
+                        && let Some(e) = &mut self.editor
                     {
-                        if let Some(image) = self.editor.as_ref().map(|e| e.image().clone()) {
-                            self.start_ocr(&ctx, image, ocr::Mode::Printed);
-                        }
+                        e.commit_pending_text();
+                        let image = e.image().clone();
+                        self.start_ocr(&ctx, image, ocr::Mode::Printed);
                     }
-                    if ui.add_enabled(has_capture, egui::Button::new(t!("💾 Salvar PNG", "💾 Save PNG"))).clicked() {
-                        if let Some(e) = &self.editor {
-                            self.status = save_png(e.image());
-                        }
+                    if ui.add_enabled(has_capture, egui::Button::new(t!("💾 Salvar PNG", "💾 Save PNG"))).clicked()
+                        && let Some(e) = &mut self.editor
+                    {
+                        e.commit_pending_text();
+                        self.status = save_png(e.image());
                     }
-                    if ui.add_enabled(has_capture, egui::Button::new(t!("📋 Copiar", "📋 Copy"))).clicked() {
-                        if let Some(e) = &self.editor {
-                            self.status = match copy_to_clipboard(e.image()) {
-                                Ok(()) => t!("Copiado para a área de transferência.", "Copied to the clipboard.").to_owned(),
-                                Err(e) => tf!("Não foi possível copiar: {e}", "Could not copy: {e}"),
-                            };
-                        }
+                    if ui.add_enabled(has_capture, egui::Button::new(t!("📋 Copiar", "📋 Copy"))).clicked()
+                        && let Some(e) = &mut self.editor
+                    {
+                        e.commit_pending_text();
+                        self.status = match copy_to_clipboard(e.image()) {
+                            Ok(()) => t!("Copiado para a área de transferência.", "Copied to the clipboard.").to_owned(),
+                            Err(e) => tf!("Não foi possível copiar: {e}", "Could not copy: {e}"),
+                        };
                     }
                 });
             });
@@ -2629,10 +2706,23 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.shared.quit_requested.swap(false, Ordering::SeqCst)
+            || INSTANCE.get().is_some_and(|i| i.take_quit_request())
+        {
+            self.shutdown(ctx);
+            std::process::exit(0);
+        }
+        if self.shared.open_requested.swap(false, Ordering::SeqCst) {
+            self.hide_after_start = 0;
+            self.settle = None;
+            self.shared.cloaked.store(false, Ordering::SeqCst);
+            win::cloak(self.shared.hwnd, false);
+        }
         if self.hide_after_start > 0 {
             self.hide_after_start -= 1;
             if self.hide_after_start == 0 {
-                win::hide(self.shared.hwnd);
+                self.put_away();
+                self.shared.cloaked.store(false, Ordering::SeqCst);
                 win::cloak(self.shared.hwnd, false);
             } else {
                 ctx.request_repaint();
@@ -2646,6 +2736,7 @@ impl eframe::App for App {
             let hwnd = self.shared.hwnd;
             let windows = win::visible_windows(hwnd);
             self.selecting = Some(Selecting { kind, windows, title, drag_origin: None, drawn: None, adjust: None, was_on_screen, quick: None, started: Instant::now(), ready_frames: 0, revealed: false });
+            self.hide_after_start = 0;
             self.restore_frames = 0;
             self.settle = None;
             // Excluded from captures: the shot of the chosen area comes out without our layer on
@@ -2660,6 +2751,10 @@ impl eframe::App for App {
         let Some((_, shot)) = self.shared.pending.lock().unwrap().take() else {
             return;
         };
+        self.hide_after_start = 0;
+        self.settle = None;
+        self.shared.cloaked.store(false, Ordering::SeqCst);
+        win::cloak(self.shared.hwnd, false);
         match shot {
             Err(e) => self.status = e,
             Ok(shot) => {
@@ -2675,14 +2770,30 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Closing with the X only hides the window when there's a tray to bring it back.
-        if ui.ctx().input(|i| i.viewport().close_requested())
-            && self.cfg.close_to_tray
-            && self.tray.is_some()
-            && self.shared.hwnd != 0
-        {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            win::hide(self.shared.hwnd);
+        if ui.ctx().input(|i| i.viewport().close_requested()) {
+            let ctx = ui.ctx().clone();
+            if self.shared.quit_requested.load(Ordering::SeqCst) {
+                self.shutdown(&ctx);
+            } else if self.selecting.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.status = t!("Captura cancelada.", "Capture canceled.").to_owned();
+                self.dismiss_selection(&ctx);
+            } else if self.pano.is_some() || self.video.is_some() || self.steps.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if let Some(session) = self.video.take().and_then(|v| v.recorder)
+                    && let Ok(path) = session.stop()
+                {
+                    self.video_done = Some(VideoDone::new(path));
+                }
+                self.leave_pano_hud(&ctx);
+            } else if self.cfg.close_to_tray && self.tray.is_some() && self.shared.hwnd != 0 {
+                // Closing with the X only hides the window when there's a tray to bring it back.
+                self.flush_autosave(&ctx);
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                win::hide(self.shared.hwnd);
+            } else {
+                self.shutdown(&ctx);
+            }
         }
         self.settle_step(ui.ctx());
         if self.selecting.is_some() {
@@ -2701,26 +2812,28 @@ impl eframe::App for App {
                 // Leaving the selection: the window is still coming back from the size of every
                 // monitor.
                 if win::is_on_screen(self.shared.hwnd) {
-                    if let Some(r) = self.normal_rect {
-                        if win::window_rect(self.shared.hwnd) != Some(r) {
-                            win::set_window_rect(self.shared.hwnd, r);
-                        }
+                    if let Some(r) = self.normal_rect
+                        && win::window_rect(self.shared.hwnd) != Some(r)
+                    {
+                        win::set_window_rect(self.shared.hwnd, r);
                     }
                     self.restore_frames -= 1;
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
-            } else if !fullscreen && win::is_on_screen(self.shared.hwnd) {
-                if let Some(size) = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size()) {
-                    if size.x >= NORMAL_MIN_SIZE.x && size.y >= NORMAL_MIN_SIZE.y {
-                        self.normal_size = Some(size);
-                        self.normal_pos = win::window_pos(self.shared.hwnd);
-                        self.normal_rect = win::window_rect(self.shared.hwnd);
-                    }
-                }
+            } else if !fullscreen
+                && win::is_on_screen(self.shared.hwnd)
+                && let Some(size) = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size())
+                && size.x >= NORMAL_MIN_SIZE.x
+                && size.y >= NORMAL_MIN_SIZE.y
+            {
+                self.normal_size = Some(size);
+                self.normal_pos = win::window_pos(self.shared.hwnd);
+                self.normal_rect = win::window_rect(self.shared.hwnd);
             }
             if self.save_requested && self.restore_frames == 0 {
                 self.save_requested = false;
-                if let Some(e) = &self.editor {
+                if let Some(e) = &mut self.editor {
+                    e.commit_pending_text();
                     self.status = save_png(e.image());
                 }
             }
@@ -2737,10 +2850,16 @@ fn spawn_instance_listener(shared: Arc<Shared>, ctx: egui::Context) {
         while let Some(request) = instance.wait() {
             match request {
                 win::InstanceRequest::Show => {
+                    shared.open_requested.store(true, Ordering::SeqCst);
                     win::show(shared.hwnd);
                     ctx.request_repaint();
                 }
                 win::InstanceRequest::Select => start_capture(CaptureKind::Region, shared.clone(), ctx.clone()),
+                win::InstanceRequest::Quit => {
+                    shared.quit_requested.store(true, Ordering::SeqCst);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ctx.request_repaint();
+                }
             }
         }
     });
@@ -2837,10 +2956,14 @@ fn main() -> eframe::Result {
     }));
 
     let start_hidden = args.iter().any(|a| a == autostart::MINIMIZED_ARG);
+    let key = instance_key();
+    if args.iter().any(|a| a == "--quit") {
+        win::Instance::send(&key, win::InstanceRequest::Quit);
+        return Ok(());
+    }
     // Only one SnapKit per set of preferences. A second copy (from the Start menu while this one
     // is in the tray, say) would fight over the shortcut and the library index; it passes its
     // request on and leaves.
-    let key = instance_key();
     match win::Instance::claim(&key) {
         Some(instance) => {
             let _ = INSTANCE.set(instance);
@@ -2942,4 +3065,27 @@ fn fatal_box(detail: &str) {
         )
     };
     win::error_box(APP_NAME, &text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_handle_locks_at_minimum_without_moving_fixed_edge() {
+        let bounds = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(500.0, 500.0));
+        let start = Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(200.0, 200.0));
+        // Dragging the West handle (7) past the East edge (200.0) keeps max.x fixed at 200.0.
+        let r = apply_handle(start, 7, Pos2::new(250.0, 150.0), bounds);
+        assert_eq!(r.max.x, 200.0);
+        assert_eq!(r.min.x, 200.0 - MIN_REGION);
+        // Dragging the East handle (3) past the West edge (100.0) keeps min.x fixed at 100.0.
+        let r = apply_handle(start, 3, Pos2::new(50.0, 150.0), bounds);
+        assert_eq!(r.min.x, 100.0);
+        assert_eq!(r.max.x, 100.0 + MIN_REGION);
+        // Dragging the Northwest handle (0) past the Southeast corner keeps max fixed at (200, 200).
+        let r = apply_handle(start, 0, Pos2::new(205.0, 205.0), bounds);
+        assert_eq!(r.max, Pos2::new(200.0, 200.0));
+        assert_eq!(r.min, Pos2::new(200.0 - MIN_REGION, 200.0 - MIN_REGION));
+    }
 }

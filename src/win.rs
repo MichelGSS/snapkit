@@ -186,14 +186,16 @@ pub fn grab_pixels(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<[u8; 3]>> {
         let mut bits: *mut c_void = std::ptr::null_mut();
         let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
         let mut out = None;
-        if !bmp.is_null() && !bits.is_null() {
-            let old = SelectObject(dc, bmp);
-            if BitBlt(dc, 0, 0, w, h, screen, x, y, SRCCOPY) != 0 {
-                let buf = std::slice::from_raw_parts(bits.cast::<u8>(), (w * h * 4) as usize);
-                // The screen comes in BGRA.
-                out = Some(buf.chunks_exact(4).map(|p| [p[2], p[1], p[0]]).collect());
+        if !bmp.is_null() {
+            if !bits.is_null() {
+                let old = SelectObject(dc, bmp);
+                if BitBlt(dc, 0, 0, w, h, screen, x, y, SRCCOPY) != 0 {
+                    let buf = std::slice::from_raw_parts(bits.cast::<u8>(), (w * h * 4) as usize);
+                    // The screen comes in BGRA.
+                    out = Some(buf.as_chunks::<4>().0.iter().map(|p| [p[2], p[1], p[0]]).collect());
+                }
+                SelectObject(dc, old);
             }
-            SelectObject(dc, old);
             DeleteObject(bmp);
         }
         DeleteDC(dc);
@@ -250,9 +252,18 @@ pub fn local_time() -> (u16, u16, u16, u16, u16, u16) {
 
 /// Title of the foreground window (empty if there's none or it has no title).
 pub fn foreground_window_title() -> String {
+    foreground_window_title_except(0)
+}
+
+/// Title of the foreground window, ignoring `skip` (our own window).
+pub fn foreground_window_title_except(skip: isize) -> String {
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_null() || (skip != 0 && fg as isize == skip) {
+        return String::new();
+    }
     let mut buf = [0u16; 256];
     // SAFETY: the buffer has the size given; a null handle just returns 0.
-    let len = unsafe { GetWindowTextW(GetForegroundWindow(), buf.as_mut_ptr(), buf.len() as i32) };
+    let len = unsafe { GetWindowTextW(fg, buf.as_mut_ptr(), buf.len() as i32) };
     String::from_utf16_lossy(&buf[..len.max(0) as usize])
 }
 
@@ -357,53 +368,91 @@ pub enum InstanceRequest {
     Show,
     /// Start a region capture.
     Select,
+    /// Close cleanly (used by the installer and uninstaller).
+    Quit,
 }
 
-/// The right to be the only SnapKit running with these preferences, plus the two signals that a
+/// The right to be the only SnapKit running with these preferences, plus the signals that a
 /// second copy uses to talk to it.
 pub struct Instance {
     show: usize,
     select: usize,
+    quit: usize,
+    quit_global: usize,
+    quit_requested: std::sync::atomic::AtomicBool,
 }
 
-fn instance_names(key: &str) -> [Vec<u16>; 3] {
+fn instance_names(key: &str) -> [Vec<u16>; 5] {
     let wide = |s: String| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     [
         wide(format!("Local\\SnapKit-{key}")),
         wide(format!("Local\\SnapKit-{key}-show")),
         wide(format!("Local\\SnapKit-{key}-select")),
+        wide(format!("Local\\SnapKit-{key}-quit")),
+        wide("Local\\SnapKit.SingleInstance.Quit.v1".to_owned()),
     ]
 }
 
 impl Instance {
     /// Becomes the running copy, or returns `None` if another one already is.
     pub fn claim(key: &str) -> Option<Self> {
-        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
         use windows_sys::Win32::System::Threading::{CreateEventW, CreateMutexW};
-        let [mutex, show, select] = instance_names(key);
+        let [mutex, show, select, quit, quit_global] = instance_names(key);
         // SAFETY: the names are null-terminated; the handles are kept for the whole run, on
         // purpose (the mutex marks this copy as the running one until it exits).
         unsafe {
             let m = CreateMutexW(std::ptr::null(), 0, mutex.as_ptr());
-            if m.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
+            if m.is_null() {
+                return None;
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                CloseHandle(m);
                 return None;
             }
             let show = CreateEventW(std::ptr::null(), 0, 0, show.as_ptr()) as usize;
             let select = CreateEventW(std::ptr::null(), 0, 0, select.as_ptr()) as usize;
-            Some(Self { show, select })
+            let quit = CreateEventW(std::ptr::null(), 0, 0, quit.as_ptr()) as usize;
+            let quit_global = CreateEventW(std::ptr::null(), 0, 0, quit_global.as_ptr()) as usize;
+            if show == 0 || select == 0 || quit == 0 {
+                for h in [show, select, quit, quit_global] {
+                    if h != 0 {
+                        CloseHandle(h as _);
+                    }
+                }
+                CloseHandle(m);
+                return None;
+            }
+            Some(Self {
+                show,
+                select,
+                quit,
+                quit_global,
+                quit_requested: std::sync::atomic::AtomicBool::new(false),
+            })
         }
     }
 
     /// Waits for the next request from a second copy.
     pub fn wait(&self) -> Option<InstanceRequest> {
         use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
-        let handles = [self.show as _, self.select as _];
-        // SAFETY: two valid event handles, owned by `self`.
-        match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) } {
+        let handles = [self.show as _, self.select as _, self.quit as _, self.quit_global as _];
+        let count = if self.quit_global != 0 { 4 } else { 3 };
+        // SAFETY: valid event handles, owned by `self`.
+        match unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, INFINITE) } {
             0 => Some(InstanceRequest::Show),
             1 => Some(InstanceRequest::Select),
+            2 | 3 => {
+                self.quit_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                Some(InstanceRequest::Quit)
+            }
             _ => None,
         }
+    }
+
+    /// True once if another copy asked this one to quit.
+    pub fn take_quit_request(&self) -> bool {
+        self.quit_requested.swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// From a second copy: passes the request on to the running one. Returns `false` if it
@@ -411,7 +460,32 @@ impl Instance {
     pub fn send(key: &str, request: InstanceRequest) -> bool {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
-        let [_, show, select] = instance_names(key);
+        let [_, show, select, quit, quit_global] = instance_names(key);
+        if request == InstanceRequest::Quit {
+            // SAFETY: null-terminated names; handles closed right after use.
+            unsafe {
+                let mut signaled = false;
+                for name in [&quit, &quit_global] {
+                    let event = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+                    if !event.is_null() {
+                        signaled |= SetEvent(event) != 0;
+                        CloseHandle(event);
+                    }
+                }
+                if signaled {
+                    // Wait up to 5 s for the running instance to flush writes and exit.
+                    for _ in 0..50 {
+                        let e = OpenEventW(EVENT_MODIFY_STATE, 0, quit.as_ptr());
+                        if e.is_null() {
+                            break;
+                        }
+                        CloseHandle(e);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+                return signaled;
+            }
+        }
         let name = if request == InstanceRequest::Show { show } else { select };
         // The running copy may still be starting: it creates the signals right after the mutex.
         for _ in 0..20 {
@@ -521,6 +595,9 @@ pub fn cursor_image() -> Option<(RgbaImage, (i32, i32))> {
             let mut bits: *mut c_void = std::ptr::null_mut();
             let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
             if bmp.is_null() || bits.is_null() {
+                if !bmp.is_null() {
+                    DeleteObject(bmp);
+                }
                 DeleteDC(dc);
                 return None;
             }
@@ -587,6 +664,7 @@ impl RegionFrame {
         const THICKNESS: i32 = 4;
         // COLORREF is 0x00BBGGRR: SnapKit's orange (255, 138, 76).
         const COLOR: u32 = 0x004C_8AFF;
+        static CLASS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
         let (tx, rx) = channel::<u32>();
         std::thread::spawn(move || {
@@ -604,13 +682,17 @@ impl RegionFrame {
             // pointers passed (class name, MSG) live until the end of the block.
             unsafe {
                 let instance = GetModuleHandleW(std::ptr::null());
-                let mut wc: WNDCLASSW = std::mem::zeroed();
-                wc.lpfnWndProc = Some(DefWindowProcW);
-                wc.hInstance = instance;
-                wc.hbrBackground = CreateSolidBrush(COLOR);
-                wc.lpszClassName = class.as_ptr();
-                // Registering again for a second frame fails harmlessly: the class already exists.
-                RegisterClassW(&wc);
+                CLASS.get_or_init(|| {
+                    let brush = CreateSolidBrush(COLOR);
+                    let mut wc: WNDCLASSW = std::mem::zeroed();
+                    wc.lpfnWndProc = Some(DefWindowProcW);
+                    wc.hInstance = instance;
+                    wc.hbrBackground = brush;
+                    wc.lpszClassName = class.as_ptr();
+                    if RegisterClassW(&wc) == 0 && !brush.is_null() {
+                        DeleteObject(brush);
+                    }
+                });
 
                 let mut windows = Vec::new();
                 for (x, y, w, h) in bars {
@@ -635,11 +717,12 @@ impl RegionFrame {
                         windows.push(hwnd);
                     }
                 }
-                let _ = tx.send(GetCurrentThreadId());
-                let mut msg: MSG = std::mem::zeroed();
-                // GetMessageW returns 0 on WM_QUIT (sent by `Drop`) and -1 on error.
-                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-                    DispatchMessageW(&msg);
+                if tx.send(GetCurrentThreadId()).is_ok() {
+                    let mut msg: MSG = std::mem::zeroed();
+                    // GetMessageW returns 0 on WM_QUIT (sent by `Drop`) and -1 on error.
+                    while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                        DispatchMessageW(&msg);
+                    }
                 }
                 for hwnd in windows {
                     DestroyWindow(hwnd);

@@ -59,7 +59,7 @@ fn row_signatures(img: &RgbaImage) -> Vec<u64> {
             let row = &raw[y * w * 4..(y * w + usable) * 4];
             // FNV-1a over RGB, every other pixel.
             let mut h: u64 = 0xcbf29ce484222325;
-            for px in row.chunks_exact(4).step_by(2) {
+            for px in row.as_chunks::<4>().0.iter().step_by(2) {
                 for &c in &px[..3] {
                     h = (h ^ c as u64).wrapping_mul(0x100000001b3);
                 }
@@ -129,6 +129,9 @@ fn sample_lines(img: &RgbaImage, vertical: bool, from: usize, to: usize) -> Vec<
     const LINES: usize = 28;
     let (w, h) = (img.width() as usize, img.height() as usize);
     let across = if vertical { w } else { h };
+    if across == 0 || from >= to {
+        return Vec::new();
+    }
     let raw = img.as_raw();
     (0..LINES)
         .map(|k| {
@@ -143,6 +146,26 @@ fn sample_lines(img: &RgbaImage, vertical: bool, from: usize, to: usize) -> Vec<
                 .collect()
         })
         .collect()
+}
+
+/// Counts rows at the top and bottom that stayed in place between `prev` and `next`, either
+/// bit-for-bit or within [`COLOR_TOLERANCE`] across the usable width.
+fn fixed_edges(prev: &RgbaImage, prev_sigs: &[u64], next: &RgbaImage, next_sigs: &[u64]) -> (usize, usize) {
+    let h = prev_sigs.len();
+    let w = prev.width() as usize;
+    let usable = usable_width(w);
+    let (p_raw, n_raw) = (prev.as_raw(), next.as_raw());
+    let row_equal = |y: usize| {
+        if prev_sigs[y] == next_sigs[y] {
+            return true;
+        }
+        let range = y * w * 4..(y * w + usable) * 4;
+        let (pr, nr) = (p_raw[range.clone()].as_chunks::<4>().0, n_raw[range].as_chunks::<4>().0);
+        pr.iter().step_by(2).zip(nr.iter().step_by(2)).all(|(a, b)| similar([a[0], a[1], a[2]], [b[0], b[1], b[2]]))
+    };
+    let top = (0..h).take_while(|&y| row_equal(y)).count();
+    let bottom = (top..h).rev().take_while(|&y| row_equal(y)).count();
+    (top, bottom)
 }
 
 /// Shift `d` such that `next[i] ≈ prev[i + d]` for most informative pixels. Positive: the content
@@ -175,11 +198,11 @@ fn estimate_shift(prev: &[Vec<Rgb>], next: &[Vec<Rgb>], allow_backward: bool) ->
             let (mut score, mut possible) = (0u32, 0u32);
             for (m, &k) in moving.iter().enumerate() {
                 let (p, n, info) = (&prev[k], &next[k], &informative[m]);
-                for i in lo..hi {
+                for (i, &ni) in n.iter().enumerate().take(hi).skip(lo) {
                     let j = (i as i64 + d) as usize;
                     if info[j] {
                         possible += 1;
-                        if similar(n[i], p[j]) {
+                        if similar(ni, p[j]) {
                             score += 1;
                         }
                     }
@@ -237,8 +260,7 @@ impl Stitcher {
             Motion::Lost => {
                 // The fixed edges (identical rows at the top and bottom) are left out of the vote.
                 let h = self.frame_height as usize;
-                let top = self.last_sigs.iter().zip(&sigs).take_while(|(a, b)| a == b).count();
-                let bottom = self.last_sigs[top..].iter().rev().zip(sigs[top..].iter().rev()).take_while(|(a, b)| a == b).count();
+                let (top, bottom) = fixed_edges(&self.last, &self.last_sigs, next, &sigs);
                 let (prev, cur) = (
                     sample_lines(&self.last, true, top, h - bottom),
                     sample_lines(next, true, top, h - bottom),
@@ -331,16 +353,22 @@ fn scroll_to_start(rect: PxRect, axis: Axis) -> Result<bool, String> {
 /// Scrolls the area along one axis to the end, stitching. The image comes back in the normal
 /// orientation.
 fn strip(rect: PxRect, axis: Axis) -> Result<(RgbaImage, String), String> {
+    strip_inner(rect, axis).map(|(img, reason, _)| (img, reason))
+}
+
+fn strip_inner(rect: PxRect, axis: Axis) -> Result<(RgbaImage, String, bool), String> {
     let first = axis.grab(rect)?;
     let mut stitcher = Stitcher::new(&first);
     // Short areas need small steps for the shots to overlap.
     let mut notches = if first.height() < 500 { 1 } else { 3 };
     let mut reason = t!("limite de fotos atingido", "shot limit reached").to_owned();
+    let mut stopped_by_esc = false;
     let mut still = 0;
 
     for _ in 0..MAX_FRAMES {
         if win::escape_pressed() {
             reason = t!("interrompida com Esc", "stopped with Esc").to_owned();
+            stopped_by_esc = true;
             break;
         }
         axis.step(notches, true);
@@ -379,7 +407,7 @@ fn strip(rect: PxRect, axis: Axis) -> Result<(RgbaImage, String), String> {
         }
     }
     let out = stitcher.finish();
-    Ok((if axis == Axis::Horizontal { transpose(&out) } else { out }, reason))
+    Ok((if axis == Axis::Horizontal { transpose(&out) } else { out }, reason, stopped_by_esc))
 }
 
 /// Scrolls on both axes: a full vertical strip for each horizontal position, then joins the strips
@@ -387,11 +415,12 @@ fn strip(rect: PxRect, axis: Axis) -> Result<(RgbaImage, String), String> {
 fn both_axes(rect: PxRect) -> Result<(RgbaImage, String), String> {
     let mut columns: Vec<RgbaImage> = Vec::new();
     let mut reason;
+    let h_notches = if rect.2 - rect.0 < 500 { 1 } else { 3 };
     loop {
-        let (column, why) = strip(rect, Axis::Vertical)?;
+        let (column, why, esc) = strip_inner(rect, Axis::Vertical)?;
         columns.push(column);
         reason = why;
-        if reason.contains("Esc") || columns.len() >= 12 {
+        if esc || columns.len() >= 12 {
             break;
         }
         if !scroll_to_start(rect, Axis::Vertical)? {
@@ -399,7 +428,7 @@ fn both_axes(rect: PxRect) -> Result<(RgbaImage, String), String> {
             break;
         }
         let before = grab_stable(rect)?;
-        Axis::Horizontal.step(3, true);
+        Axis::Horizontal.step(h_notches, true);
         std::thread::sleep(Duration::from_millis(150));
         if grab_stable(rect)? == before {
             break; // there's nothing more to the right
@@ -536,7 +565,7 @@ pub struct PanoramicSession {
     stop: Arc<AtomicBool>,
     size: Arc<Mutex<(u32, u32)>>,
     lost: Arc<AtomicU32>,
-    worker: JoinHandle<Result<RgbaImage, String>>,
+    worker: Option<JoinHandle<Result<RgbaImage, String>>>,
 }
 
 /// Starts watching the area `rect`; the user scrolls and the shots get pasted in.
@@ -561,7 +590,7 @@ pub fn start_panoramic(rect: PxRect) -> PanoramicSession {
         }
         Ok(pano.finish())
     });
-    PanoramicSession { stop, size, lost, worker }
+    PanoramicSession { stop, size, lost, worker: Some(worker) }
 }
 
 impl PanoramicSession {
@@ -576,10 +605,11 @@ impl PanoramicSession {
     }
 
     /// Stops watching and returns the mosaic and a note for the user.
-    pub fn finish(self) -> Result<(RgbaImage, String), String> {
+    pub fn finish(mut self) -> Result<(RgbaImage, String), String> {
         self.stop.store(true, Ordering::Relaxed);
         let lost = self.lost.load(Ordering::Relaxed);
-        let image = self.worker.join().map_err(|_| t!("a captura panorâmica falhou", "the panoramic capture failed").to_owned())??;
+        let worker = self.worker.take().ok_or_else(|| t!("a captura panorâmica falhou", "the panoramic capture failed").to_owned())?;
+        let image = worker.join().map_err(|_| t!("a captura panorâmica falhou", "the panoramic capture failed").to_owned())??;
         let note = if lost == 0 {
             t!("panorâmica concluída", "panoramic finished").to_owned()
         } else {
@@ -589,6 +619,15 @@ impl PanoramicSession {
             )
         };
         Ok((image, note))
+    }
+}
+
+impl Drop for PanoramicSession {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -692,9 +731,10 @@ mod tests {
 
     #[test]
     fn tolerates_small_color_noise() {
-        // The second shot has ±2 noise in every pixel: no exact signature matches.
-        let noisy = |scroll: u32| {
-            let mut f = frame(scroll, 300, 0, 0);
+        // The second shot has ±2 noise in every pixel: no exact signature matches, including on
+        // the sticky header and footer.
+        let noisy = |scroll: u32, header: u32, footer: u32| {
+            let mut f = frame(scroll, 300, header, footer);
             for (i, p) in f.pixels_mut().enumerate() {
                 let d = (i % 5) as i16 - 2;
                 for c in 0..3 {
@@ -703,9 +743,11 @@ mod tests {
             }
             f
         };
-        let mut s = Stitcher::new(&frame(0, 300, 0, 0));
-        assert_eq!(s.push(&noisy(90)), Push::Added);
-        assert_eq!(s.finish().height(), 390);
+        let mut s = Stitcher::new(&frame(0, 300, 40, 30));
+        assert_eq!(s.push(&noisy(90, 40, 30)), Push::Added);
+        let out = s.finish();
+        assert_eq!(out.height(), 390);
+        assert_ne!(out.get_pixel(40, 299).0[0], 200, "noisy sticky footer stripped from middle");
     }
 
     #[test]
@@ -745,7 +787,7 @@ mod tests {
     fn chat_view(scroll: u32) -> RgbaImage {
         RgbaImage::from_fn(240, 200, |x, y| {
             let page_y = scroll + y;
-            let in_bubble = (page_y / 40) % 2 == 0 && x > 30 && x < 200;
+            let in_bubble = (page_y / 40).is_multiple_of(2) && x > 30 && x < 200;
             if in_bubble {
                 let v = x.wrapping_mul(2654435761).wrapping_add(page_y.wrapping_mul(40503)) >> 5;
                 image::Rgba([v as u8, (v >> 8) as u8, (v >> 16) as u8, 255])

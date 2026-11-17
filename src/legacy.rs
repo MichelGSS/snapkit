@@ -34,10 +34,11 @@ pub fn migrate() {
 
     // "Start with Windows": the old entry pointed to the old executable.
     let run = r"Software\Microsoft\Windows\CurrentVersion\Run";
-    if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(run, KEY_READ | KEY_WRITE) {
-        if key.get_value::<String, _>(OLD_NAME).is_ok() && key.delete_value(OLD_NAME).is_ok() {
-            let _ = crate::autostart::set_enabled(true);
-        }
+    if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(run, KEY_READ | KEY_WRITE)
+        && key.get_value::<String, _>(OLD_NAME).is_ok()
+        && key.delete_value(OLD_NAME).is_ok()
+    {
+        let _ = crate::autostart::set_enabled(true);
     }
 }
 

@@ -62,9 +62,17 @@ impl Library {
     /// copy of SnapKit). An index that can't be read is kept as `index.json.bad`.
     pub fn open(dir: PathBuf) -> Self {
         let index = dir.join(INDEX_FILE);
-        let mut entries: Vec<Entry> = match std::fs::read_to_string(&index) {
-            Err(_) => Vec::new(),
-            Ok(text) => match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+        let mut entries: Vec<Entry> = match std::fs::read(&index) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                let _ = std::fs::rename(&index, dir.join("index.json.bad"));
+                crate::log_error(&format!("index.json could not be read ({e}); it was kept as index.json.bad"));
+                Vec::new()
+            }
+            Ok(bytes) => match std::str::from_utf8(&bytes)
+                .map_err(|e| e.to_string())
+                .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string()))
+            {
                 Ok(entries) => entries,
                 Err(e) => {
                     let _ = std::fs::rename(&index, dir.join("index.json.bad"));
@@ -100,7 +108,7 @@ impl Library {
         }
         self.entries.append(&mut lost);
         // The names are the capture time, so this is newest first, like the index.
-        self.entries.sort_by(|a, b| b.file.cmp(&a.file));
+        self.entries.sort_by(|a, b| capture_sort_key(&b.file).cmp(&capture_sort_key(&a.file)));
         true
     }
 
@@ -146,11 +154,11 @@ impl Library {
 
     /// Updates the recorded size after an edit (a crop, for example).
     pub fn set_size(&mut self, file: &str, width: u32, height: u32) {
-        if let Some(e) = self.entries.iter_mut().find(|e| e.file == file) {
-            if (e.width, e.height) != (width, height) {
-                (e.width, e.height) = (width, height);
-                self.save_index();
-            }
+        if let Some(e) = self.entries.iter_mut().find(|e| e.file == file)
+            && (e.width, e.height) != (width, height)
+        {
+            (e.width, e.height) = (width, height);
+            self.save_index();
         }
     }
 
@@ -181,9 +189,28 @@ fn capture_time(name: &str) -> Option<(&str, &str, &str, &str, &str)> {
     (shape && suffix_ok).then(|| (&stamp[0..4], &stamp[5..7], &stamp[8..10], &stamp[11..13], &stamp[14..16]))
 }
 
-/// A tampered index must not point outside the library folder.
+/// Chronological key `(timestamp, sequence_within_second)` so `..._10.png` sorts after `..._2.png`.
+fn capture_sort_key(name: &str) -> (&str, u64) {
+    if let Some(stem) = name.strip_suffix(".png")
+        && let Some((stamp, suffix)) = stem.split_at_checked(19)
+    {
+        let seq = if suffix.is_empty() {
+            1
+        } else {
+            suffix.strip_prefix('_').and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
+        };
+        return (stamp, seq);
+    }
+    (name, 0)
+}
+
+/// A tampered index must not point outside the library folder or at non-PNG files (like `index.json`).
 fn is_plain_file_name(file: &str) -> bool {
-    !file.is_empty() && !file.contains(['/', '\\', ':']) && file != "." && file != ".."
+    !file.is_empty()
+        && !file.contains(['/', '\\', ':'])
+        && file != "."
+        && file != ".."
+        && Path::new(file).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
 }
 
 /// What gets selected after `file` leaves the list: the next item or, at the end, the previous one.
@@ -208,6 +235,14 @@ struct Job {
     thumb: RgbaImage,
 }
 
+struct PendingGuard<'a>(&'a AtomicUsize);
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Writes PNGs on a single thread, in the order requested, so that an edit saved right after the
 /// capture is never overwritten by the earlier write.
 pub struct Writer {
@@ -226,10 +261,18 @@ impl Writer {
         let (report, done) = (error.clone(), pending.clone());
         std::thread::spawn(move || {
             for job in rx {
-                if let Err(e) = write_job(&job) {
-                    *report.lock().unwrap() = Some(format!("{}: {e}", job.path.display()));
+                let _guard = PendingGuard(&done);
+                let path = job.path.clone();
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_job(&job)));
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        *report.lock().unwrap() = Some(format!("{}: {e}", path.display()));
+                    }
+                    Err(_) => {
+                        *report.lock().unwrap() = Some(format!("{}: unexpected error while encoding PNG", path.display()));
+                    }
                 }
-                done.fetch_sub(1, Ordering::SeqCst);
             }
         });
         Self { tx, error, pending }
@@ -250,23 +293,44 @@ impl Writer {
 
     pub fn save(&self, library: &Library, file: &str, image: RgbaImage, thumb: RgbaImage) {
         self.pending.fetch_add(1, Ordering::SeqCst);
-        let _ = self.tx.send(Job {
-            path: library.path(file),
-            thumb_path: library.thumb_path(file),
-            image,
-            thumb,
-        });
+        let path = library.path(file);
+        if self
+            .tx
+            .send(Job {
+                path: path.clone(),
+                thumb_path: library.thumb_path(file),
+                image,
+                thumb,
+            })
+            .is_err()
+        {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            *self.error.lock().unwrap() = Some(format!("{}: background writer unavailable", path.display()));
+        }
     }
 }
 
-fn write_job(job: &Job) -> Result<(), String> {
-    for path in [&job.path, &job.thumb_path] {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
+fn save_png_atomic(img: &RgbaImage, path: &Path) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    job.image.save(&job.path).map_err(|e| e.to_string())?;
-    job.thumb.save(&job.thumb_path).map_err(|e| e.to_string())
+    let mut tmp_name = path.file_stem().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp.png");
+    let tmp = path.with_file_name(tmp_name);
+    if let Err(e) = img.save(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
+}
+
+fn write_job(job: &Job) -> Result<(), String> {
+    save_png_atomic(&job.image, &job.path)?;
+    save_png_atomic(&job.thumb, &job.thumb_path)
 }
 
 #[cfg(test)]
@@ -367,7 +431,7 @@ mod tests {
         std::fs::write(dir.join("fora.png"), b"x").unwrap();
         let sub = dir.join("lib");
         std::fs::create_dir_all(&sub).unwrap();
-        let index = r#"[{"file":"..\\fora.png","when":"","width":1,"height":1}]"#;
+        let index = r#"[{"file":"..\\fora.png","when":"","width":1,"height":1},{"file":"index.json","when":"","width":1,"height":1}]"#;
         std::fs::write(sub.join(INDEX_FILE), index).unwrap();
         assert_eq!(Library::open(sub).len(), 0);
     }
@@ -376,7 +440,14 @@ mod tests {
     fn corrupt_index_becomes_empty_library() {
         let dir = temp_dir("corrupted");
         std::fs::write(dir.join(INDEX_FILE), "{{{").unwrap();
-        assert_eq!(Library::open(dir).len(), 0);
+        assert_eq!(Library::open(dir.clone()).len(), 0);
+        assert!(dir.join("index.json.bad").is_file());
+    }
+
+    #[test]
+    fn same_second_suffixes_sort_numerically() {
+        assert!(capture_sort_key("2026-11-10_02-45-12_2.png") > capture_sort_key("2026-11-10_02-45-12.png"));
+        assert!(capture_sort_key("2026-11-10_02-45-12_10.png") > capture_sort_key("2026-11-10_02-45-12_2.png"));
     }
 
     #[test]

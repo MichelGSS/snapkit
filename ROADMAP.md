@@ -4,7 +4,7 @@ SnapKit is a screen capture and annotation tool for Windows, written in Rust wit
 
 ## Project principles
 
-- **100% local.** No accounts, servers, telemetry or network access.
+- **Local by default.** No accounts, servers or telemetry; the internet is used only when the user checks for updates.
 - **Original work.** No code, icons, texts or layouts copied from other products.
 - **Lightweight.** One native process, no background services.
 - **Windows first.** Other platforms may come later.
@@ -22,12 +22,11 @@ SnapKit is a screen capture and annotation tool for Windows, written in Rust wit
 | Video | MP4 with system sound and microphone, pause, trimming, GIF export |
 | Library | Automatic saving, thumbnails, search, Recycle Bin |
 | Interface | English and Portuguese, nine themes, tray, start with Windows |
-| Distribution | Installer, portable zip, MIT license, third-party notices, CI |
+| Distribution | Installer, portable zip, opt-in SHA-256 verified updates, MIT license, third-party notices, CI |
 
 ## Next
 
 - Signed installer and release builds from CI.
-- Update notifications that don't require a network connection from SnapKit itself (for example, a link to the Releases page).
 - Global shortcuts for more capture modes.
 - Keeping annotations editable when a capture is reopened from the library.
 - Rotating and reordering annotations.
