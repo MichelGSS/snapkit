@@ -18,8 +18,21 @@ use serde::{Deserialize, Serialize};
 
 const INDEX_FILE: &str = "index.json";
 const THUMB_DIR: &str = ".miniaturas";
+const LAYERS_VERSION: u32 = 1;
 /// Maximum thumbnail width, in pixels.
 pub const THUMB_WIDTH: u32 = 240;
+
+#[derive(Serialize)]
+struct LayersFileRef<'a> {
+    version: u32,
+    ops: &'a [crate::render::Op],
+}
+
+#[derive(Deserialize)]
+struct LayersFile {
+    version: u32,
+    ops: Vec<crate::render::Op>,
+}
 
 /// Local date and time, already split (year, month, day, hour, minute, second).
 pub type LocalTime = (u16, u16, u16, u16, u16, u16);
@@ -95,7 +108,7 @@ impl Library {
         let mut lost: Vec<Entry> = files
             .flatten()
             .filter_map(|f| f.file_name().into_string().ok())
-            .filter(|name| capture_time(name).is_some() && !self.entries.iter().any(|e| &e.file == name))
+            .filter(|name| !is_sidecar_name(name) && capture_time(name).is_some() && !self.entries.iter().any(|e| &e.file == name))
             .filter_map(|file| {
                 let (y, mo, d, h, mi) = capture_time(&file)?;
                 let (width, height) = image::image_dimensions(self.dir.join(&file)).ok()?;
@@ -122,6 +135,35 @@ impl Library {
 
     pub fn thumb_path(&self, file: &str) -> PathBuf {
         self.dir.join(THUMB_DIR).join(file)
+    }
+
+    pub fn layers_path(&self, file: &str) -> PathBuf {
+        let stem = Path::new(file).file_stem().and_then(|s| s.to_str()).unwrap_or(file);
+        self.dir.join(format!("{stem}.snap.json"))
+    }
+
+    pub fn base_path(&self, file: &str) -> PathBuf {
+        let stem = Path::new(file).file_stem().and_then(|s| s.to_str()).unwrap_or(file);
+        self.dir.join(format!("{stem}.base.png"))
+    }
+
+    pub fn save_layers_json(ops: &[crate::render::Op]) -> Result<String, String> {
+        serde_json::to_string(&LayersFileRef { version: LAYERS_VERSION, ops }).map_err(|e| e.to_string())
+    }
+
+    pub fn load_layers(&self, file: &str) -> Option<(RgbaImage, Vec<crate::render::Op>)> {
+        let bytes = std::fs::read(self.layers_path(file)).ok()?;
+        let parsed: LayersFile = serde_json::from_slice(&bytes).ok()?;
+        if parsed.version != LAYERS_VERSION {
+            return None;
+        }
+        let base = image::open(self.base_path(file)).ok()?.to_rgba8();
+        Some((base, parsed.ops))
+    }
+
+    pub fn remove_layers(&self, file: &str) {
+        let _ = std::fs::remove_file(self.layers_path(file));
+        let _ = std::fs::remove_file(self.base_path(file));
     }
 
     /// Entries that contain the search text (case-insensitive), newest first.
@@ -204,12 +246,18 @@ fn capture_sort_key(name: &str) -> (&str, u64) {
     (name, 0)
 }
 
+fn is_sidecar_name(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    lower.ends_with(".base.png") || lower.ends_with(".tmp.png") || lower.ends_with(".snap.json")
+}
+
 /// A tampered index must not point outside the library folder or at non-PNG files (like `index.json`).
 fn is_plain_file_name(file: &str) -> bool {
     !file.is_empty()
         && !file.contains(['/', '\\', ':'])
         && file != "."
         && file != ".."
+        && !is_sidecar_name(file)
         && Path::new(file).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
 }
 
@@ -228,11 +276,19 @@ pub fn make_thumb(image: &RgbaImage) -> RgbaImage {
     image::imageops::thumbnail(image, THUMB_WIDTH, h)
 }
 
+pub struct LayersJob {
+    pub base_path: PathBuf,
+    pub base_image: Option<RgbaImage>,
+    pub layers_path: PathBuf,
+    pub ops_json: String,
+}
+
 struct Job {
     path: PathBuf,
     thumb_path: PathBuf,
     image: RgbaImage,
     thumb: RgbaImage,
+    layers: Option<LayersJob>,
 }
 
 struct PendingGuard<'a>(&'a AtomicUsize);
@@ -291,16 +347,21 @@ impl Writer {
         self.error.lock().unwrap().take()
     }
 
-    pub fn save(&self, library: &Library, file: &str, image: RgbaImage, thumb: RgbaImage) {
+    pub fn save(&self, library: &Library, file: &str, image: RgbaImage, _thumb: RgbaImage) {
+        self.save_with_layers(library.path(file), library.thumb_path(file), image, None);
+    }
+
+    pub fn save_with_layers(&self, path: PathBuf, thumb_path: PathBuf, image: RgbaImage, layers: Option<LayersJob>) {
+        let thumb = make_thumb(&image);
         self.pending.fetch_add(1, Ordering::SeqCst);
-        let path = library.path(file);
         if self
             .tx
             .send(Job {
                 path: path.clone(),
-                thumb_path: library.thumb_path(file),
+                thumb_path,
                 image,
                 thumb,
+                layers,
             })
             .is_err()
         {
@@ -330,7 +391,17 @@ fn save_png_atomic(img: &RgbaImage, path: &Path) -> Result<(), String> {
 
 fn write_job(job: &Job) -> Result<(), String> {
     save_png_atomic(&job.image, &job.path)?;
-    save_png_atomic(&job.thumb, &job.thumb_path)
+    save_png_atomic(&job.thumb, &job.thumb_path)?;
+    if let Some(l) = &job.layers {
+        if let Some(base) = &l.base_image {
+            save_png_atomic(base, &l.base_path)?;
+        }
+        if let Some(dir) = l.layers_path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        crate::config::write_atomic(&l.layers_path, l.ops_json.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -479,9 +550,81 @@ mod tests {
             thumb_path: lib.thumb_path("a.png"),
             thumb: make_thumb(&img),
             image: img,
+            layers: None,
         })
         .unwrap();
         assert_eq!(image::open(lib.path("a.png")).unwrap().width(), 300);
         assert_eq!(image::open(lib.thumb_path("a.png")).unwrap().width(), 240);
+    }
+
+    #[test]
+    fn layers_and_base_paths_use_file_stem() {
+        let lib = Library::open(temp_dir("layer-paths"));
+        assert_eq!(lib.layers_path("2026-11-10_02-45-12.png"), lib.dir().join("2026-11-10_02-45-12.snap.json"));
+        assert_eq!(lib.base_path("2026-11-10_02-45-12.png"), lib.dir().join("2026-11-10_02-45-12.base.png"));
+    }
+
+    #[test]
+    fn save_load_and_remove_layers_roundtrip() {
+        let dir = temp_dir("layers-roundtrip");
+        let lib = Library::open(dir.clone());
+        let file = "2026-11-10_02-45-12.png";
+        let base = RgbaImage::from_pixel(20, 20, image::Rgba([10, 20, 30, 255]));
+        let rendered = RgbaImage::from_pixel(20, 20, image::Rgba([255, 0, 0, 255]));
+        let ops = vec![crate::render::Op::Line {
+            from: (0.0, 10.0),
+            to: (20.0, 10.0),
+            color: [255, 0, 0, 255],
+            width: 4.0,
+            dashed: false,
+        }];
+        let ops_json = Library::save_layers_json(&ops).unwrap();
+
+        write_job(&Job {
+            path: lib.path(file),
+            thumb_path: lib.thumb_path(file),
+            thumb: make_thumb(&rendered),
+            image: rendered,
+            layers: Some(LayersJob {
+                base_path: lib.base_path(file),
+                base_image: Some(base.clone()),
+                layers_path: lib.layers_path(file),
+                ops_json,
+            }),
+        })
+        .unwrap();
+
+        let (loaded_base, loaded_ops) = lib.load_layers(file).expect("layers should load");
+        assert_eq!(loaded_base, base);
+        assert_eq!(loaded_ops, ops);
+
+        // Wrong version is rejected.
+        std::fs::write(lib.layers_path(file), r#"{"version":999,"ops":[]}"#).unwrap();
+        assert!(lib.load_layers(file).is_none());
+
+        lib.remove_layers(file);
+        assert!(!lib.layers_path(file).exists());
+        assert!(!lib.base_path(file).exists());
+        assert!(lib.load_layers(file).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_lost_files_ignores_sidecars() {
+        let dir = temp_dir("ignore-sidecars");
+        RgbaImage::new(30, 20).save(dir.join("2026-11-10_02-45-12.png")).unwrap();
+        RgbaImage::new(30, 20).save(dir.join("2026-11-10_02-45-12.base.png")).unwrap();
+        RgbaImage::new(30, 20).save(dir.join("2026-11-10_02-45-12.tmp.png")).unwrap();
+        std::fs::write(dir.join("2026-11-10_02-45-12.snap.json"), b"{\"version\":1,\"ops\":[]}").unwrap();
+
+        assert!(!is_plain_file_name("2026-11-10_02-45-12.base.png"));
+        assert!(!is_plain_file_name("2026-11-10_02-45-12.tmp.png"));
+        assert!(!is_plain_file_name("2026-11-10_02-45-12.snap.json"));
+        assert!(is_plain_file_name("2026-11-10_02-45-12.png"));
+
+        let lib = Library::open(dir.clone());
+        let files: Vec<&str> = lib.search("").iter().map(|e| e.file.as_str()).collect();
+        assert_eq!(files, ["2026-11-10_02-45-12.png"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

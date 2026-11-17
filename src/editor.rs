@@ -262,6 +262,12 @@ impl History {
         Self { current: original.clone(), original, ops: Vec::new(), undo: Vec::new(), redo: Vec::new(), font }
     }
 
+    /// Restores history from a base image and an existing list of operations, without undo/redo entries.
+    pub fn from_parts(original: RgbaImage, ops: Vec<Op>, font: FontArc) -> Self {
+        let current = render::render_all(&original, &ops, &font);
+        Self { original, ops, undo: Vec::new(), redo: Vec::new(), current, font }
+    }
+
     pub fn image(&self) -> &RgbaImage {
         &self.current
     }
@@ -464,11 +470,11 @@ const ZOOM_MAX: f32 = 16.0;
 const ZOOM_STEP: f32 = 1.25;
 
 impl Editor {
-    pub fn new(ctx: &egui::Context, image: RgbaImage, accent: Color32) -> Self {
+    fn with_history(ctx: &egui::Context, history: History, accent: Color32) -> Self {
         let max_texture = ctx.input(|i| i.max_texture_side);
-        let texture = ctx.load_texture("editing", texture_image(&image, max_texture), TextureOptions::LINEAR);
+        let texture = ctx.load_texture("editing", texture_image(history.image(), max_texture), TextureOptions::LINEAR);
         Self {
-            history: History::new(image, default_font()),
+            history,
             texture,
             max_texture,
             accent,
@@ -502,6 +508,19 @@ impl Editor {
             pan: Vec2::ZERO,
             view_scale: 1.0,
         }
+    }
+
+    pub fn new(ctx: &egui::Context, image: RgbaImage, accent: Color32) -> Self {
+        Self::with_history(ctx, History::new(image, default_font()), accent)
+    }
+
+    /// Restores an editor from a saved base image and annotation operations.
+    pub fn from_parts(ctx: &egui::Context, base: RgbaImage, ops: Vec<render::Op>, accent: Color32) -> Self {
+        let mut editor = Self::with_history(ctx, History::from_parts(base, ops, default_font()), accent);
+        if !editor.is_blank() {
+            editor.tool = Tool::Select;
+        }
+        editor
     }
 
     /// Changes the accent color (outlines and control points) when the theme changes.
@@ -554,6 +573,16 @@ impl Editor {
     /// Final image, with every annotation applied.
     pub fn image(&self) -> &RgbaImage {
         self.history.image()
+    }
+
+    /// Original unannotated base image.
+    pub fn base_image(&self) -> &RgbaImage {
+        &self.history.original
+    }
+
+    /// Current list of operations applied on top of [`Self::base_image`].
+    pub fn ops(&self) -> &[render::Op] {
+        self.history.ops()
     }
 
     /// The part of the image marked with Grab text, if there's a pending request.
@@ -2027,5 +2056,68 @@ mod tests {
         ed.tool = Tool::Crop;
         assert!(ed.build_op((0.0, 0.0), (100.0, 100.0)).is_none(), "cropping the whole image is a no-op");
         assert!(ed.build_op((10.0, 10.0), (80.0, 80.0)).is_some());
+    }
+
+    #[test]
+    fn op_serde_roundtrip() {
+        let ops = vec![
+            Op::Arrow { from: (1.0, 2.0), to: (30.0, 40.0), color: RED, width: 4.0, dashed: true, double: true },
+            Op::Line { from: (0.0, 5.0), to: (10.0, 5.0), color: RED, width: 2.0, dashed: false },
+            Op::Rect { a: (5.0, 5.0), b: (25.0, 25.0), color: RED, width: 3.0, filled: true, dashed: false },
+            Op::Ellipse { a: (10.0, 10.0), b: (20.0, 30.0), color: RED, width: 2.0, filled: false, dashed: true },
+            Op::Pen { points: vec![(1.0, 1.0), (5.0, 8.0)], color: RED, width: 3.0 },
+            Op::Erase { points: vec![(2.0, 2.0), (6.0, 6.0)], width: 10.0 },
+            Op::Highlight { a: (0.0, 0.0), b: (20.0, 10.0), color: [255, 255, 0, 128] },
+            Op::Text { pos: (12.0, 15.0), text: "Hello".into(), color: RED, size: 18.0, boxed: true },
+            Op::Callout { tip: (5.0, 5.0), pos: (20.0, 20.0), text: "Note".into(), color: RED, size: 16.0, style: CalloutStyle::Outline },
+            Op::Step { center: (15.0, 15.0), number: 3, color: RED, radius: 14.0, shape: StepShape::Pin, glyph: StepGlyph::Upper },
+            Op::Stamp { kind: Stamp::Check, center: (40.0, 40.0), radius: 16.0, color: RED },
+            Op::Spotlight { a: (10.0, 10.0), b: (50.0, 50.0) },
+            Op::Pixelate { a: (0.0, 0.0), b: (20.0, 20.0) },
+            Op::Blur { a: (20.0, 20.0), b: (40.0, 40.0) },
+            Op::Magnify { src: ((0.0, 0.0), (10.0, 10.0)), a: (30.0, 30.0), b: (50.0, 50.0) },
+            Op::Crop { a: (2.0, 2.0), b: (90.0, 90.0) },
+            Op::Rotate { clockwise: true },
+            Op::Flip { horizontal: true },
+            Op::Resize { width: 80, height: 60 },
+            Op::Border { width: 4, color: RED },
+            Op::Shadow { size: 12 },
+            Op::CutOut { from: (0.0, 10.0), to: (0.0, 20.0), rows: true },
+        ];
+        let json = serde_json::to_string(&ops).unwrap();
+        let decoded: Vec<Op> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, ops);
+    }
+
+    #[test]
+    fn editor_from_parts_restores_objects_and_next_step() {
+        let ctx = egui::Context::default();
+        let base = RgbaImage::from_pixel(100, 100, image::Rgba(WHITE));
+        let ops = vec![
+            line(),
+            Op::Step {
+                center: (20.0, 20.0),
+                number: 3,
+                color: RED,
+                radius: 10.0,
+                shape: StepShape::Circle,
+                glyph: StepGlyph::Number,
+            },
+        ];
+        let mut ed = Editor::from_parts(&ctx, base.clone(), ops.clone(), Color32::WHITE);
+        assert_eq!(ed.base_image(), &base);
+        assert_eq!(ed.ops(), ops.as_slice());
+        assert_eq!(ed.image().get_pixel(50, 50).0, RED);
+        assert!(!ed.history.can_undo());
+        assert_eq!(ed.history.next_step(), 4);
+        assert_eq!(ed.tool, Tool::Select);
+
+        // Restored objects remain editable and undoable.
+        ed.history.remove(0);
+        assert_eq!(ed.ops().len(), 1);
+        assert_eq!(ed.image().get_pixel(50, 50).0, WHITE);
+        assert!(ed.history.undo());
+        assert_eq!(ed.ops().len(), 2);
+        assert_eq!(ed.image().get_pixel(50, 50).0, RED);
     }
 }

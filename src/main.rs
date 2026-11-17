@@ -69,8 +69,8 @@ struct Shared {
     delay_secs: AtomicU32,
     /// Draw the mouse cursor in the capture.
     include_cursor: AtomicBool,
-    /// Identifier of the global hotkey in effect (0 = none).
-    hotkey_id: AtomicU32,
+    /// Active global hotkey IDs mapped to their capture mode.
+    hotkey_map: Mutex<Vec<(u32, CaptureKind)>>,
     /// True while the window is cloaked (`DWMWA_CLOAK`), so it isn't mistaken for visible.
     cloaked: AtomicBool,
     /// Asked to show the main window from the tray or a second copy.
@@ -303,13 +303,15 @@ struct App {
     editor: Option<editor::Editor>,
     status: String,
     hotkeys: Option<GlobalHotKeyManager>,
-    /// Hotkey currently registered with the system.
-    active_hotkey: Option<HotKey>,
+    /// Hotkeys currently registered with the system.
+    active_hotkeys: Vec<HotKey>,
     /// Keeps the tray icon alive; `None` if the tray couldn't be created.
     tray: Option<tray::Tray>,
     show_prefs: bool,
-    /// Draft of the shortcut in the preferences window, before Apply.
+    /// Draft of the primary shortcut in the preferences window, before Apply.
     hotkey_draft: HotkeyCfg,
+    /// Draft of the per-mode shortcuts in the preferences window, before Apply.
+    mode_hotkeys_draft: config::ModeHotkeysCfg,
     autostart: bool,
     library: library::Library,
     writer: library::Writer,
@@ -470,7 +472,7 @@ impl App {
             hwnd,
             delay_secs: AtomicU32::new(cfg.delay_secs),
             include_cursor: AtomicBool::new(cfg.include_cursor),
-            hotkey_id: AtomicU32::new(0),
+            hotkey_map: Mutex::new(Vec::new()),
             cloaked: AtomicBool::new(false),
             open_requested: AtomicBool::new(false),
             quit_requested: AtomicBool::new(false),
@@ -513,12 +515,13 @@ impl App {
         let mut app = Self {
             shared,
             hotkey_draft: cfg.hotkey.clone(),
+            mode_hotkeys_draft: cfg.mode_hotkeys.clone(),
             cfg,
             selecting: None,
             editor: None,
             status: String::new(),
             hotkeys,
-            active_hotkey: None,
+            active_hotkeys: Vec::new(),
             tray,
             show_prefs: false,
             autostart: autostart::is_enabled(),
@@ -554,7 +557,7 @@ impl App {
         if std::env::args().any(|a| a == "--select") {
             start_capture(CaptureKind::Region, app.shared.clone(), cc.egui_ctx.clone());
         }
-        app.status = match app.apply_hotkey(&app.cfg.hotkey.clone()) {
+        app.status = match app.apply_hotkeys(&app.cfg.hotkey.clone(), &app.cfg.mode_hotkeys.clone()) {
             Ok(()) => tf!("Pronto. Atalho global: {}", "Ready. Global shortcut: {}", app.cfg.hotkey.label()),
             Err(e) => tf!("Atalho {} indisponível: {e}", "Shortcut {} unavailable: {e}", app.cfg.hotkey.label()),
         };
@@ -570,18 +573,68 @@ impl App {
         app
     }
 
-    /// Replaces the global hotkey registered with the system. On error, the previous one is kept.
-    fn apply_hotkey(&mut self, cfg: &HotkeyCfg) -> Result<(), String> {
-        let manager = self.hotkeys.as_ref().ok_or(t!("atalhos globais indisponíveis", "global shortcuts unavailable"))?;
-        let new = cfg.to_hotkey().ok_or(t!("tecla desconhecida", "unknown key"))?;
-        if self.active_hotkey == Some(new) {
-            return Ok(());
+    /// Validates and replaces all registered global hotkeys (primary Region + enabled modes).
+    /// On error, restores the previous set of hotkeys.
+    fn apply_hotkeys(&mut self, primary: &HotkeyCfg, modes: &config::ModeHotkeysCfg) -> Result<(), String> {
+        let manager = self
+            .hotkeys
+            .as_ref()
+            .ok_or_else(|| t!("atalhos globais indisponíveis", "global shortcuts unavailable").to_owned())?;
+
+        let mut candidates: Vec<(HotkeyCfg, HotKey, CaptureKind)> = Vec::new();
+        let mut push_candidate = |cfg: &HotkeyCfg, kind: CaptureKind| -> Result<(), String> {
+            if !cfg.is_safe() {
+                return Err(tf!(
+                    "{} atrapalharia a digitação; inclua Ctrl, Alt ou Win.",
+                    "{} would get in the way of typing; include Ctrl, Alt or Win.",
+                    cfg.label()
+                ));
+            }
+            let hk = cfg
+                .to_hotkey()
+                .ok_or_else(|| tf!("tecla desconhecida ({})", "unknown key ({})", cfg.label()))?;
+            if candidates.iter().any(|(prev, _, _)| prev.conflicts_with(cfg)) {
+                return Err(tf!(
+                    "Atalho duplicado: {}. Cada modo precisa de um atalho diferente.",
+                    "Duplicate shortcut: {}. Each mode needs a distinct shortcut.",
+                    cfg.label()
+                ));
+            }
+            candidates.push((cfg.clone(), hk, kind));
+            Ok(())
+        };
+
+        push_candidate(primary, CaptureKind::Region)?;
+        for (mode, opt) in modes.all() {
+            if let Some(cfg) = opt {
+                push_candidate(cfg, capture_kind_for_mode(mode))?;
+            }
         }
-        manager.register(new).map_err(|e| e.to_string())?;
-        if let Some(old) = self.active_hotkey.replace(new) {
-            let _ = manager.unregister(old);
+
+        for old in &self.active_hotkeys {
+            let _ = manager.unregister(*old);
         }
-        self.shared.hotkey_id.store(new.id(), Ordering::Relaxed);
+
+        let mut registered: Vec<HotKey> = Vec::with_capacity(candidates.len());
+        let mut map: Vec<(u32, CaptureKind)> = Vec::with_capacity(candidates.len());
+        for (cfg, hk, kind) in candidates {
+            if let Err(e) = manager.register(hk) {
+                for r in registered {
+                    let _ = manager.unregister(r);
+                }
+                for old in &self.active_hotkeys {
+                    let _ = manager.register(*old);
+                }
+                return Err(tf!("Não foi possível usar {}: {e}.", "Could not use {}: {e}.", cfg.label()));
+            }
+            map.push((hk.id(), kind));
+            registered.push(hk);
+        }
+
+        self.active_hotkeys = registered;
+        if let Ok(mut guard) = self.shared.hotkey_map.lock() {
+            *guard = map;
+        }
         Ok(())
     }
 
@@ -794,50 +847,46 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.strong(t!("Atalho global de captura", "Global capture shortcut"));
+                ui.strong(t!("Atalho global de captura (Região)", "Global capture shortcut (Region)"));
                 ui.horizontal(|ui| {
-                    let d = &mut self.hotkey_draft;
-                    ui.checkbox(&mut d.ctrl, "Ctrl");
-                    ui.checkbox(&mut d.alt, "Alt");
-                    ui.checkbox(&mut d.shift, "Shift");
-                    ui.checkbox(&mut d.win, "Win");
-                    egui::ComboBox::from_id_salt("key")
-                        .selected_text(d.key.clone())
-                        .width(110.0)
-                        .show_ui(ui, |ui| {
-                            for key in config::KEYS {
-                                ui.selectable_value(&mut d.key, key.to_owned(), key);
+                    hotkey_editor_row(ui, "key", &mut self.hotkey_draft);
+                });
+                ui.collapsing(t!("Atalhos para outros modos", "Shortcuts for other modes"), |ui| {
+                    egui::Grid::new("mode_hotkeys_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                        for (idx, mode) in ALL_SHORTCUT_MODES.iter().copied().enumerate() {
+                            let mut enabled = self.mode_hotkeys_draft.get(mode).is_some();
+                            if ui.checkbox(&mut enabled, mode_hotkey_label(mode)).changed() {
+                                let next = if enabled { Some(HotkeyCfg::default()) } else { None };
+                                self.mode_hotkeys_draft.set(mode, next);
                             }
-                        });
+                            ui.horizontal(|ui| {
+                                if let Some(hk) = self.mode_hotkeys_draft.get_mut(mode) {
+                                    hotkey_editor_row(ui, ("mode_hk", idx), hk);
+                                } else {
+                                    ui.weak(t!("Desativado", "Disabled"));
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
                 });
                 ui.horizontal(|ui| {
-                    let changed = self.hotkey_draft != self.cfg.hotkey;
-                    if ui.add_enabled(changed, egui::Button::new(t!("Aplicar atalho", "Apply shortcut"))).clicked() {
-                        let draft = self.hotkey_draft.clone();
-                        if !draft.is_safe() {
-                            self.status = tf!(
-                                "{} atrapalharia a digitação; inclua Ctrl, Alt ou Win.",
-                                "{} would get in the way of typing; include Ctrl, Alt or Win.",
-                                draft.label()
-                            );
-                        } else {
-                            match self.apply_hotkey(&draft) {
-                                Ok(()) => {
-                                    self.status = tf!("Atalho global: {}", "Global shortcut: {}", draft.label());
-                                    self.cfg.hotkey = draft;
-                                    self.save_cfg();
-                                    if let Some(tray) = &self.tray {
-                                        tray.relabel(&self.cfg.hotkey.label());
-                                    }
+                    let changed = self.hotkey_draft != self.cfg.hotkey || self.mode_hotkeys_draft != self.cfg.mode_hotkeys;
+                    if ui.add_enabled(changed, egui::Button::new(t!("Aplicar atalhos", "Apply shortcuts"))).clicked() {
+                        let primary = self.hotkey_draft.clone();
+                        let modes = self.mode_hotkeys_draft.clone();
+                        match self.apply_hotkeys(&primary, &modes) {
+                            Ok(()) => {
+                                self.cfg.hotkey = primary;
+                                self.cfg.mode_hotkeys = modes;
+                                self.save_cfg();
+                                if let Some(tray) = &self.tray {
+                                    tray.relabel(&self.cfg.hotkey.label());
                                 }
-                                Err(e) => {
-                                    self.status = tf!(
-                                        "Não foi possível usar {}: {e}. Mantido {}.",
-                                        "Could not use {}: {e}. Kept {}.",
-                                        draft.label(),
-                                        self.cfg.hotkey.label()
-                                    );
-                                }
+                                self.status = tf!("Atalho global: {}", "Global shortcut: {}", self.cfg.hotkey.label());
+                            }
+                            Err(e) => {
+                                self.status = e;
                             }
                         }
                     }
@@ -1014,6 +1063,45 @@ impl App {
         }
     }
 
+    /// Saves `self.editor`'s flattened image, thumbnail, and editable annotation layers (when
+    /// annotations exist or previously existed) to the library writer.
+    fn save_editor_to_library(&mut self, ctx: &egui::Context, file: &str, is_new: bool) {
+        let Some(editor) = &self.editor else { return };
+        let image = editor.image().clone();
+        let thumb = library::make_thumb(&image);
+        let texture = ctx.load_texture(
+            "thumbnail",
+            editor::texture_image(&thumb, ctx.input(|i| i.max_texture_side)),
+            TextureOptions::LINEAR,
+        );
+        self.thumbs.insert(file.to_owned(), texture);
+
+        let ops = editor.ops();
+        let layers_path = self.library.layers_path(file);
+        let layers = if !ops.is_empty() || layers_path.exists() {
+            match library::Library::save_layers_json(ops) {
+                Ok(ops_json) => {
+                    let base_path = self.library.base_path(file);
+                    let base_image = if is_new || !base_path.exists() {
+                        Some(editor.base_image().clone())
+                    } else {
+                        None
+                    };
+                    Some(library::LayersJob { base_path, base_image, layers_path, ops_json })
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(layers) = layers {
+            self.writer
+                .save_with_layers(self.library.path(file), self.library.thumb_path(file), image, Some(layers));
+        } else {
+            self.writer.save(&self.library, file, image, thumb);
+        }
+    }
+
     /// Saves the editor's current image to the library right away, if it changed since the last
     /// save.
     fn flush_autosave(&mut self, ctx: &egui::Context) {
@@ -1022,13 +1110,11 @@ impl App {
         if editor.revision() == self.saved_revision {
             return;
         }
-        let image = editor.image().clone();
-        let thumb = library::make_thumb(&image);
-        let texture = ctx.load_texture("thumbnail", editor::texture_image(&thumb, ctx.input(|i| i.max_texture_side)), TextureOptions::LINEAR);
-        self.thumbs.insert(file.clone(), texture);
-        self.library.set_size(file, image.width(), image.height());
-        self.writer.save(&self.library, file, image, thumb);
-        self.saved_revision = editor.revision();
+        let file = file.clone();
+        let rev = editor.revision();
+        self.library.set_size(&file, editor.image().width(), editor.image().height());
+        self.save_editor_to_library(ctx, &file, false);
+        self.saved_revision = rev;
     }
 
     /// Saves the editor's current image to the library, if it changed since the last save. Waits
@@ -1063,9 +1149,13 @@ impl App {
     /// Opens a capture kept in the library in the editor.
     fn open_from_library(&mut self, ctx: &egui::Context, file: &str) {
         self.flush_autosave(ctx);
-        match image::open(self.library.path(file)) {
-            Ok(img) => {
-                let editor = editor::Editor::new(ctx, img.to_rgba8(), self.accent());
+        let loaded = if let Some((base, ops)) = self.library.load_layers(file) {
+            Ok(editor::Editor::from_parts(ctx, base, ops, self.accent()))
+        } else {
+            image::open(self.library.path(file)).map(|img| editor::Editor::new(ctx, img.to_rgba8(), self.accent()))
+        };
+        match loaded {
+            Ok(editor) => {
                 self.saved_revision = editor.revision();
                 self.editor = Some(editor);
                 self.current_file = Some(file.to_owned());
@@ -1080,6 +1170,7 @@ impl App {
         match trash::delete(self.library.path(file)) {
             Ok(()) => {
                 let _ = std::fs::remove_file(self.library.thumb_path(file));
+                self.library.remove_layers(file);
                 self.library.forget(file);
                 self.thumbs.remove(file);
                 if self.current_file.as_deref() == Some(file) {
@@ -1223,13 +1314,11 @@ impl App {
         editor.commit_pending_text();
         let image = editor.image().clone();
         let file = self.library.add(win::local_time(), title, image.width(), image.height());
-        let thumb = library::make_thumb(&image);
-        let texture = ctx.load_texture("thumbnail", editor::texture_image(&thumb, ctx.input(|i| i.max_texture_side)), TextureOptions::LINEAR);
-        self.thumbs.insert(file.clone(), texture);
-        self.writer.save(&self.library, &file, image.clone(), thumb);
-        self.current_file = Some(file);
-        // The image saved above already includes what has been annotated so far.
+        self.current_file = Some(file.clone());
+        // The image saved below already includes what has been annotated so far.
         self.saved_revision = editor.revision();
+        self.editor = Some(editor);
+        self.save_editor_to_library(ctx, &file, true);
         self.status = match copy_to_clipboard(&image) {
             Ok(()) => tf!(
                 "Captura de {}×{} px copiada para a área de transferência.",
@@ -1239,7 +1328,6 @@ impl App {
             ),
             Err(e) => tf!("Captura feita, mas não foi possível copiar: {e}", "Captured, but could not copy: {e}"),
         };
-        self.editor = Some(editor);
     }
 
     /// Hides the window and scrolls the chosen area in the background; the result arrives through
@@ -2598,6 +2686,7 @@ impl App {
                     if ui.button(t!("⚙ Preferências", "⚙ Preferences")).clicked() {
                         self.show_prefs = !self.show_prefs;
                         self.hotkey_draft = self.cfg.hotkey.clone();
+                        self.mode_hotkeys_draft = self.cfg.mode_hotkeys.clone();
                     }
                     if let UpdateState::Available(release) = &self.update_state {
                         let label = tf!("⬆ Versão {}", "⬆ Version {}", release.version);
@@ -2873,13 +2962,66 @@ fn guarded<T>(job: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         .unwrap_or_else(|_| Err(t!("erro interno (detalhes em %APPDATA%\\SnapKit\\error.log)", "internal error (details in %APPDATA%\\SnapKit\\error.log)").to_owned()))
 }
 
-/// Listens for the global hotkey in the background and triggers the region capture.
+const ALL_SHORTCUT_MODES: [config::CaptureShortcutMode; 6] = [
+    config::CaptureShortcutMode::FullScreen,
+    config::CaptureShortcutMode::AllScreens,
+    config::CaptureShortcutMode::Scrolling,
+    config::CaptureShortcutMode::Panoramic,
+    config::CaptureShortcutMode::Steps,
+    config::CaptureShortcutMode::Video,
+];
+
+fn capture_kind_for_mode(mode: config::CaptureShortcutMode) -> CaptureKind {
+    match mode {
+        config::CaptureShortcutMode::FullScreen => CaptureKind::FullScreen,
+        config::CaptureShortcutMode::AllScreens => CaptureKind::AllScreens,
+        config::CaptureShortcutMode::Scrolling => CaptureKind::Scroll,
+        config::CaptureShortcutMode::Panoramic => CaptureKind::Panoramic,
+        config::CaptureShortcutMode::Steps => CaptureKind::Steps,
+        config::CaptureShortcutMode::Video => CaptureKind::Video,
+    }
+}
+
+fn mode_hotkey_label(mode: config::CaptureShortcutMode) -> &'static str {
+    match mode {
+        config::CaptureShortcutMode::FullScreen => t!("Tela inteira", "Full screen"),
+        config::CaptureShortcutMode::AllScreens => t!("Todas as telas", "All screens"),
+        config::CaptureShortcutMode::Scrolling => t!("Rolagem", "Scrolling"),
+        config::CaptureShortcutMode::Panoramic => t!("Panorâmica", "Panoramic"),
+        config::CaptureShortcutMode::Steps => t!("Passo a passo", "Step by step"),
+        config::CaptureShortcutMode::Video => t!("Vídeo", "Video"),
+    }
+}
+
+fn hotkey_editor_row(ui: &mut egui::Ui, id_salt: impl std::hash::Hash + std::fmt::Debug, hk: &mut HotkeyCfg) {
+    ui.checkbox(&mut hk.ctrl, "Ctrl");
+    ui.checkbox(&mut hk.alt, "Alt");
+    ui.checkbox(&mut hk.shift, "Shift");
+    ui.checkbox(&mut hk.win, "Win");
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(hk.key.clone())
+        .width(100.0)
+        .show_ui(ui, |ui| {
+            for key in config::KEYS {
+                ui.selectable_value(&mut hk.key, key.to_owned(), key);
+            }
+        });
+}
+
+/// Listens for global hotkeys in the background and triggers the corresponding capture mode.
 fn spawn_hotkey_listener(shared: Arc<Shared>, ctx: egui::Context) {
     std::thread::spawn(move || {
         while let Ok(event) = GlobalHotKeyEvent::receiver().recv() {
-            let active = shared.hotkey_id.load(Ordering::Relaxed);
-            if active != 0 && event.id == active && event.state == HotKeyState::Pressed {
-                start_capture(CaptureKind::Region, shared.clone(), ctx.clone());
+            if event.state != HotKeyState::Pressed {
+                continue;
+            }
+            let kind = shared
+                .hotkey_map
+                .lock()
+                .ok()
+                .and_then(|map| map.iter().find(|(id, _)| *id == event.id).map(|(_, kind)| *kind));
+            if let Some(kind) = kind {
+                start_capture(kind, shared.clone(), ctx.clone());
             }
         }
     });

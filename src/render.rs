@@ -111,14 +111,48 @@ impl Stamp {
     ];
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     /// `double`: a head on both ends. `dashed` (here and in the shapes below): dashed stroke.
-    Arrow { from: Point, to: Point, color: Rgba, width: f32, dashed: bool, double: bool },
-    Line { from: Point, to: Point, color: Rgba, width: f32, dashed: bool },
+    Arrow {
+        from: Point,
+        to: Point,
+        color: Rgba,
+        width: f32,
+        #[serde(default)]
+        dashed: bool,
+        #[serde(default)]
+        double: bool,
+    },
+    Line {
+        from: Point,
+        to: Point,
+        color: Rgba,
+        width: f32,
+        #[serde(default)]
+        dashed: bool,
+    },
     /// `filled`: paints the whole shape instead of just the outline.
-    Rect { a: Point, b: Point, color: Rgba, width: f32, filled: bool, dashed: bool },
-    Ellipse { a: Point, b: Point, color: Rgba, width: f32, filled: bool, dashed: bool },
+    Rect {
+        a: Point,
+        b: Point,
+        color: Rgba,
+        width: f32,
+        #[serde(default)]
+        filled: bool,
+        #[serde(default)]
+        dashed: bool,
+    },
+    Ellipse {
+        a: Point,
+        b: Point,
+        color: Rgba,
+        width: f32,
+        #[serde(default)]
+        filled: bool,
+        #[serde(default)]
+        dashed: bool,
+    },
     Pen { points: Vec<Point>, color: Rgba, width: f32 },
     /// Eraser: wherever the stroke passes, the image goes back to the original capture, erasing
     /// what was drawn there before.
@@ -126,7 +160,14 @@ pub enum Op {
     /// Highlighter: a translucent rectangle that keeps the text underneath readable.
     Highlight { a: Point, b: Point, color: Rgba },
     /// `boxed`: draws a contrasting background box behind the text.
-    Text { pos: Point, text: String, color: Rgba, size: f32, boxed: bool },
+    Text {
+        pos: Point,
+        text: String,
+        color: Rgba,
+        size: f32,
+        #[serde(default)]
+        boxed: bool,
+    },
     /// Speech callout: a colored box with text and a tail that points to `tip`. `pos` is the
     /// top-left corner of the box, which grows with the text.
     Callout { tip: Point, pos: Point, text: String, color: Rgba, size: f32, style: CalloutStyle },

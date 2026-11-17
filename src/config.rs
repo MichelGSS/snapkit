@@ -56,6 +56,77 @@ impl HotkeyCfg {
         let has_modifier = self.ctrl || self.alt || self.win;
         has_modifier || self.key.starts_with('F') && self.key.len() > 1 || self.key == "PrintScreen"
     }
+
+    /// Returns `true` if `self` and `other` bind the exact same modifier + key combination.
+    pub fn conflicts_with(&self, other: &HotkeyCfg) -> bool {
+        self.ctrl == other.ctrl
+            && self.alt == other.alt
+            && self.shift == other.shift
+            && self.win == other.win
+            && self.key == other.key
+    }
+}
+
+/// Capture modes that can have their own optional global shortcut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CaptureShortcutMode {
+    FullScreen,
+    AllScreens,
+    Scrolling,
+    Panoramic,
+    Steps,
+    Video,
+}
+
+/// Optional per-mode global shortcuts, in addition to the primary `hotkey`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModeHotkeysCfg {
+    pub full_screen: Option<HotkeyCfg>,
+    pub all_screens: Option<HotkeyCfg>,
+    pub scrolling: Option<HotkeyCfg>,
+    pub panoramic: Option<HotkeyCfg>,
+    pub steps: Option<HotkeyCfg>,
+    pub video: Option<HotkeyCfg>,
+}
+
+impl ModeHotkeysCfg {
+    pub fn get(&self, mode: CaptureShortcutMode) -> Option<&HotkeyCfg> {
+        match mode {
+            CaptureShortcutMode::FullScreen => self.full_screen.as_ref(),
+            CaptureShortcutMode::AllScreens => self.all_screens.as_ref(),
+            CaptureShortcutMode::Scrolling => self.scrolling.as_ref(),
+            CaptureShortcutMode::Panoramic => self.panoramic.as_ref(),
+            CaptureShortcutMode::Steps => self.steps.as_ref(),
+            CaptureShortcutMode::Video => self.video.as_ref(),
+        }
+    }
+
+    pub fn get_mut(&mut self, mode: CaptureShortcutMode) -> &mut Option<HotkeyCfg> {
+        match mode {
+            CaptureShortcutMode::FullScreen => &mut self.full_screen,
+            CaptureShortcutMode::AllScreens => &mut self.all_screens,
+            CaptureShortcutMode::Scrolling => &mut self.scrolling,
+            CaptureShortcutMode::Panoramic => &mut self.panoramic,
+            CaptureShortcutMode::Steps => &mut self.steps,
+            CaptureShortcutMode::Video => &mut self.video,
+        }
+    }
+
+    pub fn set(&mut self, mode: CaptureShortcutMode, val: Option<HotkeyCfg>) {
+        *self.get_mut(mode) = val;
+    }
+
+    pub fn all(&self) -> [(CaptureShortcutMode, Option<&HotkeyCfg>); 6] {
+        [
+            (CaptureShortcutMode::FullScreen, self.full_screen.as_ref()),
+            (CaptureShortcutMode::AllScreens, self.all_screens.as_ref()),
+            (CaptureShortcutMode::Scrolling, self.scrolling.as_ref()),
+            (CaptureShortcutMode::Panoramic, self.panoramic.as_ref()),
+            (CaptureShortcutMode::Steps, self.steps.as_ref()),
+            (CaptureShortcutMode::Video, self.video.as_ref()),
+        ]
+    }
 }
 
 fn key_code(key: &str) -> Option<Code> {
@@ -73,6 +144,8 @@ fn key_code(key: &str) -> Option<Code> {
 #[serde(default)]
 pub struct Config {
     pub hotkey: HotkeyCfg,
+    #[serde(default)]
+    pub mode_hotkeys: ModeHotkeysCfg,
     pub delay_secs: u32,
     pub include_cursor: bool,
     /// Closing the window only hides it; the program stays in the tray.
@@ -100,6 +173,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             hotkey: HotkeyCfg::default(),
+            mode_hotkeys: ModeHotkeysCfg::default(),
             delay_secs: 0,
             include_cursor: false,
             close_to_tray: true,
@@ -275,5 +349,47 @@ mod tests {
         };
         let text = serde_json::to_string(&c).unwrap();
         assert_eq!(Config::parse(&text), c);
+    }
+
+    #[test]
+    fn parse_without_mode_hotkeys_defaults_to_none() {
+        let cfg = Config::parse(r#"{"delay_secs": 3, "hotkey": {"key": "A"}}"#);
+        assert_eq!(cfg.delay_secs, 3);
+        assert_eq!(cfg.mode_hotkeys, ModeHotkeysCfg::default());
+        for (_, hk) in cfg.mode_hotkeys.all() {
+            assert!(hk.is_none());
+        }
+    }
+
+    #[test]
+    fn mode_hotkeys_round_trip_and_helpers() {
+        let mut modes = ModeHotkeysCfg::default();
+        let fs = HotkeyCfg { ctrl: true, alt: true, shift: false, win: false, key: "F1".into() };
+        let vid = HotkeyCfg { ctrl: true, alt: false, shift: true, win: false, key: "R".into() };
+        modes.set(CaptureShortcutMode::FullScreen, Some(fs.clone()));
+        *modes.get_mut(CaptureShortcutMode::Video) = Some(vid.clone());
+
+        assert_eq!(modes.get(CaptureShortcutMode::FullScreen), Some(&fs));
+        assert_eq!(modes.get(CaptureShortcutMode::Video), Some(&vid));
+        assert_eq!(modes.get(CaptureShortcutMode::Scrolling), None);
+
+        let cfg = Config { mode_hotkeys: modes, ..Config::default() };
+        let text = serde_json::to_string(&cfg).unwrap();
+        let parsed = Config::try_parse(&text).unwrap();
+        assert_eq!(parsed, cfg);
+        assert_eq!(parsed.mode_hotkeys.all().len(), 6);
+    }
+
+    #[test]
+    fn hotkey_conflicts_with_checks_all_fields() {
+        let base = HotkeyCfg { ctrl: true, alt: true, shift: false, win: false, key: "S".into() };
+        let same = HotkeyCfg { ctrl: true, alt: true, shift: false, win: false, key: "S".into() };
+        let diff_key = HotkeyCfg { key: "X".into(), ..base.clone() };
+        let diff_shift = HotkeyCfg { shift: true, ..base.clone() };
+        let diff_win = HotkeyCfg { win: true, ..base.clone() };
+        assert!(base.conflicts_with(&same));
+        assert!(!base.conflicts_with(&diff_key));
+        assert!(!base.conflicts_with(&diff_shift));
+        assert!(!base.conflicts_with(&diff_win));
     }
 }
