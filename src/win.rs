@@ -162,6 +162,80 @@ pub fn client_origin(hwnd: isize) -> Option<(i32, i32)> {
     (unsafe { ClientToScreen(hwnd as HWND, &mut p) } != 0).then_some((p.x, p.y))
 }
 
+/// Full client rectangle of `hwnd` in physical desktop coordinates `(left, top, right, bottom)`.
+pub fn client_rect_screen(hwnd: isize) -> Option<PxRect> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: `r` is a valid stack RECT; `ClientToScreen` converts `(0, 0)` of `hwnd`.
+    unsafe {
+        if GetClientRect(hwnd as HWND, &mut r) == 0 {
+            return None;
+        }
+        let mut origin = POINT { x: 0, y: 0 };
+        if ClientToScreen(hwnd as HWND, &mut origin) == 0 {
+            return None;
+        }
+        let w = r.right - r.left;
+        let h = r.bottom - r.top;
+        (w > 0 && h > 0).then_some((origin.x, origin.y, origin.x + w, origin.y + h))
+    }
+}
+
+/// Requests `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` (`-4`) for the current process so every
+/// Win32 coordinate query runs in true physical pixels even before `eframe` opens.
+pub fn enable_per_monitor_dpi() {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    type SetProcessDpiAwarenessContextFn = unsafe extern "system" fn(isize) -> i32;
+    let user32: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+    // SAFETY: `user32.dll` is always loaded; `SetProcessDpiAwarenessContext` is available on
+    // Windows 10 1703+ (SnapKit requires Windows 10 2004+).
+    unsafe {
+        let module = GetModuleHandleW(user32.as_ptr());
+        if !module.is_null()
+            && let Some(sym) = GetProcAddress(module, c"SetProcessDpiAwarenessContext".as_ptr().cast())
+        {
+            let func: SetProcessDpiAwarenessContextFn = std::mem::transmute(sym);
+            let _ = func(-4); // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        }
+    }
+}
+
+/// Effective DPI scale factor (`1.0` = 96 DPI, `1.25` = 125%, `1.5` = 150%, etc.) of the monitor
+/// containing `p`. Used to size and place floating panels accurately on mixed-DPI setups.
+pub fn dpi_scale_at(p: (i32, i32)) -> f32 {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    type GetDpiForMonitorFn = unsafe extern "system" fn(*mut c_void, i32, *mut u32, *mut u32) -> i32;
+    static FN_PTR: std::sync::OnceLock<Option<GetDpiForMonitorFn>> = std::sync::OnceLock::new();
+    let getter = *FN_PTR.get_or_init(|| {
+        let shcore: Vec<u16> = "shcore.dll\0".encode_utf16().collect();
+        // SAFETY: loads `shcore.dll` once and resolves `GetDpiForMonitor`.
+        unsafe {
+            let lib = LoadLibraryW(shcore.as_ptr());
+            if lib.is_null() {
+                return None;
+            }
+            GetProcAddress(lib, c"GetDpiForMonitor".as_ptr().cast())
+                .map(|sym| std::mem::transmute::<_, GetDpiForMonitorFn>(sym))
+        }
+    });
+    let Some(get_dpi) = getter else {
+        return 1.0;
+    };
+    // SAFETY: `monitor` comes from `MonitorFromPoint`; `dpi_x` and `dpi_y` are valid u32 outputs.
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: p.0, y: p.1 }, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return 1.0;
+        }
+        let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+        if get_dpi(monitor.cast(), 0, &mut dpi_x, &mut dpi_y) == 0 && dpi_x > 0 {
+            (dpi_x as f32 / 96.0).clamp(0.5, 4.0)
+        } else {
+            1.0
+        }
+    }
+}
+
 /// Reads a small block of pixels straight from the screen (RGB, row by row). Much faster than
 /// photographing a whole monitor; it serves the selection magnifier, which updates every frame.
 pub fn grab_pixels(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<[u8; 3]>> {
@@ -739,6 +813,216 @@ impl Drop for RegionFrame {
         // SAFETY: it only posts a message; if the thread has already ended, the call fails
         // harmlessly.
         unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) };
+    }
+}
+
+/// Click-through animated ring shown around mouse clicks during video/GIF recording.
+///
+/// Unlike [`RegionFrame`], this window is *not* excluded from screen capture so FFmpeg (`gdigrab`)
+/// records the visual ripple, while `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE` ensures clicks pass
+/// straight through to the underlying application without stealing focus or adding latency.
+pub struct ClickHalo {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ClickHalo {
+    pub fn show(rect: PxRect, skip_hwnd: isize) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::Foundation::SIZE;
+        use windows_sys::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION};
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE,
+            PeekMessageW, RegisterClassW, ULW_ALPHA, UpdateLayeredWindow, WNDCLASSW, WS_EX_LAYERED,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        };
+
+        const SIDE: i32 = 72;
+        const DURATION_SECS: f32 = 0.26;
+        static CLASS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let class: Vec<u16> = "SnapKitClickHalo\0".encode_utf16().collect();
+            // SAFETY: window and GDI DIB section are created, updated, and destroyed on this thread.
+            unsafe {
+                let instance = GetModuleHandleW(std::ptr::null());
+                CLASS.get_or_init(|| {
+                    let mut wc: WNDCLASSW = std::mem::zeroed();
+                    wc.lpfnWndProc = Some(DefWindowProcW);
+                    wc.hInstance = instance;
+                    wc.lpszClassName = class.as_ptr();
+                    RegisterClassW(&wc);
+                });
+
+                let hwnd = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+                    class.as_ptr(),
+                    std::ptr::null(),
+                    WS_POPUP,
+                    rect.0,
+                    rect.1,
+                    SIDE,
+                    SIDE,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    instance,
+                    std::ptr::null(),
+                );
+                if hwnd.is_null() {
+                    return;
+                }
+
+                let screen_dc = GetDC(std::ptr::null_mut());
+                let mem_dc = CreateCompatibleDC(screen_dc);
+                let mut bmi: BITMAPINFO = std::mem::zeroed();
+                bmi.bmiHeader = BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: SIDE,
+                    biHeight: -SIDE,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..std::mem::zeroed()
+                };
+                let mut bits: *mut c_void = std::ptr::null_mut();
+                let bmp = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+                if bmp.is_null() || bits.is_null() {
+                    if !bmp.is_null() {
+                        DeleteObject(bmp);
+                    }
+                    DeleteDC(mem_dc);
+                    ReleaseDC(std::ptr::null_mut(), screen_dc);
+                    DestroyWindow(hwnd);
+                    return;
+                }
+                let old_bmp = SelectObject(mem_dc, bmp);
+                let buf = std::slice::from_raw_parts_mut(bits.cast::<u8>(), (SIDE * SIDE * 4) as usize);
+
+                let mut was = [left_button_down(), right_button_down()];
+                let mut active: Option<((i32, i32), bool, Instant)> = None;
+                let mut visible = false;
+                let mut msg: MSG = std::mem::zeroed();
+
+                while !stop_flag.load(Ordering::Relaxed) {
+                    while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        DispatchMessageW(&msg);
+                    }
+                    let now = [left_button_down(), right_button_down()];
+                    let left_edge = now[0] && !was[0];
+                    let right_edge = now[1] && !was[1];
+                    was = now;
+
+                    if left_edge || right_edge {
+                        let pos = cursor_pos();
+                        let in_rect = pos.0 >= rect.0 && pos.0 < rect.2 && pos.1 >= rect.1 && pos.1 < rect.3;
+                        let on_hud = skip_hwnd != 0
+                            && window_rect(skip_hwnd)
+                                .is_some_and(|r| pos.0 >= r.0 && pos.0 < r.2 && pos.1 >= r.1 && pos.1 < r.3);
+                        if in_rect && !on_hud {
+                            active = Some((pos, right_edge && !left_edge, Instant::now()));
+                        }
+                    }
+
+                    if let Some((pos, is_right, started)) = active {
+                        let elapsed = started.elapsed().as_secs_f32();
+                        if elapsed >= DURATION_SECS {
+                            active = None;
+                            if visible {
+                                ShowWindow(hwnd, SW_HIDE);
+                                visible = false;
+                            }
+                        } else {
+                            let t = (elapsed / DURATION_SECS).clamp(0.0, 1.0);
+                            let radius = 10.0 + 21.0 * (1.0 - (1.0 - t).powi(2));
+                            let ring_half = 2.6;
+                            let base_alpha = (1.0 - t) * 230.0;
+                            let rgb: [f32; 3] = if is_right {
+                                [0.0, 195.0, 255.0]
+                            } else {
+                                [255.0, 196.0, 0.0]
+                            };
+                            let half = SIDE as f32 * 0.5;
+                            buf.fill(0);
+                            for y in 0..SIDE {
+                                for x in 0..SIDE {
+                                    let dx = x as f32 + 0.5 - half;
+                                    let dy = y as f32 + 0.5 - half;
+                                    let d = (dx * dx + dy * dy).sqrt();
+                                    let ring_cov = (ring_half + 0.8 - (d - radius).abs()).clamp(0.0, 1.0);
+                                    let fill_cov = if d < radius { 0.16 * (1.0 - t) } else { 0.0 };
+                                    let cov = ring_cov.max(fill_cov);
+                                    if cov > 0.005 {
+                                        let a = (base_alpha * cov).clamp(0.0, 255.0);
+                                        let af = a / 255.0;
+                                        let idx = ((y * SIDE + x) * 4) as usize;
+                                        // Premultiplied BGRA for UpdateLayeredWindow
+                                        buf[idx] = (rgb[2] * af).round() as u8;
+                                        buf[idx + 1] = (rgb[1] * af).round() as u8;
+                                        buf[idx + 2] = (rgb[0] * af).round() as u8;
+                                        buf[idx + 3] = a.round() as u8;
+                                    }
+                                }
+                            }
+                            let dst_pt = POINT { x: pos.0 - SIDE / 2, y: pos.1 - SIDE / 2 };
+                            let size = SIZE { cx: SIDE, cy: SIDE };
+                            let src_pt = POINT { x: 0, y: 0 };
+                            let blend = BLENDFUNCTION {
+                                BlendOp: AC_SRC_OVER as u8,
+                                BlendFlags: 0,
+                                SourceConstantAlpha: 255,
+                                AlphaFormat: AC_SRC_ALPHA as u8,
+                            };
+                            UpdateLayeredWindow(
+                                hwnd,
+                                screen_dc,
+                                &dst_pt,
+                                &size,
+                                mem_dc,
+                                &src_pt,
+                                0,
+                                &blend,
+                                ULW_ALPHA,
+                            );
+                            if !visible {
+                                SetWindowPos(
+                                    hwnd,
+                                    -1isize as HWND, // HWND_TOPMOST
+                                    dst_pt.x,
+                                    dst_pt.y,
+                                    SIDE,
+                                    SIDE,
+                                    SWP_NOACTIVATE | 0x0040, // SWP_SHOWWINDOW
+                                );
+                                visible = true;
+                            }
+                        }
+                    }
+
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+
+                SelectObject(mem_dc, old_bmp);
+                DeleteObject(bmp);
+                DeleteDC(mem_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+                DestroyWindow(hwnd);
+            }
+        });
+        Self { stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for ClickHalo {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -1336,6 +1620,15 @@ mod tests {
             assert_eq!(drop_src_query_continue_drag(std::ptr::null_mut(), 0, 0), DRAGDROP_S_DROP);
             assert_eq!(drop_src_query_continue_drag(std::ptr::null_mut(), 0, MK_LBUTTON), S_OK);
         }
+    }
+
+    #[test]
+    fn dpi_scale_and_click_halo_work_without_crashing() {
+        enable_per_monitor_dpi();
+        let s = dpi_scale_at((0, 0));
+        assert!((0.5..=4.0).contains(&s), "unexpected dpi scale: {s}");
+        let halo = ClickHalo::show((0, 0, 200, 200), 0);
+        drop(halo);
     }
 
     /// Manual diagnosis: `cargo test cursor_report -- --ignored --nocapture`.

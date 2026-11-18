@@ -178,6 +178,9 @@ pub struct Config {
     pub video_quality: VideoQuality,
     /// Whether the mouse cursor is drawn in video recordings.
     pub video_cursor: bool,
+    /// Whether mouse clicks are highlighted with animated ripples in video recordings.
+    #[serde(default)]
+    pub video_highlight_clicks: bool,
     /// Countdown in seconds before video recording begins (`0`, `3`, or `5`).
     pub video_countdown: u32,
     /// After choosing the region, annotate right there, on the screen, instead of opening the
@@ -209,6 +212,7 @@ impl Default for Config {
             video_fps: 30,
             video_quality: VideoQuality::High,
             video_cursor: true,
+            video_highlight_clicks: false,
             video_countdown: 3,
             quick_annotate: true,
             styles: Vec::new(),
@@ -426,10 +430,12 @@ mod tests {
 
     #[test]
     fn video_preferences_default_and_round_trip() {
+        assert!(!Config::default().video_highlight_clicks);
         let def = Config::parse("{}");
         assert_eq!(def.video_fps, 30);
         assert_eq!(def.video_quality, VideoQuality::High);
         assert!(def.video_cursor);
+        assert!(!def.video_highlight_clicks);
         assert_eq!(def.video_countdown, 3);
         assert_eq!(VideoQuality::Standard.bitrate_factor(), 0.65);
         assert_eq!(VideoQuality::High.bitrate_factor(), 1.0);
@@ -439,6 +445,7 @@ mod tests {
             video_fps: 60,
             video_quality: VideoQuality::Ultra,
             video_cursor: false,
+            video_highlight_clicks: true,
             video_countdown: 5,
             ..Config::default()
         };

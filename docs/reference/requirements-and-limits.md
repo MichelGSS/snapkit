@@ -32,18 +32,16 @@ The installed size breaks down as follows: FFmpeg about 110 MB, Tesseract about 
 | Scrolling capture | 80 shots or 32,000 pixels in the scrolling direction |
 | Step-by-step capture | 40 steps per session |
 | Image resize | Up to 20,000 pixels per side |
+| Export formats | PNG, JPEG, WebP, BMP, and single- or multi-page PDF 1.4 |
+| Pin to screen | Zoom from 25% to 400%, opacity from 20% to 100%, multiple simultaneous pins |
 | Text recognition languages | English and Portuguese (printed text); Latin script handwriting with the neural engine |
-| Video | MP4 (H.264 video, AAC audio at 48 kHz stereo) |
+| Video | MP4 (H.264 video at 15, 24, 30 or 60 FPS; AAC audio at 48 kHz stereo); speed adjustment from 0.5× to 2.0× |
 | GIF | 8, 12, 15 or 24 frames per second; 320, 480, 720 or 960 pixels wide, or the original width |
 
 ## Known limitations
 
-- There's only one global shortcut, for region capture.
-- When you reopen a capture from the library, earlier annotations are part of the image and can't be selected.
-- Annotations can't be rotated or reordered (brought to front or sent to back).
 - Scrolling capture needs the content to stay still between shots; videos and animations on the page can stop it.
 - When a capture spans monitors of different heights, the empty space comes out black.
-- On setups that mix monitors with different scaling, a recording area can come out slightly shifted.
 - Video recording doesn't support a webcam overlay; trimming keeps one clip, from a start to an end time.
 - In remote sessions or virtual machines without OpenGL, SnapKit may not open.
 - Over Remote Desktop, the area around the selection can show black instead of the darkened screen. The capture itself isn't affected.

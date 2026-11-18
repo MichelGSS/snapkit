@@ -333,6 +333,271 @@ impl Drop for AudioRecording {
     }
 }
 
+/// Real-time audio preview player for the integrated video editor.
+///
+/// Decodes the audio track of a video clip via FFmpeg (`f32le` stereo at the output device's sample
+/// rate, applying `atempo` when playback speed != 1.0) and plays it through WASAPI (`cpal`). If no
+/// output audio device is available, [`Self::start`] returns `None` and video preview continues
+/// silently.
+pub struct AudioPlayer {
+    stop: Arc<AtomicBool>,
+    child: Mutex<Option<std::process::Child>>,
+    output_thread: Option<JoinHandle<()>>,
+    reader_thread: Option<JoinHandle<()>>,
+}
+
+impl AudioPlayer {
+    pub fn start(
+        ffmpeg: &Path,
+        video: &Path,
+        start_secs: f64,
+        end_secs: Option<f64>,
+        speed: f64,
+        muted: Arc<AtomicBool>,
+    ) -> Option<Self> {
+        use std::io::Read;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ring: Ring = Arc::new(Mutex::new(VecDeque::with_capacity(RATE as usize * 4)));
+
+        // Open output stream on its own thread (`cpal::Stream` is `!Send`) and retrieve its native
+        // sample rate so FFmpeg resamples directly with high quality.
+        let (tx, rx) = channel::<Option<u32>>();
+        let (stop_out, ring_out, muted_out) = (stop.clone(), ring.clone(), muted);
+        let output_thread = std::thread::spawn(move || {
+            let host = cpal::default_host();
+            let Some(device) = host.default_output_device() else {
+                let _ = tx.send(None);
+                return;
+            };
+            let Ok(supported) = device.default_output_config() else {
+                let _ = tx.send(None);
+                return;
+            };
+            let out_rate = supported.sample_rate();
+            let out_ch = supported.channels().max(1) as usize;
+            let cfg = supported.config();
+
+            let fill_f32 = move |out: &mut [f32]| {
+                let is_muted = muted_out.load(Ordering::Relaxed);
+                let mut q = ring_out.lock().unwrap();
+                for frame in out.chunks_mut(out_ch) {
+                    let l = q.pop_front().unwrap_or(0.0);
+                    let r = q.pop_front().unwrap_or(0.0);
+                    if is_muted {
+                        frame.fill(0.0);
+                    } else if out_ch == 1 {
+                        frame[0] = ((l + r) * 0.5).clamp(-1.0, 1.0);
+                    } else {
+                        frame[0] = l.clamp(-1.0, 1.0);
+                        frame[1] = r.clamp(-1.0, 1.0);
+                        for extra in &mut frame[2..] {
+                            *extra = 0.0;
+                        }
+                    }
+                }
+            };
+
+            let on_err = |_| {};
+            let stream_res = match supported.sample_format() {
+                cpal::SampleFormat::F32 => {
+                    let fill = fill_f32;
+                    device.build_output_stream(cfg, move |data: &mut [f32], _: &_| fill(data), on_err, None)
+                }
+                cpal::SampleFormat::I16 => {
+                    let fill = fill_f32;
+                    let mut scratch = Vec::<f32>::new();
+                    device.build_output_stream(
+                        cfg,
+                        move |data: &mut [i16], _: &_| {
+                            scratch.resize(data.len(), 0.0);
+                            fill(&mut scratch);
+                            for (dst, &s) in data.iter_mut().zip(&scratch) {
+                                *dst = (s * 32767.0) as i16;
+                            }
+                        },
+                        on_err,
+                        None,
+                    )
+                }
+                cpal::SampleFormat::U16 => {
+                    let fill = fill_f32;
+                    let mut scratch = Vec::<f32>::new();
+                    device.build_output_stream(
+                        cfg,
+                        move |data: &mut [u16], _: &_| {
+                            scratch.resize(data.len(), 0.0);
+                            fill(&mut scratch);
+                            for (dst, &s) in data.iter_mut().zip(&scratch) {
+                                *dst = ((s * 0.5 + 0.5) * 65535.0).clamp(0.0, 65535.0) as u16;
+                            }
+                        },
+                        on_err,
+                        None,
+                    )
+                }
+                _ => {
+                    let _ = tx.send(None);
+                    return;
+                }
+            };
+
+            let Ok(stream) = stream_res else {
+                let _ = tx.send(None);
+                return;
+            };
+            if stream.play().is_err() {
+                let _ = tx.send(None);
+                return;
+            }
+            if tx.send(Some(out_rate)).is_err() {
+                return;
+            }
+            while !stop_out.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            drop(stream);
+        });
+
+        let Some(out_rate) = rx.recv_timeout(Duration::from_secs(2)).ok().flatten() else {
+            stop.store(true, Ordering::Relaxed);
+            let _ = output_thread.join();
+            return None;
+        };
+
+        let start = start_secs.max(0.0);
+        let eff_speed = speed.clamp(0.25, 4.0);
+        let mut args = vec![
+            "-hide_banner".to_owned(),
+            "-loglevel".to_owned(),
+            "error".to_owned(),
+            "-ss".to_owned(),
+            format!("{start:.3}"),
+        ];
+        if let Some(end) = end_secs
+            && end > start
+        {
+            args.extend(["-to".to_owned(), format!("{end:.3}")]);
+        }
+        args.extend([
+            "-i".to_owned(),
+            video.to_string_lossy().into_owned(),
+            "-vn".to_owned(),
+        ]);
+        if (eff_speed - 1.0).abs() > 0.01 {
+            args.extend(["-af".to_owned(), crate::record::atempo_filter_str(eff_speed)]);
+        }
+        args.extend([
+            "-ac".to_owned(),
+            "2".to_owned(),
+            "-ar".to_owned(),
+            out_rate.to_string(),
+            "-f".to_owned(),
+            "f32le".to_owned(),
+            "-".to_owned(),
+        ]);
+
+        let mut cmd = Command::new(ffmpeg);
+        cmd.creation_flags(CREATE_NO_WINDOW)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let Ok(mut child) = cmd.spawn() else {
+            stop.store(true, Ordering::Relaxed);
+            let _ = output_thread.join();
+            return None;
+        };
+        crate::win::end_with_us(&child);
+
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            stop.store(true, Ordering::Relaxed);
+            let _ = output_thread.join();
+            return None;
+        };
+
+        let max_buffered = (out_rate as usize) * 2 * 2; // ~2 seconds of stereo samples max in RAM
+        let (stop_rd, ring_rd) = (stop.clone(), ring);
+        let reader_thread = std::thread::spawn(move || {
+            let mut raw = [0u8; 4096];
+            let mut carry = [0u8; 4];
+            let mut carry_len = 0usize;
+            while !stop_rd.load(Ordering::Relaxed) {
+                while !stop_rd.load(Ordering::Relaxed) && ring_rd.lock().unwrap().len() >= max_buffered {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                if stop_rd.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(n) = stdout.read(&mut raw) else { break };
+                if n == 0 {
+                    break;
+                }
+                let mut offset = 0usize;
+                if carry_len > 0 {
+                    let take = (4 - carry_len).min(n);
+                    carry[carry_len..carry_len + take].copy_from_slice(&raw[..take]);
+                    carry_len += take;
+                    offset += take;
+                    if carry_len == 4 {
+                        let sample = f32::from_le_bytes(carry);
+                        if sample.is_finite() {
+                            ring_rd.lock().unwrap().push_back(sample);
+                        }
+                        carry_len = 0;
+                    }
+                }
+                let rem = &raw[offset..n];
+                let (chunks, tail) = rem.as_chunks::<4>();
+                if !chunks.is_empty() {
+                    let mut q = ring_rd.lock().unwrap();
+                    for bytes in chunks {
+                        let sample = f32::from_le_bytes(*bytes);
+                        q.push_back(if sample.is_finite() { sample } else { 0.0 });
+                    }
+                }
+                if !tail.is_empty() {
+                    carry[..tail.len()].copy_from_slice(tail);
+                    carry_len = tail.len();
+                }
+            }
+        });
+
+        Some(Self {
+            stop,
+            child: Mutex::new(Some(child)),
+            output_thread: Some(output_thread),
+            reader_thread: Some(reader_thread),
+        })
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(rd) = self.reader_thread.take() {
+            let _ = rd.join();
+        }
+        if let Some(out) = self.output_thread.take() {
+            let _ = out.join();
+        }
+    }
+}
+
+impl Drop for AudioPlayer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,12 +676,14 @@ mod tests {
         let ring: Ring = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (p, r, s) = (path.clone(), ring.clone(), stop.clone());
+        let wall_start = Instant::now();
         let t = std::thread::spawn(move || write_wav(&p, &[r], &s));
-        std::thread::sleep(Duration::from_millis(600));
+        std::thread::sleep(Duration::from_millis(550));
         stop.store(true, Ordering::Relaxed);
         let data_bytes = t.join().unwrap().unwrap();
+        let wall_secs = wall_start.elapsed().as_secs_f64();
         let seconds = data_bytes as f64 / 192_000.0;
-        assert!((0.45..0.65).contains(&seconds), "{seconds} s");
+        assert!(seconds >= 0.45 && (seconds - wall_secs).abs() < 0.15, "audio={seconds:.3}s vs wall={wall_secs:.3}s");
         let file = std::fs::read(&path).unwrap();
         assert_eq!(file.len(), 44 + data_bytes as usize);
         assert_eq!(u32::from_le_bytes(file[40..44].try_into().unwrap()), data_bytes, "header updated");

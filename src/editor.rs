@@ -63,6 +63,19 @@ const TOOLS: [(Tool, &str, &str); 19] = [
     (Tool::Step, "Passo", "Step"),
 ];
 
+/// Alignment and distribution modes for two or more selected annotations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlignMode {
+    Left,
+    CenterH,
+    Right,
+    Top,
+    CenterV,
+    Bottom,
+    DistributeH,
+    DistributeV,
+}
+
 /// A tool and options combination kept for reuse with one click.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Style {
@@ -78,6 +91,8 @@ pub struct Style {
     step_shape: StepShape,
     step_glyph: StepGlyph,
     callout_style: CalloutStyle,
+    #[serde(default)]
+    rect_radius: f32,
 }
 
 /// Tools in the compact quick annotation bar, over the screen.
@@ -165,6 +180,7 @@ fn tool_for(op: &Op) -> Tool {
         Op::Callout { .. } => Tool::Callout,
         Op::Step { .. } => Tool::Step,
         Op::Stamp { .. } => Tool::Stamp,
+        Op::Sticker { .. } => Tool::Select,
         Op::Spotlight { .. } => Tool::Spotlight,
         Op::Pixelate { .. } => Tool::Pixelate,
         Op::Blur { .. } => Tool::Blur,
@@ -190,6 +206,7 @@ struct Relevant {
     dashed: bool,
     double: bool,
     boxed: bool,
+    corner_radius: bool,
     step: bool,
     callout: bool,
     stamp: bool,
@@ -202,7 +219,8 @@ impl Relevant {
         match tool {
             Tool::Arrow => Self { dashed: true, double: true, ..stroke },
             Tool::Line => Self { dashed: true, ..stroke },
-            Tool::Rect | Tool::Ellipse => Self { filled: true, dashed: true, ..stroke },
+            Tool::Rect => Self { filled: true, dashed: true, corner_radius: true, ..stroke },
+            Tool::Ellipse => Self { filled: true, dashed: true, ..stroke },
             Tool::Pen => stroke,
             Tool::Erase => Self { thickness: Some(t!("Espessura", "Thickness")), ..Self::default() },
             Tool::Text => Self { boxed: true, ..sized },
@@ -328,6 +346,170 @@ impl History {
         }
     }
 
+    /// Appends multiple operations as a single undo step.
+    pub fn push_batch(&mut self, new_ops: Vec<Op>) {
+        if new_ops.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let has_erase = new_ops.iter().any(|op| matches!(op, Op::Erase { .. }));
+        for op in new_ops {
+            if !has_erase {
+                render::apply(&mut self.current, &op, &self.font);
+            }
+            self.ops.push(op);
+        }
+        if has_erase {
+            self.rerender();
+        }
+    }
+
+    /// Removes multiple editable objects at once as a single undo step.
+    pub fn remove_many(&mut self, indices: &[usize]) -> bool {
+        let first = self.first_object();
+        let mut valid: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| i >= first && i < self.ops.len())
+            .collect();
+        valid.sort_unstable();
+        valid.dedup();
+        if valid.is_empty() {
+            return false;
+        }
+        self.checkpoint();
+        for i in valid.into_iter().rev() {
+            self.ops.remove(i);
+        }
+        self.rerender();
+        true
+    }
+
+    /// Aligns or evenly distributes two or more editable objects in a single undo step.
+    pub fn align_objects(&mut self, indices: &[usize], mode: AlignMode) -> bool {
+        let first = self.first_object();
+        let mut valid: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| i >= first && i < self.ops.len())
+            .collect();
+        valid.sort_unstable();
+        valid.dedup();
+        let min_count = if matches!(mode, AlignMode::DistributeH | AlignMode::DistributeV) { 3 } else { 2 };
+        if valid.len() < min_count {
+            return false;
+        }
+        let mut items: Vec<(usize, Point, Point)> = valid
+            .into_iter()
+            .filter_map(|i| {
+                let (min, max) = self.ops[i].bounds(&self.font)?;
+                Some((i, min, max))
+            })
+            .collect();
+        if items.len() < min_count {
+            return false;
+        }
+
+        let g_min_x = items.iter().map(|(_, min, _)| min.0).fold(f32::INFINITY, f32::min);
+        let g_min_y = items.iter().map(|(_, min, _)| min.1).fold(f32::INFINITY, f32::min);
+        let g_max_x = items.iter().map(|(_, _, max)| max.0).fold(f32::NEG_INFINITY, f32::max);
+        let g_max_y = items.iter().map(|(_, _, max)| max.1).fold(f32::NEG_INFINITY, f32::max);
+
+        let mut shifts: Vec<(usize, f32, f32)> = Vec::with_capacity(items.len());
+        match mode {
+            AlignMode::Left => {
+                for &(i, min, _) in &items {
+                    shifts.push((i, g_min_x - min.0, 0.0));
+                }
+            }
+            AlignMode::CenterH => {
+                let cx = (g_min_x + g_max_x) * 0.5;
+                for &(i, min, max) in &items {
+                    shifts.push((i, cx - (min.0 + max.0) * 0.5, 0.0));
+                }
+            }
+            AlignMode::Right => {
+                for &(i, _, max) in &items {
+                    shifts.push((i, g_max_x - max.0, 0.0));
+                }
+            }
+            AlignMode::Top => {
+                for &(i, min, _) in &items {
+                    shifts.push((i, 0.0, g_min_y - min.1));
+                }
+            }
+            AlignMode::CenterV => {
+                let cy = (g_min_y + g_max_y) * 0.5;
+                for &(i, min, max) in &items {
+                    shifts.push((i, 0.0, cy - (min.1 + max.1) * 0.5));
+                }
+            }
+            AlignMode::Bottom => {
+                for &(i, _, max) in &items {
+                    shifts.push((i, 0.0, g_max_y - max.1));
+                }
+            }
+            AlignMode::DistributeH => {
+                items.sort_by(|a, b| ((a.1.0 + a.2.0) * 0.5).total_cmp(&((b.1.0 + b.2.0) * 0.5)));
+                let first_min = items.first().unwrap().1.0;
+                let last_max = items.last().unwrap().2.0;
+                let total_w: f32 = items.iter().map(|(_, min, max)| max.0 - min.0).sum();
+                let span = last_max - first_min;
+                if span > total_w {
+                    let gap = (span - total_w) / (items.len() - 1) as f32;
+                    let mut cursor = first_min;
+                    for &(i, min, max) in &items {
+                        shifts.push((i, cursor - min.0, 0.0));
+                        cursor += (max.0 - min.0) + gap;
+                    }
+                } else {
+                    let c0 = (items.first().unwrap().1.0 + items.first().unwrap().2.0) * 0.5;
+                    let c1 = (items.last().unwrap().1.0 + items.last().unwrap().2.0) * 0.5;
+                    let step = (c1 - c0) / (items.len() - 1) as f32;
+                    for (k, &(i, min, max)) in items.iter().enumerate() {
+                        let target_cx = c0 + step * k as f32;
+                        shifts.push((i, target_cx - (min.0 + max.0) * 0.5, 0.0));
+                    }
+                }
+            }
+            AlignMode::DistributeV => {
+                items.sort_by(|a, b| ((a.1.1 + a.2.1) * 0.5).total_cmp(&((b.1.1 + b.2.1) * 0.5)));
+                let first_min = items.first().unwrap().1.1;
+                let last_max = items.last().unwrap().2.1;
+                let total_h: f32 = items.iter().map(|(_, min, max)| max.1 - min.1).sum();
+                let span = last_max - first_min;
+                if span > total_h {
+                    let gap = (span - total_h) / (items.len() - 1) as f32;
+                    let mut cursor = first_min;
+                    for &(i, min, max) in &items {
+                        shifts.push((i, 0.0, cursor - min.1));
+                        cursor += (max.1 - min.1) + gap;
+                    }
+                } else {
+                    let c0 = (items.first().unwrap().1.1 + items.first().unwrap().2.1) * 0.5;
+                    let c1 = (items.last().unwrap().1.1 + items.last().unwrap().2.1) * 0.5;
+                    let step = (c1 - c0) / (items.len() - 1) as f32;
+                    for (k, &(i, min, max)) in items.iter().enumerate() {
+                        let target_cy = c0 + step * k as f32;
+                        shifts.push((i, 0.0, target_cy - (min.1 + max.1) * 0.5));
+                    }
+                }
+            }
+        }
+
+        if shifts.iter().all(|&(_, dx, dy)| dx.abs() < 0.05 && dy.abs() < 0.05) {
+            return false;
+        }
+        self.checkpoint();
+        for (i, dx, dy) in shifts {
+            if let Some(op) = self.ops.get_mut(i) {
+                op.translate(dx, dy);
+            }
+        }
+        self.rerender();
+        true
+    }
+
     /// Moves an editable object backward or forward in the Z-order within `first_object()..ops.len()`.
     pub fn reorder_object(&mut self, idx: usize, to_front: bool, all_the_way: bool, font: &FontArc) -> Option<usize> {
         let first = self.first_object();
@@ -443,6 +625,12 @@ struct ObjDrag {
     current: Op,
 }
 
+/// Dragging multiple selected objects together.
+struct GroupDrag {
+    start: Point,
+    originals: Vec<(usize, Op)>,
+}
+
 /// Above this size, the image is redrawn only when the mouse is released; during the drag only the
 /// outline shows. Redrawing a huge scrolling capture every frame would stall.
 const LIVE_PIXELS: u64 = 12_000_000;
@@ -465,6 +653,8 @@ pub struct Editor {
     dashed: bool,
     /// Arrows come out with a head on both ends.
     double: bool,
+    /// Corner radius for rectangles (`0.0` = sharp corners).
+    rect_radius: f32,
     /// Symbol that the Stamp tool places.
     stamp: Stamp,
     step_shape: StepShape,
@@ -495,12 +685,19 @@ pub struct Editor {
     pending_text: Option<PendingText>,
     /// Area marked with the Grab text tool, waiting for whoever runs the OCR.
     text_request: Option<(Point, Point)>,
+    /// Requested automatic sensitive-data redaction pass via OCR.
+    redact_request: bool,
     /// Grows with every change to the image; whoever saves compares it with the last saved value.
     revision: u64,
     changed_at: std::time::Instant,
-    /// Index, in the history list, of the object selected with the Select tool.
+    /// Index, in the history list, of the single object selected with the Select tool.
     selected: Option<usize>,
+    /// Indices of two or more objects selected simultaneously (`Ctrl+Click`, `Ctrl+A`, or marquee).
+    multi_selected: Vec<usize>,
+    /// Active rubber-band marquee selection rectangle `(origin, current)` in image coordinates.
+    marquee: Option<(Point, Point)>,
     drag: Option<ObjDrag>,
+    group_drag: Option<GroupDrag>,
     /// There's already an undo point for the gesture in progress.
     gesture_open: bool,
     /// Zoom chosen by the user; `None` fits the whole image in the window.
@@ -531,6 +728,7 @@ impl Editor {
             boxed: false,
             dashed: false,
             double: false,
+            rect_radius: 0.0,
             stamp: Stamp::Check,
             step_shape: StepShape::Circle,
             step_glyph: StepGlyph::Number,
@@ -551,10 +749,14 @@ impl Editor {
             pen_points: Vec::new(),
             pending_text: None,
             text_request: None,
+            redact_request: false,
             revision: 0,
             changed_at: std::time::Instant::now(),
             selected: None,
+            multi_selected: Vec::new(),
+            marquee: None,
             drag: None,
+            group_drag: None,
             gesture_open: false,
             zoom: None,
             pan: Vec2::ZERO,
@@ -602,7 +804,10 @@ impl Editor {
         self.pen_points.clear();
         self.pending_text = None;
         self.text_request = None;
+        self.redact_request = false;
+        self.marquee = None;
         self.drag = None;
+        self.group_drag = None;
         self.gesture_open = false;
         self.zoom = None;
         self.pan = Vec2::ZERO;
@@ -644,6 +849,80 @@ impl Editor {
         crate::capture::crop(self.history.image(), a.0, a.1, b.0, b.1)
     }
 
+    /// Returns `true` once if the user requested an automatic OCR sensitive-data redaction pass.
+    pub fn take_redact_request(&mut self) -> bool {
+        if self.redact_request {
+            self.redact_request = false;
+            self.commit_pending_text();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pastes an RGBA image onto the center of the canvas as a movable, resizable, rotatable
+    /// [`Op::Sticker`] layer and selects it.
+    pub fn paste_image(&mut self, img: RgbaImage) {
+        if img.width() == 0 || img.height() == 0 {
+            return;
+        }
+        self.commit_pending_text();
+        let (cw, ch) = (self.history.image().width() as f32, self.history.image().height() as f32);
+        let (sw, sh) = (img.width() as f32, img.height() as f32);
+        let max_w = (cw * 0.8).max(32.0);
+        let max_h = (ch * 0.8).max(32.0);
+        let fit = (max_w / sw).min(max_h / sh).min(1.0);
+        let (dw, dh) = (sw * fit, sh * fit);
+        let ax = ((cw - dw) * 0.5).max(0.0);
+        let ay = ((ch - dh) * 0.5).max(0.0);
+        let op = Op::Sticker {
+            a: (ax, ay),
+            b: (ax + dw, ay + dh),
+            angle: 0.0,
+            image: render::StickerData::new(img),
+        };
+        self.commit(op);
+        self.tool = Tool::Select;
+        self.multi_selected.clear();
+        self.select(self.history.ops().len() - 1);
+    }
+
+    /// Applies a batch of `(x1, y1, x2, y2)` redaction regions as editable Blur (or Pixelate)
+    /// objects in a single undo step and selects them.
+    pub fn apply_redactions(&mut self, boxes: &[(f32, f32, f32, f32)]) -> usize {
+        if boxes.is_empty() {
+            return 0;
+        }
+        self.commit_pending_text();
+        let use_pixelate = self.tool == Tool::Pixelate;
+        let ops: Vec<Op> = boxes
+            .iter()
+            .map(|&(x1, y1, x2, y2)| {
+                if use_pixelate {
+                    Op::Pixelate { a: (x1, y1), b: (x2, y2) }
+                } else {
+                    Op::Blur { a: (x1, y1), b: (x2, y2) }
+                }
+            })
+            .collect();
+        let count = ops.len();
+        let start_idx = self.history.ops().len();
+        self.gesture_open = false;
+        self.history.push_batch(ops);
+        self.refresh_texture();
+        self.tool = Tool::Select;
+        self.drag = None;
+        self.group_drag = None;
+        if count == 1 {
+            self.multi_selected.clear();
+            self.select(start_idx);
+        } else {
+            self.selected = None;
+            self.multi_selected = (start_idx..start_idx + count).collect();
+        }
+        count
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -666,10 +945,17 @@ impl Editor {
         self.refresh_texture();
     }
 
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.multi_selected.clear();
+        self.marquee = None;
+        self.drag = None;
+        self.group_drag = None;
+    }
+
     fn undo(&mut self) {
         self.pending_text = None;
-        self.selected = None;
-        self.drag = None;
+        self.clear_selection();
         self.gesture_open = false;
         if self.history.undo() {
             self.refresh_texture();
@@ -678,8 +964,7 @@ impl Editor {
 
     fn redo(&mut self) {
         self.pending_text = None;
-        self.selected = None;
-        self.drag = None;
+        self.clear_selection();
         self.gesture_open = false;
         if self.history.redo() {
             self.refresh_texture();
@@ -725,8 +1010,7 @@ impl Editor {
                         if clicked {
                             self.commit_pending_text();
                             self.tool = *tool;
-                            self.selected = None;
-                            self.drag = None;
+                            self.clear_selection();
                         }
                     }
                 }
@@ -770,6 +1054,7 @@ impl Editor {
             step_shape: self.step_shape,
             step_glyph: self.step_glyph,
             callout_style: self.callout_style,
+            rect_radius: self.rect_radius,
         }
     }
 
@@ -781,10 +1066,10 @@ impl Editor {
         self.color = Color32::from_rgba_unmultiplied(r, g, b, a);
         self.width = style.width.clamp(1.0, 24.0);
         (self.filled, self.boxed, self.dashed, self.double) = (style.filled, style.boxed, style.dashed, style.double);
+        self.rect_radius = style.rect_radius.clamp(0.0, 64.0);
         (self.stamp, self.step_shape, self.step_glyph) = (style.stamp, style.step_shape, style.step_glyph);
         self.callout_style = style.callout_style;
-        self.selected = None;
-        self.drag = None;
+        self.clear_selection();
     }
 
     /// Styles menu: apply, save the current one or delete. Returns `true` if the list changed.
@@ -846,8 +1131,33 @@ impl Editor {
             self.resize_to = (iw, ih);
         }
         let mut op = None;
+        let mut paste_clip = false;
+        let mut auto_redact = false;
         ui.menu_button(t!("Imagem", "Image"), |ui| {
-            ui.set_min_width(240.0);
+            ui.set_min_width(250.0);
+            if ui
+                .button(t!("📋 Colar imagem como camada (Ctrl V)", "📋 Paste image as layer (Ctrl V)"))
+                .on_hover_text(t!(
+                    "Cola a imagem da área de transferência sobre o quadro atual como um objeto editável.",
+                    "Pastes the clipboard image onto the canvas as an editable object."
+                ))
+                .clicked()
+            {
+                paste_clip = true;
+                ui.close();
+            }
+            if ui
+                .button(t!("🔒 Ocultar dados sensíveis (OCR)", "🔒 Auto-redact sensitive data (OCR)"))
+                .on_hover_text(t!(
+                    "Detecta e-mails, CPFs, cartões, telefones, IPs e chaves de API na imagem e aplica desfoque editável.",
+                    "Detects emails, IDs, cards, phones, IPs, and API keys in the image and applies editable blur boxes."
+                ))
+                .clicked()
+            {
+                auto_redact = true;
+                ui.close();
+            }
+            ui.separator();
             if ui.button(t!("Girar para a esquerda", "Rotate left")).clicked() {
                 op = Some(Op::Rotate { clockwise: false });
             }
@@ -943,10 +1253,19 @@ impl Editor {
                 });
             }
         });
+        if paste_clip
+            && let Ok(mut cb) = arboard::Clipboard::new()
+            && let Ok(img) = cb.get_image()
+            && let Some(rgba) = RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+        {
+            self.paste_image(rgba);
+        }
+        if auto_redact {
+            self.redact_request = true;
+        }
         if let Some(op) = op {
             self.commit_pending_text();
-            self.selected = None;
-            self.drag = None;
+            self.clear_selection();
             self.commit(op);
         }
     }
@@ -976,18 +1295,48 @@ impl Editor {
         }
     }
 
+    fn prune_multi_selection(&mut self) {
+        let first = self.history.first_object();
+        let len = self.history.ops().len();
+        self.multi_selected.retain(|&i| i >= first && i < len);
+        self.multi_selected.sort_unstable();
+        self.multi_selected.dedup();
+        if self.multi_selected.len() == 1 {
+            let only = self.multi_selected.pop().unwrap();
+            self.select(only);
+        }
+    }
+
     /// Options bar: shows only what applies to the active tool or the selected object. `styles` is
     /// the list of saved styles; the return value says whether it changed and needs to be saved.
     pub fn options_ui(&mut self, ui: &mut egui::Ui, styles: &mut Vec<Style>) -> bool {
         let mut styles_changed = false;
-        let before = (self.color, self.width, self.filled, self.boxed, self.dashed, self.double, self.stamp);
+        self.prune_multi_selection();
+        let multi_count = self.multi_selected.len();
+        let before = (
+            self.color,
+            self.width,
+            self.filled,
+            self.boxed,
+            self.dashed,
+            self.double,
+            self.stamp,
+            self.rect_radius,
+        );
         let before_style = (self.step_shape, self.step_glyph, self.callout_style);
-        let selection = self.selection();
+        let selection = if multi_count >= 2 { None } else { self.selection() };
         let selected_op = selection.map(|i| self.history.ops()[i].clone());
-        let show = match &selected_op {
-            Some(op) => Relevant::for_op(op),
-            None => Relevant::for_tool(self.tool),
+        let show = if multi_count >= 2 {
+            Relevant { color: true, ..Relevant::default() }
+        } else {
+            match &selected_op {
+                Some(op) => Relevant::for_op(op),
+                None => Relevant::for_tool(self.tool),
+            }
         };
+        let mut align_req: Option<AlignMode> = None;
+        let mut multi_dup = false;
+        let mut multi_del = false;
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(self.history.can_undo(), egui::Button::new(t!("↶ Desfazer", "↶ Undo"))).on_hover_text("Ctrl Z").clicked() {
                 self.undo();
@@ -998,10 +1347,15 @@ impl Editor {
             styles_changed = self.styles_menu(ui, styles);
             self.image_menu(ui);
             ui.separator();
-            match &selected_op {
-                Some(op) => ui.strong(tf!("Selecionado: {}", "Selected: {}", tool_label(tool_for(op)))),
-                None => ui.strong(tool_label(self.tool)),
-            };
+            if multi_count >= 2 {
+                ui.strong(tf!("Selecionados: {multi_count}", "Selected: {multi_count}"));
+            } else {
+                match &selected_op {
+                    Some(Op::Sticker { .. }) => ui.strong(t!("Selecionado: Camada", "Selected: Layer")),
+                    Some(op) => ui.strong(tf!("Selecionado: {}", "Selected: {}", tool_label(tool_for(op)))),
+                    None => ui.strong(tool_label(self.tool)),
+                };
+            }
             if show.color {
                 ui.separator();
                 self.color_ui(ui);
@@ -1017,6 +1371,10 @@ impl Editor {
             }
             if show.dashed {
                 ui.checkbox(&mut self.dashed, t!("Tracejado", "Dashed"));
+            }
+            if show.corner_radius {
+                ui.label(t!("Cantos", "Corners"));
+                ui.add(egui::DragValue::new(&mut self.rect_radius).range(0.0..=64.0).speed(0.5).suffix(" px"));
             }
             if show.double {
                 ui.checkbox(&mut self.double, t!("Duas pontas", "Two heads"));
@@ -1038,75 +1396,141 @@ impl Editor {
                 combo(ui, "stamp", &mut self.stamp, &Stamp::ALL);
             }
             ui.separator();
-            match selection {
-                Some(i) => {
-                    if let Op::Step { number, .. } = self.history.ops()[i] {
-                        let mut n = number;
-                        ui.label(t!("Nº", "No."));
-                        if ui.add(egui::DragValue::new(&mut n).range(1..=999)).changed() {
-                            let mut op = self.history.ops()[i].clone();
-                            if let Op::Step { number, .. } = &mut op {
-                                *number = n;
-                            }
-                            self.change(i, op);
-                        }
-                    }
-                    let angle = self.history.ops()[i].angle();
-                    if angle.abs() > 0.01 {
-                        ui.label(format!("{:.0}°", angle.to_degrees()));
-                        if ui
-                            .button("0°")
-                            .on_hover_text(t!("Redefinir rotação", "Reset rotation"))
-                            .clicked()
-                        {
-                            let mut op = self.history.ops()[i].clone();
-                            op.set_angle(0.0);
-                            self.gesture_open = false;
-                            self.change(i, op);
-                            self.gesture_open = false;
-                        }
-                    }
-                    if ui
-                        .button("⬆")
-                        .on_hover_text(t!("Trazer para a frente (])", "Bring forward (])"))
-                        .clicked()
-                    {
-                        self.reorder(i, true, false);
-                    }
-                    if ui
-                        .button("⬇")
-                        .on_hover_text(t!("Enviar para trás ([)", "Send backward ([)"))
-                        .clicked()
-                    {
-                        self.reorder(i, false, false);
-                    }
-                    if ui
-                        .button("⤒")
-                        .on_hover_text(t!("Trazer para o topo (Shift ])", "Bring to front (Shift ])"))
-                        .clicked()
-                    {
-                        self.reorder(i, true, true);
-                    }
-                    if ui
-                        .button("⤓")
-                        .on_hover_text(t!("Enviar para o fundo (Shift [)", "Send to back (Shift [)"))
-                        .clicked()
-                    {
-                        self.reorder(i, false, true);
-                    }
-                    if ui.button(t!("⧉ Duplicar", "⧉ Duplicate")).on_hover_text("Ctrl D").clicked() {
-                        let ctx = ui.ctx().clone();
-                        self.duplicate_selected(&ctx);
-                    }
-                    if ui.button(t!("Apagar", "Delete")).on_hover_text("Delete").clicked() {
-                        self.delete(i);
+            if multi_count >= 2 {
+                for (mode, sym, pt_tip, en_tip) in [
+                    (AlignMode::Left, "⫷", "Alinhar à esquerda", "Align left"),
+                    (AlignMode::CenterH, "⫿", "Centralizar na horizontal", "Align horizontal center"),
+                    (AlignMode::Right, "⫸", "Alinhar à direita", "Align right"),
+                    (AlignMode::Top, "⫯", "Alinhar ao topo", "Align top"),
+                    (AlignMode::CenterV, "⫰", "Centralizar na vertical", "Align vertical middle"),
+                    (AlignMode::Bottom, "⫱", "Alinhar à base", "Align bottom"),
+                ] {
+                    if ui.button(sym).on_hover_text(pick(pt_tip, en_tip)).clicked() {
+                        align_req = Some(mode);
                     }
                 }
-                None => {
-                    ui.weak(tool_hint(self.tool));
+                if multi_count >= 3 {
+                    if ui
+                        .button("↔")
+                        .on_hover_text(t!("Distribuir na horizontal", "Distribute horizontally"))
+                        .clicked()
+                    {
+                        align_req = Some(AlignMode::DistributeH);
+                    }
+                    if ui
+                        .button("↕")
+                        .on_hover_text(t!("Distribuir na vertical", "Distribute vertically"))
+                        .clicked()
+                    {
+                        align_req = Some(AlignMode::DistributeV);
+                    }
+                }
+                if ui.button(t!("⧉ Duplicar", "⧉ Duplicate")).on_hover_text("Ctrl D").clicked() {
+                    multi_dup = true;
+                }
+                if ui.button(t!("Apagar", "Delete")).on_hover_text("Delete").clicked() {
+                    multi_del = true;
+                }
+            } else {
+                match selection {
+                    Some(i) => {
+                        if let Op::Step { number, .. } = self.history.ops()[i] {
+                            let mut n = number;
+                            ui.label(t!("Nº", "No."));
+                            if ui.add(egui::DragValue::new(&mut n).range(1..=999)).changed() {
+                                let mut op = self.history.ops()[i].clone();
+                                if let Op::Step { number, .. } = &mut op {
+                                    *number = n;
+                                }
+                                self.change(i, op);
+                            }
+                        }
+                        let angle = self.history.ops()[i].angle();
+                        if angle.abs() > 0.01 {
+                            ui.label(format!("{:.0}°", angle.to_degrees()));
+                            if ui
+                                .button("0°")
+                                .on_hover_text(t!("Redefinir rotação", "Reset rotation"))
+                                .clicked()
+                            {
+                                let mut op = self.history.ops()[i].clone();
+                                op.set_angle(0.0);
+                                self.gesture_open = false;
+                                self.change(i, op);
+                                self.gesture_open = false;
+                            }
+                        }
+                        if ui
+                            .button("⬆")
+                            .on_hover_text(t!("Trazer para a frente (])", "Bring forward (])"))
+                            .clicked()
+                        {
+                            self.reorder(i, true, false);
+                        }
+                        if ui
+                            .button("⬇")
+                            .on_hover_text(t!("Enviar para trás ([)", "Send backward ([)"))
+                            .clicked()
+                        {
+                            self.reorder(i, false, false);
+                        }
+                        if ui
+                            .button("⤒")
+                            .on_hover_text(t!("Trazer para o topo (Shift ])", "Bring to front (Shift ])"))
+                            .clicked()
+                        {
+                            self.reorder(i, true, true);
+                        }
+                        if ui
+                            .button("⤓")
+                            .on_hover_text(t!("Enviar para o fundo (Shift [)", "Send to back (Shift [)"))
+                            .clicked()
+                        {
+                            self.reorder(i, false, true);
+                        }
+                        if ui.button(t!("⧉ Duplicar", "⧉ Duplicate")).on_hover_text("Ctrl D").clicked() {
+                            let ctx = ui.ctx().clone();
+                            self.duplicate_selected(&ctx);
+                        }
+                        if ui.button(t!("Apagar", "Delete")).on_hover_text("Delete").clicked() {
+                            self.delete(i);
+                        }
+                    }
+                    None => {
+                        ui.weak(tool_hint(self.tool));
+                    }
                 }
             }
         });
+        if let Some(mode) = align_req {
+            let indices = self.multi_selected.clone();
+            if self.history.align_objects(&indices, mode) {
+                self.gesture_open = false;
+                self.refresh_texture();
+            }
+        }
+        if multi_dup {
+            let ctx = ui.ctx().clone();
+            self.duplicate_selected(&ctx);
+        }
+        if multi_del {
+            self.delete_multi();
+        }
+        if self.multi_selected.len() >= 2 && self.color != before.0 {
+            if !self.gesture_open {
+                self.history.checkpoint();
+                self.gesture_open = true;
+            }
+            let rgba = self.rgba();
+            let indices = self.multi_selected.clone();
+            for i in indices {
+                if let Some(mut op) = self.history.ops().get(i).cloned() {
+                    op.set_color(rgba);
+                    self.history.set(i, op);
+                }
+            }
+            self.refresh_texture();
+        }
         // Color and width changed while an object is selected apply to it.
         if let Some(i) = self.selection() {
             let mut op = self.history.ops()[i].clone();
@@ -1144,6 +1568,11 @@ impl Editor {
             {
                 *kind = self.stamp;
             }
+            if (self.rect_radius - before.7).abs() > 1e-4
+                && let Op::Rect { radius, .. } = &mut op
+            {
+                *radius = self.rect_radius;
+            }
             if (self.step_shape, self.step_glyph, self.callout_style) != before_style {
                 match &mut op {
                     Op::Step { shape, glyph, .. } => (*shape, *glyph) = (self.step_shape, self.step_glyph),
@@ -1177,7 +1606,7 @@ impl Editor {
 
     /// An annotation is selected with the Select tool.
     pub fn has_selection(&self) -> bool {
-        self.selection().is_some()
+        self.selection().is_some() || self.multi_selected.len() >= 2
     }
 
     /// Compact quick annotation bar: the most used tools, colors and width.
@@ -1188,8 +1617,7 @@ impl Editor {
             if clicked {
                 self.commit_pending_text();
                 self.tool = tool;
-                self.selected = None;
-                self.drag = None;
+                self.clear_selection();
             }
         }
         ui.separator();
@@ -1244,13 +1672,28 @@ impl Editor {
         let ctx = ui.ctx().clone();
         // Shortcuts only apply when no text field is being edited.
         if self.pending_text.is_none() && !ctx.egui_wants_keyboard_input() {
-            let (undo, redo, toggle_eyedropper, cancel_eyedropper) = ctx.input_mut(|i| {
+            let (undo, redo, toggle_eyedropper, cancel_eyedropper, paste_layer) = ctx.input_mut(|i| {
                 let redo = i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
                     || i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z);
                 let toggle_eyedropper = i.consume_key(egui::Modifiers::NONE, egui::Key::I);
                 let cancel_eyedropper = self.eyedropper && i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
-                (i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z), redo, toggle_eyedropper, cancel_eyedropper)
+                let paste_ev = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
+                let paste_key = i.consume_key(egui::Modifiers::COMMAND, egui::Key::V) || paste_ev;
+                (
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
+                    redo,
+                    toggle_eyedropper,
+                    cancel_eyedropper,
+                    paste_key && self.fixed_rect.is_none(),
+                )
             });
+            if paste_layer
+                && let Ok(mut cb) = arboard::Clipboard::new()
+                && let Ok(img) = cb.get_image()
+                && let Some(rgba) = RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+            {
+                self.paste_image(rgba);
+            }
             if toggle_eyedropper {
                 self.eyedropper = !self.eyedropper;
             } else if cancel_eyedropper {
@@ -1524,6 +1967,7 @@ impl Editor {
 
     /// Selects the object and shows its color and width in the bar.
     fn select(&mut self, index: usize) {
+        self.multi_selected.clear();
         self.selected = Some(index);
         let Some(op) = self.history.ops().get(index) else { return };
         if let Some([r, g, b, a]) = op.color() {
@@ -1533,7 +1977,12 @@ impl Editor {
             self.width = t.clamp(1.0, 24.0);
         }
         match op {
-            Op::Rect { filled, dashed, .. } | Op::Ellipse { filled, dashed, .. } => {
+            Op::Rect { filled, dashed, radius, .. } => {
+                self.filled = *filled;
+                self.dashed = *dashed;
+                self.rect_radius = *radius;
+            }
+            Op::Ellipse { filled, dashed, .. } => {
                 self.filled = *filled;
                 self.dashed = *dashed;
             }
@@ -1547,6 +1996,32 @@ impl Editor {
             Op::Callout { style, .. } => self.callout_style = *style,
             Op::Text { boxed, .. } => self.boxed = *boxed,
             _ => {}
+        }
+    }
+
+    /// Toggles `index` inside the active selection (`Ctrl+Click` or `Shift+Click`).
+    fn toggle_in_selection(&mut self, index: usize) {
+        let mut set = if !self.multi_selected.is_empty() {
+            self.multi_selected.clone()
+        } else if let Some(cur) = self.selection() {
+            vec![cur]
+        } else {
+            Vec::new()
+        };
+        if let Some(pos) = set.iter().position(|&i| i == index) {
+            set.remove(pos);
+        } else {
+            set.push(index);
+        }
+        set.sort_unstable();
+        set.dedup();
+        match set.as_slice() {
+            [] => self.clear_selection(),
+            [only] => self.select(*only),
+            _ => {
+                self.selected = None;
+                self.multi_selected = set;
+            }
         }
     }
 
@@ -1576,10 +2051,20 @@ impl Editor {
         self.pending_text = None;
         self.gesture_open = false;
         self.history.remove(index);
-        self.selected = None;
-        self.drag = None;
+        self.clear_selection();
         self.smart_guides.clear();
         self.refresh_texture();
+    }
+
+    fn delete_multi(&mut self) {
+        let indices = self.multi_selected.clone();
+        self.pending_text = None;
+        self.gesture_open = false;
+        if self.history.remove_many(&indices) {
+            self.clear_selection();
+            self.smart_guides.clear();
+            self.refresh_texture();
+        }
     }
 
     fn reorder(&mut self, idx: usize, to_front: bool, all_the_way: bool) {
@@ -1594,9 +2079,44 @@ impl Editor {
         }
     }
 
-    /// Duplicates the currently selected annotation, offsetting it by `(16, 16)` (clamped to the
-    /// image bounds) and selecting the new copy.
+    /// Duplicates the currently selected annotation(s), offsetting by `(16, 16)` (clamped to the
+    /// image bounds) and selecting the new copy/copies.
     pub fn duplicate_selected(&mut self, _ctx: &egui::Context) -> bool {
+        if self.multi_selected.len() >= 2 {
+            let indices = self.multi_selected.clone();
+            let (iw, ih) = (self.history.image().width() as f32, self.history.image().height() as f32);
+            let mut next_step_num = self.history.next_step();
+            let mut copies = Vec::with_capacity(indices.len());
+            for i in indices {
+                let Some(mut op) = self.history.ops().get(i).cloned() else { continue };
+                let (mut dx, mut dy) = (16.0, 16.0);
+                if let Some((_min, max)) = op.bounds(self.history.font()) {
+                    if max.0 + dx > iw {
+                        dx = (iw - max.0).max(0.0);
+                    }
+                    if max.1 + dy > ih {
+                        dy = (ih - max.1).max(0.0);
+                    }
+                }
+                op.translate(dx, dy);
+                if let Op::Step { number, .. } = &mut op {
+                    *number = next_step_num;
+                    next_step_num += 1;
+                }
+                copies.push(op);
+            }
+            if copies.is_empty() {
+                return false;
+            }
+            let start = self.history.ops().len();
+            let count = copies.len();
+            self.gesture_open = false;
+            self.history.push_batch(copies);
+            self.refresh_texture();
+            self.selected = None;
+            self.multi_selected = (start..start + count).collect();
+            return true;
+        }
         let Some(index) = self.selection() else { return false };
         self.duplicate(index);
         true
@@ -1622,7 +2142,8 @@ impl Editor {
         self.select(self.history.ops().len() - 1);
     }
 
-    /// Select tool: clicking picks an object, dragging moves it, the small squares resize it,
+    /// Select tool: clicking picks an object (`Ctrl+Click` toggles multi-select), dragging empty
+    /// space draws a marquee box, dragging a selected object moves it (or the whole group), and
     /// double-clicking a text rewrites it.
     fn select_ui(
         &mut self,
@@ -1636,6 +2157,7 @@ impl Editor {
         let font = self.history.font().clone();
         let tol = 6.0 / scale;
         let grip = 9.0 / scale;
+        self.prune_multi_selection();
         if self.selection().is_none() {
             self.selected = None;
         }
@@ -1645,27 +2167,124 @@ impl Editor {
             Some((i, h))
         };
 
-        if response.drag_started() {
-            self.commit_pending_text();
-            // A drag is only recognized after the mouse moves a little; what counts is where it was
-            // pressed.
-            let origin = ctx.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos()).map(&to_img);
-            let grabbed = origin.and_then(|o| {
-                let (index, handle) = match handle_at(self, o) {
-                    Some((i, h)) => (i, Some(h)),
-                    None => (self.pick(o, tol)?, None),
-                };
-                let orig = self.history.ops()[index].clone();
-                Some(ObjDrag { index, handle, start: o, current: orig.clone(), orig })
-            });
-            match grabbed.as_ref().map(|d| d.index) {
-                Some(i) => self.select(i),
-                None => self.selected = None,
+        // Ctrl+A selects every editable annotation after the last whole-image transform.
+        if self.pending_text.is_none()
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
+        {
+            let first = self.history.first_object();
+            let len = self.history.ops().len();
+            if len > first + 1 {
+                self.selected = None;
+                self.multi_selected = (first..len).collect();
+            } else if len == first + 1 {
+                self.select(first);
             }
-            self.drag = grabbed;
         }
 
-        if let Some(mut d) = self.drag.take() {
+        if response.drag_started() {
+            self.commit_pending_text();
+            let origin = ctx.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos()).map(&to_img);
+            let add_mod = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl || i.modifiers.shift);
+            if let Some(o) = origin {
+                if let Some((i, h)) = handle_at(self, o) {
+                    let orig = self.history.ops()[i].clone();
+                    self.select(i);
+                    self.drag = Some(ObjDrag { index: i, handle: Some(h), start: o, current: orig.clone(), orig });
+                } else if let Some(hit_idx) = self.pick(o, tol) {
+                    if self.multi_selected.len() >= 2 && self.multi_selected.contains(&hit_idx) {
+                        let originals = self
+                            .multi_selected
+                            .iter()
+                            .filter_map(|&idx| Some((idx, self.history.ops().get(idx)?.clone())))
+                            .collect();
+                        self.group_drag = Some(GroupDrag { start: o, originals });
+                    } else if add_mod {
+                        self.toggle_in_selection(hit_idx);
+                        if self.multi_selected.len() >= 2 {
+                            let originals = self
+                                .multi_selected
+                                .iter()
+                                .filter_map(|&idx| Some((idx, self.history.ops().get(idx)?.clone())))
+                                .collect();
+                            self.group_drag = Some(GroupDrag { start: o, originals });
+                        }
+                    } else {
+                        let orig = self.history.ops()[hit_idx].clone();
+                        self.select(hit_idx);
+                        self.drag = Some(ObjDrag { index: hit_idx, handle: None, start: o, current: orig.clone(), orig });
+                    }
+                } else {
+                    if !add_mod {
+                        self.clear_selection();
+                    }
+                    self.marquee = Some((o, o));
+                }
+            }
+        }
+
+        if let Some(gd) = self.group_drag.take() {
+            self.smart_guides.clear();
+            let stop = response.drag_stopped();
+            if let Some(cur) = response.interact_pointer_pos().map(&to_img) {
+                let (dx, dy) = (cur.0 - gd.start.0, cur.1 - gd.start.1);
+                let img = self.history.image();
+                let live = img.width() as u64 * img.height() as u64 <= LIVE_PIXELS;
+                if (live || stop) && (dx.abs() > 0.1 || dy.abs() > 0.1) {
+                    if !self.gesture_open {
+                        self.history.checkpoint();
+                        self.gesture_open = true;
+                    }
+                    for &(idx, ref orig) in &gd.originals {
+                        let mut moved = orig.clone();
+                        moved.translate(dx, dy);
+                        self.history.set(idx, moved);
+                    }
+                    self.refresh_texture();
+                }
+            }
+            if response.dragged() && !stop {
+                self.group_drag = Some(gd);
+            }
+        } else if let Some((origin, _)) = self.marquee.take() {
+            let cur = response.interact_pointer_pos().map(&to_img).unwrap_or(origin);
+            let stop = response.drag_stopped();
+            if stop {
+                let min_x = origin.0.min(cur.0);
+                let min_y = origin.1.min(cur.1);
+                let max_x = origin.0.max(cur.0);
+                let max_y = origin.1.max(cur.1);
+                if (max_x - min_x) >= 3.0 || (max_y - min_y) >= 3.0 {
+                    let first = self.history.first_object();
+                    let mut hits: Vec<usize> = self.multi_selected.clone();
+                    if let Some(cur_sel) = self.selection() {
+                        hits.push(cur_sel);
+                    }
+                    for (idx, op) in self.history.ops().iter().enumerate().skip(first) {
+                        if let Some((bmin, bmax)) = op.bounds(&font)
+                            && bmin.0 <= max_x
+                            && bmax.0 >= min_x
+                            && bmin.1 <= max_y
+                            && bmax.1 >= min_y
+                        {
+                            hits.push(idx);
+                        }
+                    }
+                    hits.sort_unstable();
+                    hits.dedup();
+                    match hits.as_slice() {
+                        [] => self.clear_selection(),
+                        [only] => self.select(*only),
+                        _ => {
+                            self.selected = None;
+                            self.multi_selected = hits;
+                        }
+                    }
+                }
+            } else if response.dragged() {
+                self.marquee = Some((origin, cur));
+            }
+        } else if let Some(mut d) = self.drag.take() {
             self.smart_guides.clear();
             if let Some(cur) = response.interact_pointer_pos().map(&to_img) {
                 d.current = match d.handle {
@@ -1771,51 +2390,91 @@ impl Editor {
             }
         } else if response.clicked() {
             self.commit_pending_text();
+            let add_mod = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl || i.modifiers.shift);
             match click_pos.and_then(|p| self.pick(p, tol)) {
+                Some(i) if add_mod => self.toggle_in_selection(i),
                 Some(i) => self.select(i),
-                None => self.selected = None,
+                None if !add_mod => self.clear_selection(),
+                None => {}
             }
         }
 
-        if self.pending_text.is_none()
-            && !ctx.egui_wants_keyboard_input()
-            && let Some(i) = self.selection()
-        {
-            let (delete, escape, duplicate, send_back, bring_front, shift, dx, dy) = ctx.input_mut(|inp| {
-                let shift = inp.modifiers.shift;
-                let step = if shift { 10.0 } else { 1.0 };
-                let axis = |neg: egui::Key, pos: egui::Key| {
-                    step * (inp.key_pressed(pos) as i32 - inp.key_pressed(neg) as i32) as f32
-                };
-                let (dx, dy) = (
-                    axis(egui::Key::ArrowLeft, egui::Key::ArrowRight),
-                    axis(egui::Key::ArrowUp, egui::Key::ArrowDown),
-                );
-                (
-                    inp.key_pressed(egui::Key::Delete) || inp.key_pressed(egui::Key::Backspace),
-                    inp.key_pressed(egui::Key::Escape),
-                    inp.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
-                    inp.key_pressed(egui::Key::OpenBracket),
-                    inp.key_pressed(egui::Key::CloseBracket),
-                    shift,
-                    dx,
-                    dy,
-                )
-            });
-            if delete {
-                self.delete(i);
-            } else if escape {
-                self.selected = None;
-            } else if duplicate {
-                self.duplicate_selected(ctx);
-            } else if bring_front {
-                self.reorder(i, true, shift);
-            } else if send_back {
-                self.reorder(i, false, shift);
-            } else if dx != 0.0 || dy != 0.0 {
-                let mut op = self.history.ops()[i].clone();
-                op.translate(dx, dy);
-                self.change(i, op);
+        if self.pending_text.is_none() && !ctx.egui_wants_keyboard_input() {
+            if self.multi_selected.len() >= 2 {
+                let (delete, escape, duplicate, dx, dy) = ctx.input_mut(|inp| {
+                    let step = if inp.modifiers.shift { 10.0 } else { 1.0 };
+                    let axis = |neg: egui::Key, pos: egui::Key| {
+                        step * (inp.key_pressed(pos) as i32 - inp.key_pressed(neg) as i32) as f32
+                    };
+                    let (dx, dy) = (
+                        axis(egui::Key::ArrowLeft, egui::Key::ArrowRight),
+                        axis(egui::Key::ArrowUp, egui::Key::ArrowDown),
+                    );
+                    (
+                        inp.key_pressed(egui::Key::Delete) || inp.key_pressed(egui::Key::Backspace),
+                        inp.key_pressed(egui::Key::Escape),
+                        inp.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
+                        dx,
+                        dy,
+                    )
+                });
+                if delete {
+                    self.delete_multi();
+                } else if escape {
+                    self.clear_selection();
+                } else if duplicate {
+                    self.duplicate_selected(ctx);
+                } else if dx != 0.0 || dy != 0.0 {
+                    if !self.gesture_open {
+                        self.history.checkpoint();
+                        self.gesture_open = true;
+                    }
+                    let indices = self.multi_selected.clone();
+                    for idx in indices {
+                        if let Some(mut op) = self.history.ops().get(idx).cloned() {
+                            op.translate(dx, dy);
+                            self.history.set(idx, op);
+                        }
+                    }
+                    self.refresh_texture();
+                }
+            } else if let Some(i) = self.selection() {
+                let (delete, escape, duplicate, send_back, bring_front, shift, dx, dy) = ctx.input_mut(|inp| {
+                    let shift = inp.modifiers.shift;
+                    let step = if shift { 10.0 } else { 1.0 };
+                    let axis = |neg: egui::Key, pos: egui::Key| {
+                        step * (inp.key_pressed(pos) as i32 - inp.key_pressed(neg) as i32) as f32
+                    };
+                    let (dx, dy) = (
+                        axis(egui::Key::ArrowLeft, egui::Key::ArrowRight),
+                        axis(egui::Key::ArrowUp, egui::Key::ArrowDown),
+                    );
+                    (
+                        inp.key_pressed(egui::Key::Delete) || inp.key_pressed(egui::Key::Backspace),
+                        inp.key_pressed(egui::Key::Escape),
+                        inp.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
+                        inp.key_pressed(egui::Key::OpenBracket),
+                        inp.key_pressed(egui::Key::CloseBracket),
+                        shift,
+                        dx,
+                        dy,
+                    )
+                });
+                if delete {
+                    self.delete(i);
+                } else if escape {
+                    self.clear_selection();
+                } else if duplicate {
+                    self.duplicate_selected(ctx);
+                } else if bring_front {
+                    self.reorder(i, true, shift);
+                } else if send_back {
+                    self.reorder(i, false, shift);
+                } else if dx != 0.0 || dy != 0.0 {
+                    let mut op = self.history.ops()[i].clone();
+                    op.translate(dx, dy);
+                    self.change(i, op);
+                }
             }
         }
 
@@ -1825,9 +2484,39 @@ impl Editor {
             ctx.set_cursor_icon(match handle_at(self, p) {
                 Some((_, Handle::Rotate)) => egui::CursorIcon::Grab,
                 Some((_, _)) => egui::CursorIcon::Crosshair,
-                None if self.drag.is_some() || self.pick(p, tol).is_some() => egui::CursorIcon::Move,
+                None if self.drag.is_some() || self.group_drag.is_some() || self.pick(p, tol).is_some() => egui::CursorIcon::Move,
                 None => egui::CursorIcon::Default,
             });
+        }
+
+        if let Some((ma, mb)) = self.marquee {
+            let mrect = Rect::from_two_pos(to_screen(ma), to_screen(mb));
+            painter.rect_filled(mrect, 2.0, self.accent.gamma_multiply(0.14));
+            painter.rect_stroke(mrect, 2.0, Stroke::new(1.5, self.accent), StrokeKind::Middle);
+        }
+
+        if self.multi_selected.len() >= 2 {
+            let mut umin = (f32::INFINITY, f32::INFINITY);
+            let mut umax = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for &idx in &self.multi_selected {
+                if let Some(op) = self.history.ops().get(idx)
+                    && let Some((min, max)) = op.bounds(&font)
+                {
+                    let frame = Rect::from_min_max(to_screen(min), to_screen(max)).expand(2.5);
+                    painter.rect_stroke(frame, 2.0, Stroke::new(1.5, self.accent), StrokeKind::Middle);
+                    umin = (umin.0.min(min.0), umin.1.min(min.1));
+                    umax = (umax.0.max(max.0), umax.1.max(max.1));
+                }
+            }
+            if umin.0 <= umax.0 && umin.1 <= umax.1 {
+                let group_frame = Rect::from_min_max(to_screen(umin), to_screen(umax)).expand(6.0);
+                let dashed_stroke = Stroke::new(1.0, self.accent.gamma_multiply(0.75));
+                draw_dashed_line(painter, group_frame.left_top(), group_frame.right_top(), dashed_stroke, 5.0, 4.0);
+                draw_dashed_line(painter, group_frame.right_top(), group_frame.right_bottom(), dashed_stroke, 5.0, 4.0);
+                draw_dashed_line(painter, group_frame.right_bottom(), group_frame.left_bottom(), dashed_stroke, 5.0, 4.0);
+                draw_dashed_line(painter, group_frame.left_bottom(), group_frame.left_top(), dashed_stroke, 5.0, 4.0);
+            }
+            return;
         }
 
         // Outline and control points of the selected object.
@@ -1870,7 +2559,16 @@ impl Editor {
                 (dist >= 3.0).then_some(Op::Arrow { from: a, to: b, color, width, dashed: self.dashed, double: self.double })
             }
             Tool::Line => (dist >= 3.0).then_some(Op::Line { from: a, to: b, color, width, dashed: self.dashed }),
-            Tool::Rect => area_ok.then_some(Op::Rect { a, b, color, width, filled: self.filled, dashed: self.dashed, angle: 0.0 }),
+            Tool::Rect => area_ok.then_some(Op::Rect {
+                a,
+                b,
+                color,
+                width,
+                filled: self.filled,
+                dashed: self.dashed,
+                angle: 0.0,
+                radius: self.rect_radius,
+            }),
             Tool::Ellipse => area_ok.then_some(Op::Ellipse { a, b, color, width, filled: self.filled, dashed: self.dashed, angle: 0.0 }),
             Tool::Pen => {
                 let points = std::mem::take(&mut self.pen_points);
@@ -1949,10 +2647,10 @@ impl Editor {
                 painter.line_segment([sa, sb], stroke);
             }
             Tool::Rect if self.filled => {
-                painter.rect_filled(rect, 0.0, self.color);
+                painter.rect_filled(rect, self.rect_radius * scale, self.color);
             }
             Tool::Rect => {
-                painter.rect_stroke(rect, 0.0, stroke, StrokeKind::Middle);
+                painter.rect_stroke(rect, self.rect_radius * scale, stroke, StrokeKind::Middle);
             }
             Tool::Ellipse if self.filled => {
                 painter.add(egui::Shape::ellipse_filled(rect.center(), rect.size() / 2.0, self.color));
@@ -2353,6 +3051,7 @@ mod tests {
             step_shape: StepShape::Pin,
             step_glyph: StepGlyph::Upper,
             callout_style: CalloutStyle::Outline,
+            rect_radius: 8.0,
         };
         let text = serde_json::to_string(&style).unwrap();
         assert_eq!(serde_json::from_str::<Style>(&text).unwrap(), style);
@@ -2419,7 +3118,7 @@ mod tests {
         let ops = vec![
             Op::Arrow { from: (1.0, 2.0), to: (30.0, 40.0), color: RED, width: 4.0, dashed: true, double: true },
             Op::Line { from: (0.0, 5.0), to: (10.0, 5.0), color: RED, width: 2.0, dashed: false },
-            Op::Rect { a: (5.0, 5.0), b: (25.0, 25.0), color: RED, width: 3.0, filled: true, dashed: false, angle: 0.0 },
+            Op::Rect { a: (5.0, 5.0), b: (25.0, 25.0), color: RED, width: 3.0, filled: true, dashed: false, angle: 0.0, radius: 6.0 },
             Op::Ellipse { a: (10.0, 10.0), b: (20.0, 30.0), color: RED, width: 2.0, filled: false, dashed: true, angle: 0.0 },
             Op::Pen { points: vec![(1.0, 1.0), (5.0, 8.0)], color: RED, width: 3.0 },
             Op::Erase { points: vec![(2.0, 2.0), (6.0, 6.0)], width: 10.0 },
@@ -2484,8 +3183,8 @@ mod tests {
         let mut h = history();
         let font = h.font().clone();
         let blue: Rgba = [0, 0, 255, 255];
-        let r1 = Op::Rect { a: (10.0, 10.0), b: (60.0, 60.0), color: RED, width: 2.0, filled: true, dashed: false, angle: 0.0 };
-        let r2 = Op::Rect { a: (10.0, 10.0), b: (60.0, 60.0), color: blue, width: 2.0, filled: true, dashed: false, angle: 0.0 };
+        let r1 = Op::Rect { a: (10.0, 10.0), b: (60.0, 60.0), color: RED, width: 2.0, filled: true, dashed: false, angle: 0.0, radius: 0.0 };
+        let r2 = Op::Rect { a: (10.0, 10.0), b: (60.0, 60.0), color: blue, width: 2.0, filled: true, dashed: false, angle: 0.0, radius: 0.0 };
         h.push(r1);
         h.push(r2);
         assert_eq!(h.image().get_pixel(30, 30).0, blue);
@@ -2493,5 +3192,54 @@ mod tests {
         assert_eq!(h.image().get_pixel(30, 30).0, RED);
         assert!(h.undo());
         assert_eq!(h.image().get_pixel(30, 30).0, blue);
+    }
+
+    #[test]
+    fn align_distribute_and_batch_remove_work_in_single_undo_steps() {
+        let mut h = history();
+        let font = h.font().clone();
+        h.push(Op::Pixelate { a: (5.0, 10.0), b: (15.0, 20.0) });
+        h.push(Op::Pixelate { a: (25.0, 40.0), b: (35.0, 50.0) });
+        h.push(Op::Pixelate { a: (85.0, 70.0), b: (95.0, 80.0) });
+
+        // Align Left -> all left edges become 5.0
+        assert!(h.align_objects(&[0, 1, 2], AlignMode::Left));
+        for idx in 0..3 {
+            let (min, _) = h.ops()[idx].bounds(&font).unwrap();
+            assert!((min.0 - 5.0).abs() < 0.01, "obj {idx} min={min:?}");
+        }
+        assert!(h.undo(), "alignment is undone in a single step");
+
+        // Distribute Horizontally -> middle box (width 10) moves midway between x=5..15 and x=85..95 -> x=45..55
+        assert!(h.align_objects(&[0, 1, 2], AlignMode::DistributeH));
+        let (mid_min, mid_max) = h.ops()[1].bounds(&font).unwrap();
+        assert!((mid_min.0 - 45.0).abs() < 0.1 && (mid_max.0 - 55.0).abs() < 0.1, "{mid_min:?}..{mid_max:?}");
+
+        // Batch remove deletes 0 and 2 in one undo step
+        assert!(h.remove_many(&[0, 2]));
+        assert_eq!(h.ops().len(), 1);
+        assert!(h.undo());
+        assert_eq!(h.ops().len(), 3);
+    }
+
+    #[test]
+    fn paste_image_and_auto_redactions_select_new_layers_and_undo_atomically() {
+        let ctx = egui::Context::default();
+        let base = RgbaImage::from_pixel(200, 120, image::Rgba(WHITE));
+        let mut ed = Editor::new(&ctx, base, Color32::WHITE);
+
+        let sticker = RgbaImage::from_pixel(40, 30, image::Rgba([10, 200, 80, 255]));
+        ed.paste_image(sticker);
+        assert_eq!(ed.ops().len(), 1);
+        assert!(matches!(ed.ops()[0], Op::Sticker { .. }));
+        assert_eq!(ed.selection(), Some(0));
+
+        let n = ed.apply_redactions(&[(10.0, 10.0, 60.0, 30.0), (80.0, 10.0, 140.0, 30.0)]);
+        assert_eq!(n, 2);
+        assert_eq!(ed.ops().len(), 3);
+        assert_eq!(ed.multi_selected, vec![1, 2]);
+        // One undo removes both auto-redactions together!
+        ed.undo();
+        assert_eq!(ed.ops().len(), 1);
     }
 }

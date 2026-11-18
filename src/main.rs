@@ -7,10 +7,12 @@ mod autostart;
 mod capture;
 mod config;
 mod editor;
+mod export;
 mod legacy;
 mod library;
 mod neural;
 mod ocr;
+mod pin;
 mod record;
 mod render;
 mod scroll;
@@ -290,12 +292,14 @@ struct Quick {
 #[derive(Clone, Copy)]
 enum QuickAction {
     Copy,
+    Pin,
     Save,
     Editor,
     Cancel,
 }
 
 type OcrResult = Result<(String, ocr::Engine), String>;
+type RedactResult = Result<Vec<(f32, f32, f32, f32)>, String>;
 
 struct App {
     shared: Arc<Shared>,
@@ -329,6 +333,8 @@ struct App {
     show_library: bool,
     search: String,
     library_filter: library::MediaFilter,
+    /// Library entry currently being renamed / tagged: `(file, title_draft, tags_csv_draft)`.
+    edit_meta: Option<(String, String, String)>,
     /// Panoramic capture being prepared or in progress.
     pano: Option<PanoUi>,
     /// Video recording being prepared or in progress.
@@ -341,6 +347,9 @@ struct App {
     /// Result of the OCR in progress, delivered by the recognition thread.
     ocr_pending: Arc<Mutex<Option<OcrResult>>>,
     ocr_running: bool,
+    /// Result of automatic sensitive-data detection in progress.
+    redact_pending: Arc<Mutex<Option<RedactResult>>>,
+    redact_running: bool,
     /// Extracted text, shown in a window until the user closes it.
     ocr_text: Option<String>,
     /// Last image read, so it can be read again with the other engine.
@@ -410,6 +419,8 @@ struct VideoUi {
     as_gif: bool,
     /// Active countdown deadline before recording starts automatically.
     countdown_until: Option<Instant>,
+    /// Animated click ripple overlay while recording is active and unpaused.
+    halo: Option<win::ClickHalo>,
     /// Frame around the area, visible while the panel exists.
     _frame: Option<win::RegionFrame>,
     setup_frames: u8,
@@ -417,7 +428,7 @@ struct VideoUi {
 
 const PANO_HUD_SIZE: egui::Vec2 = egui::vec2(460.0, 84.0);
 const STEPS_HUD_SIZE: egui::Vec2 = egui::vec2(620.0, 84.0);
-const VIDEO_HUD_SIZE: egui::Vec2 = egui::vec2(680.0, 84.0);
+const VIDEO_HUD_SIZE: egui::Vec2 = egui::vec2(760.0, 84.0);
 
 /// Turns the window into a small panel, always on top and excluded from captures, and places it
 /// next to the area `rect`. Called every frame until `setup_frames` reaches zero: the window is
@@ -436,9 +447,9 @@ fn hud_setup(ctx: &egui::Context, hwnd: isize, rect: win::PxRect, size: egui::Ve
     if *setup_frames == 0 {
         // Right below the area; if it doesn't fit, above; as a last resort, at the bottom of the
         // monitor.
-        let scale = ctx.pixels_per_point();
-        let (w, h) = ((size.x * scale) as i32, (size.y * scale) as i32 + 48);
         let center = ((rect.0 + rect.2) / 2, (rect.1 + rect.3) / 2);
+        let scale = win::dpi_scale_at(center);
+        let (w, h) = ((size.x * scale) as i32, (size.y * scale) as i32 + 48);
         let work = win::work_area_at(center).unwrap_or((rect.0, rect.1, rect.2, rect.3 + h + 24));
         let x = (center.0 - w / 2).clamp(work.0, (work.2 - w).max(work.0));
         let y = if rect.3 + 12 + h <= work.3 {
@@ -449,12 +460,13 @@ fn hud_setup(ctx: &egui::Context, hwnd: isize, rect: win::PxRect, size: egui::Ve
             work.3 - h - 12
         };
         win::set_window_pos(hwnd, (x, y));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
     }
     ctx.request_repaint();
 }
 const NORMAL_MIN_SIZE: egui::Vec2 = egui::vec2(520.0, 320.0);
-/// Width that Copy, Save, Read text, Library and Preferences take up together in the bar.
-const RIGHT_GROUP_WIDTH: f32 = 500.0;
+/// Width that Copy, Save, Pin, Read text, Auto-redact, Library and Preferences take up together in the bar.
+const RIGHT_GROUP_WIDTH: f32 = 680.0;
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -536,6 +548,7 @@ impl App {
             show_library: true,
             search: String::new(),
             library_filter: library::MediaFilter::All,
+            edit_meta: None,
             pano: None,
             video: None,
             steps: None,
@@ -543,6 +556,8 @@ impl App {
             video_job_running: false,
             ocr_pending: Arc::new(Mutex::new(None)),
             ocr_running: false,
+            redact_pending: Arc::new(Mutex::new(None)),
+            redact_running: false,
             ocr_text: None,
             ocr_image: None,
             normal_size: None,
@@ -1069,6 +1084,59 @@ impl App {
         }
     }
 
+    /// Scans `image` locally with OCR to find sensitive data (emails, passwords, tokens, IDs,
+    /// credit cards, phones) on a background thread.
+    fn start_redact(&mut self, ctx: &egui::Context, image: RgbaImage) {
+        if self.redact_running || self.ocr_running {
+            return;
+        }
+        self.redact_running = true;
+        self.status = t!(
+            "Procurando dados sensíveis na imagem…",
+            "Scanning image for sensitive data…"
+        )
+        .to_owned();
+        let (pending, ctx) = (self.redact_pending.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = guarded(|| ocr::find_sensitive_regions(&image));
+            *pending.lock().unwrap() = Some(result);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Applies detected sensitive-data redactions to the active editor when the background OCR
+    /// pass completes.
+    fn poll_redact(&mut self) {
+        let Some(result) = self.redact_pending.lock().unwrap().take() else {
+            return;
+        };
+        self.redact_running = false;
+        match result {
+            Ok(boxes) if boxes.is_empty() => {
+                self.status = t!(
+                    "Nenhum dado sensível detectado na imagem.",
+                    "No sensitive data detected in the image."
+                )
+                .to_owned();
+            }
+            Ok(boxes) => {
+                if let Some(ed) = &mut self.editor {
+                    let n = ed.apply_redactions(&boxes);
+                    self.status = tf!(
+                        "{n} dados sensíveis ocultados (use Desfazer ou ajuste as caixas).",
+                        "{n} sensitive items redacted (use Undo or adjust the boxes)."
+                    );
+                }
+            }
+            Err(e) => {
+                self.status = tf!(
+                    "Não foi possível analisar dados sensíveis: {e}",
+                    "Could not scan for sensitive data: {e}"
+                );
+            }
+        }
+    }
+
     /// Saves `self.editor`'s flattened image, thumbnail, and editable annotation layers (when
     /// annotations exist or previously existed) to the library writer.
     fn save_editor_to_library(&mut self, ctx: &egui::Context, file: &str, is_new: bool) {
@@ -1142,6 +1210,7 @@ impl App {
     /// Stops any active recording or capture session and finishes writing pending captures before
     /// the program exits.
     fn shutdown(&mut self, ctx: &egui::Context) {
+        pin::close_all();
         if let Some(session) = self.video.take().and_then(|v| v.recorder) {
             let _ = session.stop();
         }
@@ -1218,6 +1287,9 @@ impl App {
                 if self.selection_anchor.as_deref() == Some(file) {
                     self.selection_anchor = None;
                 }
+                if self.edit_meta.as_ref().is_some_and(|(f, _, _)| f == file) {
+                    self.edit_meta = None;
+                }
                 if self.current_file.as_deref() == Some(file) {
                     self.current_file = None;
                     self.editor = None;
@@ -1252,6 +1324,13 @@ impl App {
             .is_some_and(|a| files.contains(a))
         {
             self.selection_anchor = None;
+        }
+        if self
+            .edit_meta
+            .as_ref()
+            .is_some_and(|(f, _, _)| files.contains(f))
+        {
+            self.edit_meta = None;
         }
         if ok > 0 {
             self.status = tf!(
@@ -1369,15 +1448,20 @@ impl App {
         ui.add_space(6.0);
         ui.add(
             egui::TextEdit::singleline(&mut self.search)
-                .hint_text(t!("Buscar por janela ou data", "Search by window or date"))
+                .hint_text(t!(
+                    "Buscar por janela, etiqueta ou data",
+                    "Search by window, tag or date"
+                ))
                 .desired_width(f32::INFINITY),
         );
         ui.add_space(4.0);
         let (total_count, img_count, vid_count) = self.library.counts();
+        let fav_count = self.library.favorite_count();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for (filter, label) in [
                 (library::MediaFilter::All, tf!("Todas ({total_count})", "All ({total_count})")),
+                (library::MediaFilter::Favorites, tf!("★ ({fav_count})", "★ ({fav_count})")),
                 (library::MediaFilter::Images, tf!("Imagens ({img_count})", "Images ({img_count})")),
                 (library::MediaFilter::Videos, tf!("Vídeos ({vid_count})", "Videos ({vid_count})")),
             ] {
@@ -1408,6 +1492,7 @@ impl App {
 
         let mut batch_delete = false;
         let mut batch_export = false;
+        let mut batch_pdf = false;
         let mut batch_copy: Option<Vec<String>> = None;
         let mut batch_combine: Option<bool> = None;
 
@@ -1459,6 +1544,17 @@ impl App {
                         {
                             batch_export = true;
                         }
+                        if selected_img_count >= 1
+                            && ui
+                                .small_button("📄 PDF")
+                                .on_hover_text(t!(
+                                    "Exporta as imagens selecionadas em um único PDF",
+                                    "Exports selected images into a single PDF"
+                                ))
+                                .clicked()
+                        {
+                            batch_pdf = true;
+                        }
                         if ui
                             .small_button(t!("📋 Copiar", "📋 Copy"))
                             .on_hover_text(t!("📋 Copiar arquivos", "📋 Copy files"))
@@ -1493,6 +1589,9 @@ impl App {
 
         let mut to_open = None;
         let mut to_delete = None;
+        let mut to_pin: Option<String> = None;
+        let mut to_toggle_fav: Option<String> = None;
+        let mut to_edit_meta: Option<(String, String, String)> = None;
         let mut to_drag: Option<Vec<std::path::PathBuf>> = None;
         let thumb_h = 96.0;
         let row_h = thumb_h + 44.0;
@@ -1586,12 +1685,31 @@ impl App {
                         theme::text_on(accent),
                     );
                 }
+                if entry.favorite {
+                    let fav_x = if multi_selected {
+                        inner.max.x - 40.0
+                    } else {
+                        inner.max.x - 20.0
+                    };
+                    let fav_rect = Rect::from_min_size(
+                        Pos2::new(fav_x, inner.min.y + 4.0),
+                        egui::vec2(16.0, 16.0),
+                    );
+                    painter.rect_filled(fav_rect, 4.0, Color32::from_black_alpha(175));
+                    painter.text(
+                        fav_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "★",
+                        egui::FontId::proportional(11.5),
+                        Color32::from_rgb(255, 204, 51),
+                    );
+                }
                 let text_top = inner.min + egui::vec2(0.0, thumb_h + 2.0);
                 let title = if entry.title.is_empty() { t!("(sem título)", "(untitled)") } else { &entry.title };
                 // Theme colors: a fixed white disappeared on the light theme's background.
                 let (title_color, detail_color) = (ui.visuals().strong_text_color(), ui.visuals().weak_text_color());
                 painter.text(text_top, egui::Align2::LEFT_TOP, title, egui::FontId::proportional(12.5), title_color);
-                let detail = if entry.duration_secs > 0.0 && entry.width > 0 && entry.height > 0 {
+                let mut detail = if entry.duration_secs > 0.0 && entry.width > 0 && entry.height > 0 {
                     format!(
                         "{}  •  {}×{}  •  {}",
                         entry.when,
@@ -1604,6 +1722,16 @@ impl App {
                 } else {
                     entry.when.clone()
                 };
+                if !entry.tags.is_empty() {
+                    let tags_str = entry
+                        .tags
+                        .iter()
+                        .map(|tag| format!("#{}", tag.trim_start_matches('#')))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    detail.push_str("  •  ");
+                    detail.push_str(&tags_str);
+                }
                 painter.text(
                     text_top + egui::vec2(0.0, 16.0),
                     egui::Align2::LEFT_TOP,
@@ -1668,6 +1796,14 @@ impl App {
                         to_open = Some(entry.file.clone());
                         ui.close();
                     }
+                    if !entry.is_video()
+                        && ui
+                            .button(t!("📌 Fixar na tela", "📌 Pin to screen"))
+                            .clicked()
+                    {
+                        to_pin = Some(entry.file.clone());
+                        ui.close();
+                    }
                     if entry.is_video()
                         && ui.button(t!("▶ Abrir no player", "▶ Open in player")).clicked()
                     {
@@ -1676,6 +1812,27 @@ impl App {
                             .spawn();
                         ui.close();
                     }
+                    let fav_label = if entry.favorite {
+                        t!("☆ Remover dos favoritos", "☆ Remove from favorites")
+                    } else {
+                        t!("★ Favoritar", "★ Favorite")
+                    };
+                    if ui.button(fav_label).clicked() {
+                        to_toggle_fav = Some(entry.file.clone());
+                        ui.close();
+                    }
+                    if ui
+                        .button(t!("✎ Renomear / etiquetas…", "✎ Rename / tags…"))
+                        .clicked()
+                    {
+                        to_edit_meta = Some((
+                            entry.file.clone(),
+                            entry.title.clone(),
+                            entry.tags.join(", "),
+                        ));
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui
                         .button(t!("📋 Copiar arquivo", "📋 Copy file"))
                         .clicked()
@@ -1720,6 +1877,14 @@ impl App {
                             .iter()
                             .filter(|f| !f.to_ascii_lowercase().ends_with(".mp4"))
                             .count();
+                        if img_count >= 1
+                            && ui
+                                .button(t!("📄 Exportar PDF…", "📄 Export PDF…"))
+                                .clicked()
+                        {
+                            batch_pdf = true;
+                            ui.close();
+                        }
                         if img_count >= 2 {
                             if ui
                                 .button(t!("↕ Juntar (Vertical)", "↕ Combine (Vertical)"))
@@ -1778,12 +1943,64 @@ impl App {
             let files = self.selected_files.clone();
             self.export_files_to_folder(&files);
         }
+        if batch_pdf {
+            let img_paths: Vec<std::path::PathBuf> = self
+                .selected_files
+                .iter()
+                .filter(|f| !f.to_ascii_lowercase().ends_with(".mp4"))
+                .map(|f| self.library.path(f))
+                .collect();
+            self.status = export::export_files_as_pdf_dialog(&img_paths);
+        }
         if let Some(files) = batch_copy {
             self.copy_library_files_to_clipboard(&files);
         }
         if let Some(vertical) = batch_combine {
             let files = self.selected_files.clone();
             self.combine_selected_images(&ctx, &files, vertical);
+        }
+        if let Some(file) = to_pin {
+            self.flush_autosave(&ctx);
+            let acc = self.accent();
+            let img_res = if self.current_file.as_deref() == Some(file.as_str())
+                && let Some(ed) = &self.editor
+            {
+                Ok(ed.image().clone())
+            } else {
+                image::open(self.library.path(&file))
+                    .map(|i| i.to_rgba8())
+                    .map_err(|e| e.to_string())
+            };
+            self.status =
+                match img_res.and_then(|img| pin::spawn(img, [acc.r(), acc.g(), acc.b()], None)) {
+                    Ok(()) => t!(
+                        "Captura fixada na tela (arraste para mover, Esc fecha).",
+                        "Capture pinned to screen (drag to move, Esc closes)."
+                    )
+                    .to_owned(),
+                    Err(e) => tf!(
+                        "Não foi possível fixar {file}: {e}",
+                        "Could not pin {file}: {e}"
+                    ),
+                };
+        }
+        if let Some(file) = to_toggle_fav
+            && let Some(now_fav) = self.library.toggle_favorite(&file)
+        {
+            self.status = if now_fav {
+                tf!(
+                    "★ {file} adicionado aos favoritos.",
+                    "★ {file} added to favorites."
+                )
+            } else {
+                tf!(
+                    "{file} removido dos favoritos.",
+                    "{file} removed from favorites."
+                )
+            };
+        }
+        if let Some(meta) = to_edit_meta {
+            self.edit_meta = Some(meta);
         }
         if let Some(file) = to_open {
             self.open_from_library(&ctx, &file);
@@ -1797,6 +2014,76 @@ impl App {
                 self.open_from_library(&ctx, &next);
                 self.status = status;
             }
+        }
+    }
+
+    fn edit_meta_ui(&mut self, ctx: &egui::Context) {
+        let Some((file, mut title_draft, mut tags_draft)) = self.edit_meta.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new(t!("Renomear e etiquetas", "Rename & tags"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.weak(&file);
+                ui.add_space(4.0);
+                ui.label(t!("Título", "Title"));
+                let title_resp = ui.add(
+                    egui::TextEdit::singleline(&mut title_draft)
+                        .hint_text(t!("Título da captura ou vídeo", "Capture or video title"))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+                ui.label(t!(
+                    "Etiquetas (separadas por vírgula)",
+                    "Tags (comma-separated)"
+                ));
+                let tags_resp = ui.add(
+                    egui::TextEdit::singleline(&mut tags_draft)
+                        .hint_text(t!("ex: bug, login, sprint-4", "e.g. bug, login, sprint-4"))
+                        .desired_width(f32::INFINITY),
+                );
+                let enter_pressed = (title_resp.lost_focus() || tags_resp.lost_focus())
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    || (!ctx.egui_wants_keyboard_input()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if enter_pressed {
+                    save = true;
+                }
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                    cancel = true;
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t!("Salvar", "Save")).clicked() {
+                        save = true;
+                    }
+                    if ui.button(t!("Cancelar", "Cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if save {
+            let parsed_tags: Vec<String> = tags_draft
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('#').trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let clean_title = title_draft.trim().to_owned();
+            if self.library.set_metadata(&file, clean_title, parsed_tags) {
+                self.status = tf!("Detalhes atualizados: {file}", "Details updated: {file}");
+            }
+            self.edit_meta = None;
+        } else if cancel || !open {
+            self.edit_meta = None;
+        } else {
+            self.edit_meta = Some((file, title_draft, tags_draft));
         }
     }
 
@@ -1983,6 +2270,7 @@ impl App {
             recorder: None,
             as_gif,
             countdown_until: None,
+            halo: None,
             _frame: frame,
             setup_frames: 6,
         });
@@ -2007,6 +2295,7 @@ impl App {
             self.cfg.video_cursor,
             self.cfg.video_countdown,
         );
+        let mut highlight_clicks = self.cfg.video_highlight_clicks;
         let as_gif = video.as_gif;
 
         if video.recorder.is_none()
@@ -2103,6 +2392,11 @@ impl App {
                             });
 
                         ui.checkbox(&mut cursor, t!("Cursor", "Cursor"));
+                        ui.checkbox(&mut highlight_clicks, t!("Cliques", "Clicks"))
+                            .on_hover_text(t!(
+                                "Destaca cliques do mouse na gravação",
+                                "Highlights mouse clicks in the recording"
+                            ));
                         if !as_gif {
                             ui.checkbox(&mut system_audio, t!("Som do sistema", "System sound"));
                             ui.checkbox(&mut microphone, t!("Microfone", "Microphone"));
@@ -2147,12 +2441,13 @@ impl App {
         let prefs_changed = (!as_gif
             && (system_audio, microphone)
                 != (self.cfg.record_system_audio, self.cfg.record_microphone))
-            || (fps, quality, cursor, countdown)
+            || (fps, quality, cursor, countdown, highlight_clicks)
                 != (
                     self.cfg.video_fps,
                     self.cfg.video_quality,
                     self.cfg.video_cursor,
                     self.cfg.video_countdown,
+                    self.cfg.video_highlight_clicks,
                 );
         if prefs_changed {
             if !as_gif {
@@ -2163,6 +2458,7 @@ impl App {
             self.cfg.video_quality = quality;
             self.cfg.video_cursor = cursor;
             self.cfg.video_countdown = countdown;
+            self.cfg.video_highlight_clicks = highlight_clicks;
             self.save_cfg();
         }
 
@@ -2190,9 +2486,11 @@ impl App {
             };
             match record::Session::start(rect, options, self.library.dir(), stem) {
                 Ok(session) => {
+                    let show_halo = self.cfg.video_highlight_clicks;
                     if let Some(video) = &mut self.video {
                         video.countdown_until = None;
                         video.recorder = Some(session);
+                        video.halo = show_halo.then(|| win::ClickHalo::show(rect, hwnd));
                     }
                 }
                 Err(e) => {
@@ -2240,18 +2538,31 @@ impl App {
                 None => {}
             }
         } else if toggle_pause
-            && let Some(session) = self.video.as_mut().and_then(|v| v.recorder.as_mut())
+            && let Some(video) = &mut self.video
+            && let Some(session) = &mut video.recorder
         {
-            let result = if session.is_paused() {
+            let was_paused = session.is_paused();
+            let result = if was_paused {
                 session.resume()
             } else {
                 session.pause()
             };
-            if let Err(e) = result {
-                self.status = tf!(
-                    "Não foi possível pausar ou continuar: {e}",
-                    "Could not pause or resume: {e}"
-                );
+            match result {
+                Ok(()) => {
+                    if was_paused {
+                        if self.cfg.video_highlight_clicks {
+                            video.halo = Some(win::ClickHalo::show(rect, hwnd));
+                        }
+                    } else {
+                        video.halo = None;
+                    }
+                }
+                Err(e) => {
+                    self.status = tf!(
+                        "Não foi possível pausar ou continuar: {e}",
+                        "Could not pause or resume: {e}"
+                    );
+                }
             }
         } else if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) && idle {
             self.leave_pano_hud(&ctx);
@@ -2680,16 +2991,30 @@ impl App {
         let accent = self.accent();
         let Some(Selecting { quick: Some(quick), .. }) = &mut self.selecting else { return };
         // Conversion between interface points and screen pixels, to readjust the area.
-        let scale = ctx.pixels_per_point();
+        let fallback_scale = ctx.pixels_per_point();
         let desktop = win::virtual_screen();
-        let (ox, oy) = win::client_origin(hwnd).unwrap_or((desktop.0, desktop.1));
+        let (ox, oy, scale_x, scale_y) = match win::client_rect_screen(hwnd) {
+            Some((cl, ct, cr, cb)) if rect.width() >= 1.0 && rect.height() >= 1.0 => (
+                cl,
+                ct,
+                (cr - cl) as f32 / rect.width(),
+                (cb - ct) as f32 / rect.height(),
+            ),
+            _ => {
+                let (ox, oy) = win::client_origin(hwnd).unwrap_or((desktop.0, desktop.1));
+                (ox, oy, fallback_scale, fallback_scale)
+            }
+        };
         let to_px = |p: Pos2| -> (i32, i32) {
-            (ox + ((p.x - rect.min.x) * scale).round() as i32, oy + ((p.y - rect.min.y) * scale).round() as i32)
+            (
+                ox + ((p.x - rect.min.x) * scale_x).round() as i32,
+                oy + ((p.y - rect.min.y) * scale_y).round() as i32,
+            )
         };
         let px_to_screen = |r: win::PxRect| {
             Rect::from_min_max(
-                rect.min + egui::vec2((r.0 - ox) as f32 / scale, (r.1 - oy) as f32 / scale),
-                rect.min + egui::vec2((r.2 - ox) as f32 / scale, (r.3 - oy) as f32 / scale),
+                rect.min + egui::vec2((r.0 - ox) as f32 / scale_x, (r.1 - oy) as f32 / scale_y),
+                rect.min + egui::vec2((r.2 - ox) as f32 / scale_x, (r.3 - oy) as f32 / scale_y),
             )
         };
         let pointer = ctx.pointer_latest_pos();
@@ -2811,7 +3136,7 @@ impl App {
         } else {
             area.left_bottom() + egui::vec2(8.0, -BAR_H - 8.0)
         };
-        pos.x = pos.x.min(rect.max.x - 900.0).max(rect.min.x + 4.0);
+        pos.x = pos.x.min(rect.max.x - 960.0).max(rect.min.x + 4.0);
         let mut action = None;
         egui::Area::new(egui::Id::unique("quick_bar"))
             .order(egui::Order::Foreground)
@@ -2823,6 +3148,16 @@ impl App {
                         ui.separator();
                         if ui.button(t!("📋 Copiar", "📋 Copy")).on_hover_text(t!("Copia e fecha (Enter ou Ctrl C)", "Copies and closes (Enter or Ctrl C)")).clicked() {
                             action = Some(QuickAction::Copy);
+                        }
+                        if ui
+                            .button(t!("📌 Fixar", "📌 Pin"))
+                            .on_hover_text(t!(
+                                "Fixa na tela sempre visível (P)",
+                                "Pins on top of the screen (P)"
+                            ))
+                            .clicked()
+                        {
+                            action = Some(QuickAction::Pin);
                         }
                         if ui.button(t!("💾 Salvar", "💾 Save")).on_hover_text("Ctrl S").clicked() {
                             action = Some(QuickAction::Save);
@@ -2845,6 +3180,8 @@ impl App {
                     || copy
                 {
                     Some(QuickAction::Copy)
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::P) {
+                    Some(QuickAction::Pin)
                 } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
                     Some(QuickAction::Save)
                 } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::E) {
@@ -2857,11 +3194,12 @@ impl App {
             });
         }
         if let Some(action) = action {
-            self.finish_quick(&ctx, action);
+            let (a, b) = (to_px(area.min), to_px(area.max));
+            self.finish_quick(&ctx, action, (a.0, a.1, b.0, b.1));
         }
     }
 
-    fn finish_quick(&mut self, ctx: &egui::Context, action: QuickAction) {
+    fn finish_quick(&mut self, ctx: &egui::Context, action: QuickAction, px_rect: win::PxRect) {
         let Some(sel) = self.selecting.as_mut() else { return };
         let title = sel.title.clone();
         let Some(quick) = sel.quick.take() else { return };
@@ -2879,6 +3217,29 @@ impl App {
                     sel.was_on_screen = false;
                 }
                 self.dismiss_selection(ctx);
+            }
+            QuickAction::Pin => {
+                let mut editor = quick.editor;
+                editor.commit_pending_text();
+                let img = editor.image().clone();
+                let acc = self.accent();
+                self.adopt_editor(ctx, editor, title);
+                if let Some(sel) = &mut self.selecting {
+                    sel.was_on_screen = false;
+                }
+                self.dismiss_selection(ctx);
+                if let Err(e) = pin::spawn(img, [acc.r(), acc.g(), acc.b()], Some(px_rect)) {
+                    self.status = tf!(
+                        "Não foi possível fixar na tela: {e}",
+                        "Could not pin to screen: {e}"
+                    );
+                } else {
+                    self.status = t!(
+                        "Captura fixada na tela (arraste para mover, Esc fecha).",
+                        "Capture pinned to screen (drag to move, Esc closes)."
+                    )
+                    .to_owned();
+                }
             }
             QuickAction::Save => {
                 self.adopt_editor(ctx, quick.editor, title);
@@ -3006,15 +3367,29 @@ impl App {
         ctx.request_repaint();
 
         // Conversion between interface points and screen pixels.
-        let scale = ctx.pixels_per_point();
-        let (ox, oy) = win::client_origin(hwnd).unwrap_or((desktop.0, desktop.1));
+        let fallback_scale = ctx.pixels_per_point();
+        let (ox, oy, scale_x, scale_y) = match win::client_rect_screen(hwnd) {
+            Some((cl, ct, cr, cb)) if rect.width() >= 1.0 && rect.height() >= 1.0 => (
+                cl,
+                ct,
+                (cr - cl) as f32 / rect.width(),
+                (cb - ct) as f32 / rect.height(),
+            ),
+            _ => {
+                let (ox, oy) = win::client_origin(hwnd).unwrap_or((desktop.0, desktop.1));
+                (ox, oy, fallback_scale, fallback_scale)
+            }
+        };
         let to_px = |p: Pos2| -> (i32, i32) {
-            (ox + ((p.x - rect.min.x) * scale).round() as i32, oy + ((p.y - rect.min.y) * scale).round() as i32)
+            (
+                ox + ((p.x - rect.min.x) * scale_x).round() as i32,
+                oy + ((p.y - rect.min.y) * scale_y).round() as i32,
+            )
         };
         let px_to_screen = |r: win::PxRect| {
             Rect::from_min_max(
-                rect.min + egui::vec2((r.0 - ox) as f32 / scale, (r.1 - oy) as f32 / scale),
-                rect.min + egui::vec2((r.2 - ox) as f32 / scale, (r.3 - oy) as f32 / scale),
+                rect.min + egui::vec2((r.0 - ox) as f32 / scale_x, (r.1 - oy) as f32 / scale_y),
+                rect.min + egui::vec2((r.2 - ox) as f32 / scale_x, (r.3 - oy) as f32 / scale_y),
             )
         };
 
@@ -3130,6 +3505,37 @@ impl App {
             }
         }
 
+        // Arrow keys nudge an armed region by 1 px (or 10 px with Shift), clamped inside `rect`.
+        if let Some(area) = drawn
+            && adjust.is_none()
+        {
+            let delta = ctx.input_mut(|i| {
+                let (mods, step) = if i.modifiers.shift {
+                    (egui::Modifiers::SHIFT, 10.0)
+                } else {
+                    (egui::Modifiers::NONE, 1.0)
+                };
+                let mut dx = 0.0f32;
+                let mut dy = 0.0f32;
+                if i.consume_key(mods, egui::Key::ArrowLeft) {
+                    dx -= step / scale_x;
+                }
+                if i.consume_key(mods, egui::Key::ArrowRight) {
+                    dx += step / scale_x;
+                }
+                if i.consume_key(mods, egui::Key::ArrowUp) {
+                    dy -= step / scale_y;
+                }
+                if i.consume_key(mods, egui::Key::ArrowDown) {
+                    dy += step / scale_y;
+                }
+                egui::vec2(dx, dy)
+            });
+            if delta != egui::Vec2::ZERO {
+                drawn = Some(clamp_move(area, delta, rect));
+            }
+        }
+
         let dim = Color32::from_black_alpha(110);
         match drawn.or(drag_rect).or(hovered_window) {
             Some(s) => {
@@ -3145,7 +3551,7 @@ impl App {
                 // Nearly invisible, but not empty: makes sure a click in the middle is ours.
                 painter.rect_filled(s, 0.0, Color32::from_black_alpha(1));
                 painter.rect_stroke(s, 0.0, Stroke::new(2.0, self.accent()), StrokeKind::Inside);
-                let size = format!("{:.0} × {:.0}", s.width() * scale, s.height() * scale);
+                let size = format!("{:.0} × {:.0}", s.width() * scale_x, s.height() * scale_y);
                 let label = if drawn.is_some() {
                     tf!("{size}  •  arraste para mover, puxe as alças, Ctrl C captura", "{size}  •  drag to move, pull the handles, Ctrl C captures")
                 } else if drag_rect.is_some() {
@@ -3246,7 +3652,10 @@ impl App {
             }
             let loupe = Rect::from_min_size(min, egui::Vec2::splat(side));
             painter.rect_filled(loupe.expand(2.0), 3.0, Color32::from_gray(25));
+            let mut center_rgb: Option<[u8; 3]> = None;
             if let Some(pixels) = win::grab_pixels(cx - CELLS / 2, cy - CELLS / 2, CELLS, CELLS) {
+                let center_idx = ((CELLS / 2) * CELLS + (CELLS / 2)) as usize;
+                center_rgb = pixels.get(center_idx).copied();
                 for (i, [r, g, b]) in pixels.into_iter().enumerate() {
                     let (col, row) = ((i as i32 % CELLS) as f32, (i as i32 / CELLS) as f32);
                     let cell = Rect::from_min_size(loupe.min + egui::vec2(col, row) * CELL, egui::Vec2::splat(CELL));
@@ -3257,11 +3666,31 @@ impl App {
             let center = Rect::from_min_size(loupe.min + egui::vec2(mid, mid), egui::Vec2::splat(CELL));
             painter.rect_stroke(center, 0.0, Stroke::new(1.5, self.accent()), StrokeKind::Outside);
             painter.rect_stroke(loupe, 3.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Outside);
-            let coords = painter.layout_no_wrap(format!("{cx}, {cy}"), egui::FontId::monospace(13.0), Color32::WHITE);
-            let pos = loupe.left_bottom() + egui::vec2(4.0, 6.0);
+            let pill_text = match center_rgb {
+                Some([r, g, b]) => format!("{cx}, {cy}  •  #{r:02X}{g:02X}{b:02X}"),
+                None => format!("{cx}, {cy}"),
+            };
+            let coords = painter.layout_no_wrap(pill_text, egui::FontId::monospace(12.5), Color32::WHITE);
+            let mut pos = loupe.left_bottom() + egui::vec2(0.0, 6.0);
+            if pos.x + coords.size().x + 10.0 > rect.max.x - 4.0 {
+                pos.x = (rect.max.x - 4.0 - coords.size().x - 6.0).max(rect.min.x + 4.0);
+            }
             let bg = Rect::from_min_size(pos, coords.size()).expand2(egui::vec2(5.0, 2.0));
             painter.rect_filled(bg, 3.0, Color32::from_black_alpha(200));
             painter.galley(pos, coords, Color32::WHITE);
+
+            if let Some([r, g, b]) = center_rgb
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::C))
+            {
+                let hex = format!("#{r:02X}{g:02X}{b:02X}");
+                let _ = copy_text(&hex);
+                self.status = tf!(
+                    "Cor copiada: #{r:02X}{g:02X}{b:02X}",
+                    "Color copied: #{r:02X}{g:02X}{b:02X}"
+                );
+                self.dismiss_selection(&ctx);
+                return;
+            }
         }
 
         // Esc cancels the whole capture; the Redo button reopens the region drawing.
@@ -3628,9 +4057,25 @@ impl App {
                         }
                     } else {
                         let has_capture = self.editor.is_some();
-                        let can_read = has_capture && !self.ocr_running;
+                        let can_ocr = has_capture && !self.ocr_running && !self.redact_running;
                         if ui
-                            .add_enabled(can_read, egui::Button::new(t!("🔤 Ler texto", "🔤 Read text")))
+                            .add_enabled(
+                                can_ocr,
+                                egui::Button::new(t!("🔒 Ocultar dados", "🔒 Auto-redact")),
+                            )
+                            .on_hover_text(t!(
+                                "Detecta e desfoca automaticamente e-mails, senhas, chaves, CPFs, cartões e telefones via OCR local.",
+                                "Automatically detects and blurs emails, passwords, keys, IDs, cards, and phones via local OCR."
+                            ))
+                            .clicked()
+                            && let Some(e) = &mut self.editor
+                        {
+                            e.commit_pending_text();
+                            let image = e.image().clone();
+                            self.start_redact(&ctx, image);
+                        }
+                        if ui
+                            .add_enabled(can_ocr, egui::Button::new(t!("🔤 Ler texto", "🔤 Read text")))
                             .on_hover_text(t!(
                                 "Reconhece todo o texto da imagem e copia. Para uma área só, use a ferramenta Extrair texto.",
                                 "Recognizes all the text in the image and copies it. For a single area, use the Grab text tool."
@@ -3642,13 +4087,46 @@ impl App {
                             let image = e.image().clone();
                             self.start_ocr(&ctx, image, ocr::Mode::Printed);
                         }
-                        if ui.add_enabled(has_capture, egui::Button::new(t!("💾 Salvar PNG", "💾 Save PNG"))).clicked()
+                        let acc = self.accent();
+                        if ui
+                            .add_enabled(has_capture, egui::Button::new(t!("📌 Fixar", "📌 Pin")))
+                            .on_hover_text(t!(
+                                "Fixa a captura na tela sempre visível.",
+                                "Pins the capture on top of the screen."
+                            ))
+                            .clicked()
                             && let Some(e) = &mut self.editor
                         {
                             e.commit_pending_text();
-                            self.status = save_png(e.image());
+                            let img = e.image().clone();
+                            self.status = match pin::spawn(img, [acc.r(), acc.g(), acc.b()], None) {
+                                Ok(()) => t!(
+                                    "Captura fixada na tela (arraste para mover, Esc fecha).",
+                                    "Capture pinned to screen (drag to move, Esc closes)."
+                                )
+                                .to_owned(),
+                                Err(err) => tf!(
+                                    "Não foi possível fixar na tela: {err}",
+                                    "Could not pin to screen: {err}"
+                                ),
+                            };
                         }
-                        if ui.add_enabled(has_capture, egui::Button::new(t!("📋 Copiar", "📋 Copy"))).clicked()
+                        if ui
+                            .add_enabled(has_capture, egui::Button::new(t!("💾 Salvar…", "💾 Save…")))
+                            .on_hover_text(t!(
+                                "Salva em PNG, JPEG, WebP, PDF ou BMP (Ctrl S)",
+                                "Saves as PNG, JPEG, WebP, PDF, or BMP (Ctrl S)"
+                            ))
+                            .clicked()
+                            && let Some(e) = &mut self.editor
+                        {
+                            e.commit_pending_text();
+                            self.status = export::save_capture_dialog(e.image());
+                        }
+                        if ui
+                            .add_enabled(has_capture, egui::Button::new(t!("📋 Copiar", "📋 Copy")))
+                            .on_hover_text("Ctrl C")
+                            .clicked()
                             && let Some(e) = &mut self.editor
                         {
                             e.commit_pending_text();
@@ -3710,8 +4188,16 @@ impl App {
         if let Some(area) = self.editor.as_mut().and_then(|e| e.take_text_request()) {
             self.start_ocr(&ctx, area, ocr::Mode::Printed);
         }
+        if self.editor.as_mut().is_some_and(|e| e.take_redact_request())
+            && let Some(e) = &mut self.editor
+        {
+            let image = e.image().clone();
+            self.start_redact(&ctx, image);
+        }
         self.ocr_ui(&ctx);
+        self.poll_redact();
         self.poll_video_jobs(&ctx);
+        self.edit_meta_ui(&ctx);
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(editor) = &mut self.editor {
                 editor.canvas_ui(ui);
@@ -3728,6 +4214,42 @@ impl App {
         }
         if self.show_prefs {
             self.prefs_ui(&ctx);
+        }
+        if let Some(e) = &mut self.editor
+            && !e.is_typing()
+            && !ctx.egui_wants_keyboard_input()
+        {
+            let (save_sc, copy_sc) = ctx.input_mut(|i| {
+                let save = i.consume_key(egui::Modifiers::COMMAND, egui::Key::S);
+                let copy_ev = i.events.iter().any(|ev| matches!(ev, egui::Event::Copy));
+                let copy = i.consume_key(egui::Modifiers::COMMAND, egui::Key::C) || copy_ev;
+                (save, copy)
+            });
+            if save_sc {
+                e.commit_pending_text();
+                self.status = export::save_capture_dialog(e.image());
+            } else if copy_sc {
+                e.commit_pending_text();
+                self.status = match copy_to_clipboard(e.image()) {
+                    Ok(()) => t!(
+                        "Copiado para a área de transferência.",
+                        "Copied to the clipboard."
+                    )
+                    .to_owned(),
+                    Err(err) => tf!("Não foi possível copiar: {err}", "Could not copy: {err}"),
+                };
+            }
+        } else if self.editor.is_none()
+            && self.video_editor.is_none()
+            && !ctx.egui_wants_keyboard_input()
+        {
+            let paste = ctx.input_mut(|i| {
+                let paste_ev = i.events.iter().any(|ev| matches!(ev, egui::Event::Paste(_)));
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::V) || paste_ev
+            });
+            if paste {
+                self.open_from_clipboard(&ctx);
+            }
         }
     }
 
@@ -3863,7 +4385,46 @@ impl App {
                 });
                 ui.add_space(gap);
             }
+            ui.add_space(4.0);
+            if ui
+                .button(t!(
+                    "📋 Abrir imagem da área de transferência (Ctrl V)",
+                    "📋 Open image from clipboard (Ctrl V)"
+                ))
+                .clicked()
+            {
+                self.open_from_clipboard(ctx);
+            }
         });
+    }
+
+    fn open_from_clipboard(&mut self, ctx: &egui::Context) {
+        match arboard::Clipboard::new().and_then(|mut c| c.get_image()) {
+            Ok(img) => {
+                if let Some(rgba) =
+                    RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+                {
+                    self.set_captured(
+                        ctx,
+                        rgba,
+                        t!("Área de transferência", "Clipboard").to_owned(),
+                    );
+                } else {
+                    self.status = t!(
+                        "A imagem da área de transferência é inválida.",
+                        "The clipboard image is invalid."
+                    )
+                    .to_owned();
+                }
+            }
+            Err(_) => {
+                self.status = t!(
+                    "Nenhuma imagem encontrada na área de transferência.",
+                    "No image found in the clipboard."
+                )
+                .to_owned();
+            }
+        }
     }
 }
 
@@ -4014,7 +4575,7 @@ impl eframe::App for App {
                 self.save_requested = false;
                 if let Some(e) = &mut self.editor {
                     e.commit_pending_text();
-                    self.status = save_png(e.image());
+                    self.status = export::save_capture_dialog(e.image());
                 }
             }
             self.home_ui(ui);
@@ -4151,21 +4712,8 @@ fn copy_text(text: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn save_png(img: &RgbaImage) -> String {
-    let Some(path) = rfd::FileDialog::new()
-        .add_filter(t!("Imagem PNG", "PNG image"), &["png"])
-        .set_file_name(t!("captura.png", "capture.png"))
-        .save_file()
-    else {
-        return t!("Salvamento cancelado.", "Save canceled.").to_owned();
-    };
-    match img.save(&path) {
-        Ok(()) => tf!("Salvo em {}", "Saved to {}", path.display()),
-        Err(e) => tf!("Não foi possível salvar: {e}", "Could not save: {e}"),
-    }
-}
-
 fn main() -> eframe::Result {
+    win::enable_per_monitor_dpi();
     // Self-test mode: `snapkit --test-capture output.png` captures the screen and exits.
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 3 && args[1] == "--test-capture" {

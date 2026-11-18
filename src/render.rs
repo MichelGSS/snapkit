@@ -3,6 +3,8 @@
 //! Every coordinate here is in image pixels. An `Op` is applied directly to an `RgbaImage`; undoing
 //! means replaying the list from the original capture.
 
+use std::sync::Arc;
+
 use ab_glyph::{Font, FontArc, ScaleFont};
 use image::RgbaImage;
 use tiny_skia::{
@@ -11,6 +13,99 @@ use tiny_skia::{
 
 pub type Point = (f32, f32);
 pub type Rgba = [u8; 4];
+
+const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn encode_base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(B64_TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { B64_TABLE[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64_TABLE[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
+    let val = |b: u8| -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((b - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let clean: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if clean.len() % 4 != 0 {
+        return Err("invalid base64 length".to_owned());
+    }
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    for chunk in clean.chunks_exact(4) {
+        let a = val(chunk[0]).ok_or("invalid base64 char")?;
+        let b = val(chunk[1]).ok_or("invalid base64 char")?;
+        let c = if chunk[2] == b'=' { 0 } else { val(chunk[2]).ok_or("invalid base64 char")? };
+        let d = if chunk[3] == b'=' { 0 } else { val(chunk[3]).ok_or("invalid base64 char")? };
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        out.push(((n >> 16) & 0xFF) as u8);
+        if chunk[2] != b'=' {
+            out.push(((n >> 8) & 0xFF) as u8);
+        }
+        if chunk[3] != b'=' {
+            out.push((n & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Shared RGBA image payload for [`Op::Sticker`]. Clones in `O(1)` via `Arc` during interactive
+/// editing, and serializes as a Base64-encoded PNG inside `.layers.json`.
+#[derive(Clone)]
+pub struct StickerData(pub Arc<RgbaImage>);
+
+impl StickerData {
+    pub fn new(img: RgbaImage) -> Self {
+        Self(Arc::new(img))
+    }
+}
+
+impl std::fmt::Debug for StickerData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StickerData({}x{})", self.0.width(), self.0.height())
+    }
+}
+
+impl PartialEq for StickerData {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl serde::Serialize for StickerData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        self.0
+            .write_to(&mut png, image::ImageFormat::Png)
+            .map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&encode_base64(&png.into_inner()))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StickerData {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let b64 = String::deserialize(deserializer)?;
+        let bytes = decode_base64(&b64).map_err(serde::de::Error::custom)?;
+        let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self(Arc::new(img.to_rgba8())))
+    }
+}
 
 /// Shape of the step marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -156,6 +251,8 @@ pub enum Op {
         dashed: bool,
         #[serde(default)]
         angle: f32,
+        #[serde(default)]
+        radius: f32,
     },
     Ellipse {
         a: Point,
@@ -214,6 +311,14 @@ pub enum Op {
         color: Rgba,
         #[serde(default)]
         angle: f32,
+    },
+    /// Pasted RGBA image layer (`Ctrl+V`), movable, resizable, and rotatable.
+    Sticker {
+        a: Point,
+        b: Point,
+        #[serde(default)]
+        angle: f32,
+        image: StickerData,
     },
     /// Spotlight: darkens the whole image except the area between `a` and `b`.
     Spotlight { a: Point, b: Point },
@@ -339,7 +444,8 @@ impl Op {
             | Op::Highlight { angle, .. }
             | Op::Text { angle, .. }
             | Op::Step { angle, .. }
-            | Op::Stamp { angle, .. } => *angle,
+            | Op::Stamp { angle, .. }
+            | Op::Sticker { angle, .. } => *angle,
             _ => 0.0,
         }
     }
@@ -352,7 +458,8 @@ impl Op {
             | Op::Highlight { angle, .. }
             | Op::Text { angle, .. }
             | Op::Step { angle, .. }
-            | Op::Stamp { angle, .. } => *angle = new_angle,
+            | Op::Stamp { angle, .. }
+            | Op::Sticker { angle, .. } => *angle = new_angle,
             _ => {}
         }
     }
@@ -374,6 +481,7 @@ impl Op {
                 | Op::Text { .. }
                 | Op::Step { .. }
                 | Op::Stamp { .. }
+                | Op::Sticker { .. }
                 | Op::Arrow { .. }
                 | Op::Line { .. }
                 | Op::Pen { .. }
@@ -394,6 +502,7 @@ impl Op {
             Op::Rect { a, b, .. }
             | Op::Ellipse { a, b, .. }
             | Op::Highlight { a, b, .. }
+            | Op::Sticker { a, b, .. }
             | Op::Pixelate { a, b }
             | Op::Blur { a, b }
             | Op::Spotlight { a, b } => Some(ordered(*a, *b)),
@@ -478,10 +587,17 @@ impl Op {
             Op::Pen { points, width, .. } | Op::Erase { points, width } => {
                 points.windows(2).any(|w| segment_distance(p, w[0], w[1]) <= width / 2.0 + tol)
             }
-            Op::Rect { a, b, width, filled, .. } => {
-                let frame = ordered(*a, *b);
+            Op::Rect { a, b, width, filled, radius, .. } => {
+                let frame @ (min, max) = ordered(*a, *b);
                 let reach = width / 2.0 + tol;
-                in_box(p, frame, reach) && (*filled || !in_box(p, frame, -reach))
+                if *radius > 0.5 {
+                    let (hx, hy) = ((max.0 - min.0) / 2.0, (max.1 - min.1) / 2.0);
+                    let r = radius.min(hx).min(hy).max(0.0);
+                    let d = rounded_rect_sdf(p.0, p.1, min.0 + hx, min.1 + hy, hx, hy, r);
+                    d <= reach && (*filled || d >= -reach)
+                } else {
+                    in_box(p, frame, reach) && (*filled || !in_box(p, frame, -reach))
+                }
             }
             Op::Ellipse { a, b, width, filled, .. } => {
                 let (min, max) = ordered(*a, *b);
@@ -530,6 +646,7 @@ impl Op {
             Op::Rect { a, b, .. }
             | Op::Ellipse { a, b, .. }
             | Op::Highlight { a, b, .. }
+            | Op::Sticker { a, b, .. }
             | Op::Pixelate { a, b }
             | Op::Blur { a, b }
             | Op::Spotlight { a, b }
@@ -588,6 +705,7 @@ impl Op {
             Op::Rect { .. }
             | Op::Ellipse { .. }
             | Op::Highlight { .. }
+            | Op::Sticker { .. }
             | Op::Pixelate { .. }
             | Op::Blur { .. }
             | Op::Spotlight { .. }
@@ -651,7 +769,8 @@ impl Op {
                     | Op::Highlight { angle, .. }
                     | Op::Text { angle, .. }
                     | Op::Step { angle, .. }
-                    | Op::Stamp { angle, .. } => *angle = raw,
+                    | Op::Stamp { angle, .. }
+                    | Op::Sticker { angle, .. } => *angle = raw,
                     Op::Arrow { from, to: end, .. } | Op::Line { from, to: end, .. } => {
                         *from = rotate_point(*from, (cx, cy), raw);
                         *end = rotate_point(*end, (cx, cy), raw);
@@ -687,6 +806,23 @@ impl Op {
                     };
                     *a = corner(f, i + 2);
                     *b = to;
+                }
+            }
+            (Op::Sticker { a, b, image, .. }, Handle::Corner(i)) => {
+                if let Some(f) = frame {
+                    let to = if self.angle().abs() > 1e-4 {
+                        let c = ((f.0.0 + f.1.0) / 2.0, (f.0.1 + f.1.1) / 2.0);
+                        rotate_point(to, c, -self.angle())
+                    } else {
+                        to
+                    };
+                    let aspect = image.0.height().max(1) as f32 / image.0.width().max(1) as f32;
+                    let fixed = corner(f, i + 2);
+                    let w = (to.0 - fixed.0).abs().max(8.0);
+                    let (dir_x, dir_y) =
+                        (if to.0 >= fixed.0 { 1.0 } else { -1.0 }, if to.1 >= fixed.1 { 1.0 } else { -1.0 });
+                    *a = fixed;
+                    *b = (fixed.0 + dir_x * w, fixed.1 + dir_y * w * aspect);
                 }
             }
             (Op::Pen { points, .. } | Op::Erase { points, .. }, Handle::Corner(i)) => {
@@ -775,7 +911,8 @@ impl Op {
             | Op::Callout { color, .. }
             | Op::Stamp { color, .. }
             | Op::Step { color, .. } => Some(*color),
-            Op::Pixelate { .. }
+            Op::Sticker { .. }
+            | Op::Pixelate { .. }
             | Op::Blur { .. }
             | Op::Spotlight { .. }
             | Op::Magnify { .. }
@@ -803,7 +940,8 @@ impl Op {
             | Op::Callout { color, .. }
             | Op::Stamp { color, .. }
             | Op::Step { color, .. } => *color = new,
-            Op::Pixelate { .. }
+            Op::Sticker { .. }
+            | Op::Pixelate { .. }
             | Op::Blur { .. }
             | Op::Spotlight { .. }
             | Op::Magnify { .. }
@@ -1087,10 +1225,16 @@ pub fn apply(img: &mut RgbaImage, op: &Op, font: &FontArc) {
         Op::Line { from, to, color, width, dashed } => {
             stroke_points(img, &[*from, *to], *color, *width, *dashed);
         }
-        Op::Rect { a, b, color, width, filled, dashed, angle } => {
+        Op::Rect { a, b, color, width, filled, dashed, angle, radius } => {
             if let Some(r) = skia_rect(*a, *b) {
                 let xform = rotation_transform(*angle, ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0));
-                shape_xform(img, &PathBuilder::from_rect(r), *color, *width, *filled, *dashed, xform);
+                if *radius > 0.5 {
+                    if let Some(path) = rounded_rect_path(ordered(*a, *b), *radius) {
+                        shape_xform(img, &path, *color, *width, *filled, *dashed, xform);
+                    }
+                } else {
+                    shape_xform(img, &PathBuilder::from_rect(r), *color, *width, *filled, *dashed, xform);
+                }
             }
         }
         Op::Ellipse { a, b, color, width, filled, dashed, angle } => {
@@ -1136,6 +1280,9 @@ pub fn apply(img: &mut RgbaImage, op: &Op, font: &FontArc) {
         }
         Op::Stamp { kind, center, radius, color, angle } => {
             stamp(img, *kind, *center, *radius, *color, *angle, font);
+        }
+        Op::Sticker { a, b, angle, image } => {
+            draw_sticker(img, *a, *b, *angle, &image.0);
         }
         Op::Spotlight { a, b } => {
             let (min, max) = ordered(*a, *b);
@@ -1462,11 +1609,10 @@ fn stamp(img: &mut RgbaImage, kind: Stamp, c: Point, r: f32, color: Rgba, angle:
     }
 }
 
-fn fill_rounded(img: &mut RgbaImage, frame: (Point, Point), radius: f32, color: Rgba) {
-    fill_rounded_xform(img, frame, radius, color, Transform::identity());
-}
-
-fn fill_rounded_xform(img: &mut RgbaImage, (min, max): (Point, Point), radius: f32, color: Rgba, xform: Transform) {
+fn rounded_rect_path((min, max): (Point, Point), radius: f32) -> Option<tiny_skia::Path> {
+    if max.0 <= min.0 || max.1 <= min.1 {
+        return None;
+    }
     let r = radius.min((max.0 - min.0) / 2.0).min((max.1 - min.1) / 2.0).max(0.0);
     let mut pb = PathBuilder::new();
     pb.move_to(min.0 + r, min.1);
@@ -1479,9 +1625,103 @@ fn fill_rounded_xform(img: &mut RgbaImage, (min, max): (Point, Point), radius: f
     pb.line_to(min.0, min.1 + r);
     pb.quad_to(min.0, min.1, min.0 + r, min.1);
     pb.close();
-    if let Some(path) = pb.finish() {
+    pb.finish()
+}
+
+fn fill_rounded(img: &mut RgbaImage, frame: (Point, Point), radius: f32, color: Rgba) {
+    fill_rounded_xform(img, frame, radius, color, Transform::identity());
+}
+
+fn fill_rounded_xform(img: &mut RgbaImage, frame: (Point, Point), radius: f32, color: Rgba, xform: Transform) {
+    if let Some(path) = rounded_rect_path(frame, radius) {
         let fill = paint(color);
         with_pixmap(img, |pm| pm.fill_path(&path, &fill, FillRule::Winding, xform, None));
+    }
+}
+
+fn draw_sticker(img: &mut RgbaImage, a: Point, b: Point, angle: f32, src: &RgbaImage) {
+    let (sw, sh) = src.dimensions();
+    if sw == 0 || sh == 0 {
+        return;
+    }
+    let (min, max) = ordered(a, b);
+    let dw = (max.0 - min.0).round() as u32;
+    let dh = (max.1 - min.1).round() as u32;
+    if dw == 0 || dh == 0 || dw > MAX_SIDE || dh > MAX_SIDE {
+        return;
+    }
+    if angle.abs() <= 1e-4 {
+        if dw == sw && dh == sh {
+            image::imageops::overlay(img, src, min.0.round() as i64, min.1.round() as i64);
+        } else {
+            let filter = if dw * dh > 2_000_000 {
+                image::imageops::FilterType::Triangle
+            } else {
+                image::imageops::FilterType::CatmullRom
+            };
+            let scaled = image::imageops::resize(src, dw, dh, filter);
+            image::imageops::overlay(img, &scaled, min.0.round() as i64, min.1.round() as i64);
+        }
+        return;
+    }
+
+    let center = ((min.0 + max.0) * 0.5, (min.1 + max.1) * 0.5);
+    let corners = [
+        rotate_point(min, center, angle),
+        rotate_point((max.0, min.1), center, angle),
+        rotate_point(max, center, angle),
+        rotate_point((min.0, max.1), center, angle),
+    ];
+    let min_x = corners.iter().map(|p| p.0).fold(f32::INFINITY, f32::min).floor().max(0.0) as u32;
+    let min_y = corners.iter().map(|p| p.1).fold(f32::INFINITY, f32::min).floor().max(0.0) as u32;
+    let max_x = corners.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max).ceil().min(img.width() as f32) as u32;
+    let max_y = corners.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max).ceil().min(img.height() as f32) as u32;
+
+    let scale_x = sw as f32 / (max.0 - min.0).max(1.0);
+    let scale_y = sh as f32 / (max.1 - min.1).max(1.0);
+    let sample_premul = |sx: i32, sy: i32| -> [f32; 4] {
+        let cx = sx.clamp(0, sw as i32 - 1) as u32;
+        let cy = sy.clamp(0, sh as i32 - 1) as u32;
+        let p = src.get_pixel(cx, cy).0;
+        let a = p[3] as f32 / 255.0;
+        [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a, a]
+    };
+
+    for py in min_y..max_y {
+        for px in min_x..max_x {
+            let (ux, uy) = rotate_point((px as f32 + 0.5, py as f32 + 0.5), center, -angle);
+            if ux < min.0 || ux > max.0 || uy < min.1 || uy > max.1 {
+                continue;
+            }
+            let sx = (ux - min.0) * scale_x - 0.5;
+            let sy = (uy - min.1) * scale_y - 0.5;
+            let (x0, y0) = (sx.floor() as i32, sy.floor() as i32);
+            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+            let p00 = sample_premul(x0, y0);
+            let p10 = sample_premul(x0 + 1, y0);
+            let p01 = sample_premul(x0, y0 + 1);
+            let p11 = sample_premul(x0 + 1, y0 + 1);
+            let mut pm = [0.0f32; 4];
+            for i in 0..4 {
+                let top = p00[i] * (1.0 - fx) + p10[i] * fx;
+                let bot = p01[i] * (1.0 - fx) + p11[i] * fx;
+                pm[i] = top * (1.0 - fy) + bot * fy;
+            }
+            let src_a = pm[3].clamp(0.0, 1.0);
+            if src_a <= 1e-4 {
+                continue;
+            }
+            let dst = img.get_pixel_mut(px, py);
+            let dst_a = dst.0[3] as f32 / 255.0;
+            let out_a = src_a + dst_a * (1.0 - src_a);
+            if out_a > 0.0 {
+                let keep = dst_a * (1.0 - src_a);
+                for (d, p) in dst.0[..3].iter_mut().zip(&pm[..3]) {
+                    *d = ((*p + *d as f32 * keep) / out_a).clamp(0.0, 255.0).round() as u8;
+                }
+                dst.0[3] = (out_a * 255.0).clamp(0.0, 255.0).round() as u8;
+            }
+        }
     }
 }
 
@@ -1951,7 +2191,7 @@ mod tests {
         assert!(line.hit((50.0, 12.0), 2.0, &f));
         assert!(!line.hit((50.0, 30.0), 2.0, &f));
 
-        let rect = Op::Rect { a: (10.0, 10.0), b: (90.0, 90.0), color: RED, width: 4.0, filled: false, dashed: false, angle: 0.0 };
+        let rect = Op::Rect { a: (10.0, 10.0), b: (90.0, 90.0), color: RED, width: 4.0, filled: false, dashed: false, angle: 0.0, radius: 0.0 };
         assert!(rect.hit((10.0, 50.0), 2.0, &f), "outline");
         assert!(!rect.hit((50.0, 50.0), 2.0, &f), "the inside doesn't count as outline");
         assert!(rect.encloses((50.0, 50.0)));
@@ -1986,7 +2226,7 @@ mod tests {
         );
 
         // Dragging the top-left corner keeps the bottom-right one in place.
-        let rect = Op::Rect { a: (60.0, 60.0), b: (20.0, 20.0), color: RED, width: 4.0, filled: false, dashed: false, angle: 0.0 };
+        let rect = Op::Rect { a: (60.0, 60.0), b: (20.0, 20.0), color: RED, width: 4.0, filled: false, dashed: false, angle: 0.0, radius: 0.0 };
         let resized = rect.with_handle(Handle::Corner(0), (5.0, 10.0), &f);
         assert_eq!(resized.bounds(&f), Some(((3.0, 8.0), (62.0, 62.0))));
 
@@ -2022,7 +2262,7 @@ mod tests {
     fn filled_shapes_paint_their_inside() {
         let f = test_font();
         let mut img = white(100, 100);
-        let rect = Op::Rect { a: (10.0, 10.0), b: (90.0, 90.0), color: RED, width: 2.0, filled: true, dashed: false, angle: 0.0 };
+        let rect = Op::Rect { a: (10.0, 10.0), b: (90.0, 90.0), color: RED, width: 2.0, filled: true, dashed: false, angle: 0.0, radius: 0.0 };
         apply(&mut img, &rect, &f);
         assert_eq!(img.get_pixel(50, 50).0, RED);
         assert!(rect.hit((50.0, 50.0), 0.0, &f), "a filled shape is picked by its inside");
@@ -2081,7 +2321,7 @@ mod tests {
     fn magnify_shows_an_enlarged_copy_somewhere_else() {
         let f = test_font();
         let mut img = white(300, 200);
-        apply(&mut img, &Op::Rect { a: (40.0, 40.0), b: (60.0, 60.0), color: RED, width: 1.0, filled: true, dashed: false, angle: 0.0 }, &f);
+        apply(&mut img, &Op::Rect { a: (40.0, 40.0), b: (60.0, 60.0), color: RED, width: 1.0, filled: true, dashed: false, angle: 0.0, radius: 0.0 }, &f);
         // The 40×40 region around the square appears 2.5 times larger on the right.
         let op = Op::Magnify { src: ((30.0, 30.0), (70.0, 70.0)), a: (150.0, 50.0), b: (250.0, 150.0) };
         apply(&mut img, &op, &f);
@@ -2243,7 +2483,7 @@ mod tests {
         }
         let ops = vec![
             Op::Crop { a: (40.0, 0.0), b: (100.0, 60.0) },
-            Op::Rect { a: (0.0, 0.0), b: (60.0, 60.0), color: RED, width: 1.0, filled: true, dashed: false, angle: 0.0 },
+            Op::Rect { a: (0.0, 0.0), b: (60.0, 60.0), color: RED, width: 1.0, filled: true, dashed: false, angle: 0.0, radius: 0.0 },
             Op::Erase { points: vec![(0.0, 30.0), (60.0, 30.0)], width: 10.0 },
         ];
         let out = render_all(&original, &ops, &f);
@@ -2315,7 +2555,7 @@ mod tests {
         original.put_pixel(0, 0, image::Rgba([0, 0, 255, 255]));
         let ops = vec![
             Op::Rotate { clockwise: true },
-            Op::Rect { a: (0.0, 0.0), b: (20.0, 40.0), color: RED, width: 1.0, filled: true, dashed: false, angle: 0.0 },
+            Op::Rect { a: (0.0, 0.0), b: (20.0, 40.0), color: RED, width: 1.0, filled: true, dashed: false, angle: 0.0, radius: 0.0 },
             Op::Erase { points: vec![(15.0, 0.0), (19.5, 0.0)], width: 2.0 },
         ];
         let out = render_all(&original, &ops, &f);
@@ -2331,7 +2571,7 @@ mod tests {
         let p = (5.0, 5.0);
         for op in [
             Op::Arrow { from: p, to: p, color: RED, width: 3.0, dashed: false, double: false },
-            Op::Rect { a: p, b: p, color: RED, width: 3.0, filled: false, dashed: false, angle: 0.0 },
+            Op::Rect { a: p, b: p, color: RED, width: 3.0, filled: false, dashed: false, angle: 0.0, radius: 0.0 },
             Op::Ellipse { a: p, b: p, color: RED, width: 3.0, filled: false, dashed: false, angle: 0.0 },
             Op::Pen { points: vec![], color: RED, width: 3.0 },
             Op::Pixelate { a: p, b: p },
@@ -2380,7 +2620,7 @@ mod tests {
     fn object_rotation_handle_snaps_hits_and_renders() {
         let f = test_font();
         // Horizontal bar from (20, 45) to (80, 55), centered at (50, 50).
-        let rect = Op::Rect { a: (20.0, 45.0), b: (80.0, 55.0), color: RED, width: 2.0, filled: true, dashed: false, angle: 0.0 };
+        let rect = Op::Rect { a: (20.0, 45.0), b: (80.0, 55.0), color: RED, width: 2.0, filled: true, dashed: false, angle: 0.0, radius: 0.0 };
         let (stem, knob) = rect.rotation_handle(&f).expect("rect has rotation handle");
         assert_eq!(stem, (50.0, 45.0));
         assert_eq!(knob, (50.0, 21.0));
@@ -2457,19 +2697,19 @@ mod tests {
             Op::Pixelate { a: (105.0, 28.0), b: (270.0, 58.0) },
             Op::Highlight { a: (25.0, 68.0), b: (420.0, 100.0), color: [255, 235, 60, 255], angle: 0.0 },
             Op::Arrow { from: (60.0, 300.0), to: (250.0, 170.0), color: RED, width: 5.0, dashed: false, double: false },
-            Op::Rect { a: (300.0, 140.0), b: (450.0, 230.0), color: blue, width: 4.0, filled: false, dashed: false, angle: 0.0 },
+            Op::Rect { a: (300.0, 140.0), b: (450.0, 230.0), color: blue, width: 4.0, filled: false, dashed: false, angle: 0.0, radius: 12.0 },
             Op::Ellipse { a: (470.0, 140.0), b: (610.0, 230.0), color: [52, 199, 89, 255], width: 4.0, filled: false, dashed: false, angle: 0.0 },
             Op::Line { from: (300.0, 260.0), to: (610.0, 260.0), color: [255, 138, 76, 255], width: 8.0, dashed: false },
             Op::Pen { points: (0..60).map(|i| (300.0 + i as f32 * 5.0, 310.0 + (i as f32 * 0.5).sin() * 18.0)).collect(), color: blue, width: 3.0 },
             Op::Text { pos: (60.0, 310.0), text: "Hello!".into(), color: RED, size: 30.0, boxed: false, angle: 0.0 },
-            Op::Rect { a: (20.0, 120.0), b: (90.0, 160.0), color: blue, width: 4.0, filled: true, dashed: false, angle: 0.0 },
+            Op::Rect { a: (20.0, 120.0), b: (90.0, 160.0), color: blue, width: 4.0, filled: true, dashed: false, angle: 0.0, radius: 8.0 },
             Op::Ellipse { a: (100.0, 120.0), b: (170.0, 160.0), color: [52, 199, 89, 255], width: 4.0, filled: true, dashed: false, angle: 0.0 },
             Op::Blur { a: (25.0, 25.0), b: (100.0, 60.0) },
             Op::Text { pos: (30.0, 190.0), text: "Text with a background\nand two lines".into(), color: [255, 255, 255, 255], size: 18.0, boxed: true, angle: 0.0 },
             Op::Callout { tip: (375.0, 185.0), pos: (180.0, 225.0), text: "A callout that\npoints".into(), color: [255, 138, 76, 255], size: 18.0, style: CalloutStyle::Rounded },
             Op::Magnify { src: ((55.0, 305.0), (115.0, 340.0)), a: (500.0, 280.0), b: (620.0, 350.0) },
             Op::Arrow { from: (200.0, 300.0), to: (290.0, 340.0), color: blue, width: 4.0, dashed: true, double: true },
-            Op::Rect { a: (455.0, 125.0), b: (625.0, 245.0), color: RED, width: 3.0, filled: false, dashed: true, angle: 0.0 },
+            Op::Rect { a: (455.0, 125.0), b: (625.0, 245.0), color: RED, width: 3.0, filled: false, dashed: true, angle: 0.0, radius: 0.0 },
             Op::Stamp { kind: Stamp::Check, center: (30.0, 255.0), radius: 14.0, color: [52, 199, 89, 255], angle: 0.0 },
             Op::Stamp { kind: Stamp::Cross, center: (64.0, 255.0), radius: 14.0, color: RED, angle: 0.0 },
             Op::Stamp { kind: Stamp::Warning, center: (98.0, 255.0), radius: 14.0, color: [255, 214, 10, 255], angle: 0.0 },
@@ -2497,5 +2737,64 @@ mod tests {
             apply(&mut img, &op, &f);
         }
         img.save("target/demo.png").unwrap();
+    }
+
+    #[test]
+    fn rounded_rect_leaves_outer_corners_unpainted_and_hits_curved_border() {
+        let f = test_font();
+        let mut img = white(100, 100);
+        let op = Op::Rect {
+            a: (10.0, 10.0),
+            b: (90.0, 90.0),
+            color: RED,
+            width: 4.0,
+            filled: true,
+            dashed: false,
+            angle: 0.0,
+            radius: 20.0,
+        };
+        apply(&mut img, &op, &f);
+        assert_eq!(img.get_pixel(50, 50).0, RED, "center is painted");
+        assert_eq!(img.get_pixel(11, 11).0, [255, 255, 255, 255], "sharp corner is rounded away");
+        assert!(op.hit((50.0, 50.0), 0.0, &f));
+        assert!(!op.hit((10.0, 10.0), 1.0, &f), "outside the rounded arc");
+    }
+
+    #[test]
+    fn sticker_round_trips_base64_png_preserves_alpha_resizes_and_rotates() {
+        let f = test_font();
+        let mut badge = RgbaImage::from_pixel(40, 20, image::Rgba([0, 180, 90, 255]));
+        // Make left 10px transparent to verify alpha compositing.
+        for y in 0..20 {
+            for x in 0..10 {
+                badge.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+            }
+        }
+        let op = Op::Sticker {
+            a: (20.0, 30.0),
+            b: (60.0, 50.0),
+            angle: 0.0,
+            image: StickerData::new(badge),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let decoded: Op = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, op);
+
+        let mut canvas = white(100, 100);
+        apply(&mut canvas, &decoded, &f);
+        assert_eq!(canvas.get_pixel(24, 40).0, [255, 255, 255, 255], "transparent part keeps white canvas");
+        assert_eq!(canvas.get_pixel(45, 40).0, [0, 180, 90, 255], "opaque part paints green");
+
+        // Corner drag preserves 2:1 aspect ratio.
+        let resized = decoded.with_handle(Handle::Corner(2), (100.0, 999.0), &f);
+        let Op::Sticker { a, b, .. } = &resized else { panic!() };
+        assert_eq!((*a, *b), ((20.0, 30.0), (100.0, 70.0)));
+
+        // Rotated 90° clockwise renders cleanly.
+        let mut rot = decoded.clone();
+        rot.set_angle(std::f32::consts::FRAC_PI_2);
+        let mut rot_canvas = white(100, 100);
+        apply(&mut rot_canvas, &rot, &f);
+        assert!(rot_canvas.pixels().any(|p| p.0 == [0, 180, 90, 255]));
     }
 }

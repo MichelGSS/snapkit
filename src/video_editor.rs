@@ -61,6 +61,8 @@ struct FrameWorkerShared {
     ready_frame: Mutex<Option<(f64, RgbaImage)>>,
     /// Decoded filmstrip thumbnails once the background filmstrip job finishes.
     ready_filmstrip: Mutex<Option<Vec<RgbaImage>>>,
+    /// Normalized audio waveform bars (`0.0..=1.0`) once extracted in the background.
+    ready_waveform: Mutex<Option<Vec<f32>>>,
     /// Updated probe metadata if probing completed or reloaded asynchronously.
     ready_info: Mutex<Option<record::VideoInfo>>,
     /// True while a worker thread is actively extracting frames.
@@ -80,6 +82,8 @@ pub struct VideoEditor {
     trim_end: f64,
     is_playing: bool,
     stream: Option<record::FrameStream>,
+    audio_player: Option<crate::audio::AudioPlayer>,
+    audio_muted: Arc<AtomicBool>,
     last_requested_frame: f64,
     timeline_drag: Option<TimelineDrag>,
 
@@ -100,6 +104,7 @@ pub struct VideoEditor {
     preview_tex: Option<TextureHandle>,
     filmstrip_tex: Vec<TextureHandle>,
     filmstrip_loading: bool,
+    waveform: Vec<f32>,
 
     // Background worker coordination
     worker: Arc<FrameWorkerShared>,
@@ -141,6 +146,7 @@ impl VideoEditor {
             requested_secs: Mutex::new(None),
             ready_frame: Mutex::new(None),
             ready_filmstrip: Mutex::new(None),
+            ready_waveform: Mutex::new(None),
             ready_info: Mutex::new(None),
             worker_running: AtomicBool::new(false),
         });
@@ -156,6 +162,8 @@ impl VideoEditor {
             trim_end: duration,
             is_playing: false,
             stream: None,
+            audio_player: None,
+            audio_muted: Arc::new(AtomicBool::new(false)),
             last_requested_frame: -1.0,
             timeline_drag: None,
             speed: 1.0,
@@ -170,6 +178,7 @@ impl VideoEditor {
             preview_tex,
             filmstrip_tex: Vec::new(),
             filmstrip_loading: true,
+            waveform: Vec::new(),
             worker,
         };
 
@@ -198,19 +207,23 @@ impl VideoEditor {
         self.accent = accent;
     }
 
+    fn stop_streams(&mut self) {
+        self.is_playing = false;
+        self.stream = None;
+        self.audio_player = None;
+    }
+
     /// Marks whether a background export/overwrite job is currently running, disabling action buttons.
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
         if busy {
-            self.is_playing = false;
-            self.stream = None;
+            self.stop_streams();
         }
     }
 
     /// Re-probes the video file and reloads the preview frame and filmstrip after an in-place overwrite.
     pub fn reload_after_overwrite(&mut self, ctx: &egui::Context) {
-        self.is_playing = false;
-        self.stream = None;
+        self.stop_streams();
         if let Some(info) = record::probe(&self.path) {
             self.info = info;
         }
@@ -220,25 +233,34 @@ impl VideoEditor {
         self.trim_end = duration;
         self.speed = 1.0;
         self.mute = false;
+        self.audio_muted.store(false, Ordering::Relaxed);
         self.crop_enabled = false;
         self.crop_rect = None;
         self.crop_drag = None;
         self.filmstrip_tex.clear();
         self.filmstrip_loading = true;
+        self.waveform.clear();
         self.last_requested_frame = -1.0;
 
         self.spawn_initial_loaders(ctx);
         self.request_frame(ctx, 0.0);
     }
 
-    /// Spawns background threads to load the filmstrip thumbnails and re-verify probe metadata.
+    /// Spawns background threads to load the filmstrip thumbnails, audio waveform, and probe metadata.
     fn spawn_initial_loaders(&self, ctx: &egui::Context) {
         let path = self.path.clone();
         let worker = self.worker.clone();
         let ctx_clone = ctx.clone();
         std::thread::spawn(move || {
+            let mut has_audio = false;
             if let Some(probed) = record::probe(&path) {
+                has_audio = probed.has_audio;
                 *worker.ready_info.lock().unwrap() = Some(probed);
+                ctx_clone.request_repaint();
+            }
+            if has_audio {
+                let wf = record::extract_waveform(&path, 160);
+                *worker.ready_waveform.lock().unwrap() = Some(wf);
                 ctx_clone.request_repaint();
             }
             let thumbs = record::extract_filmstrip(&path, FILMSTRIP_COUNT, FILMSTRIP_HEIGHT);
@@ -319,7 +341,7 @@ impl VideoEditor {
     }
 
     fn start_playback(&mut self, ctx: &egui::Context) {
-        self.stream = None;
+        self.stop_streams();
         let end_limit = self.playback_end_limit();
         if self.playhead >= end_limit - 0.05 || self.playhead < self.trim_start {
             self.playhead = self.trim_start;
@@ -338,6 +360,19 @@ impl VideoEditor {
             Ok(stream) => {
                 self.stream = Some(stream);
                 self.is_playing = true;
+                if self.info.has_audio
+                    && let Some(ffmpeg) = record::find_ffmpeg()
+                {
+                    self.audio_muted.store(self.mute, Ordering::Relaxed);
+                    self.audio_player = crate::audio::AudioPlayer::start(
+                        &ffmpeg,
+                        &self.path,
+                        self.playhead,
+                        Some(end_limit),
+                        self.speed,
+                        self.audio_muted.clone(),
+                    );
+                }
             }
             Err(_) => {
                 self.is_playing = false;
@@ -347,8 +382,7 @@ impl VideoEditor {
 
     fn pause_playback(&mut self, ctx: &egui::Context) {
         let was_playing = self.is_playing || self.stream.is_some();
-        self.is_playing = false;
-        self.stream = None;
+        self.stop_streams();
         if was_playing {
             self.last_requested_frame = -1.0;
             self.request_frame(ctx, self.playhead);
@@ -365,6 +399,10 @@ impl VideoEditor {
             if (old_dur <= 0.0 || (self.trim_end - old_dur).abs() < 0.05) && self.info.duration > 0.0 {
                 self.trim_end = self.info.duration;
             }
+        }
+
+        if let Some(wf) = self.worker.ready_waveform.lock().unwrap().take() {
+            self.waveform = wf;
         }
 
         let ready_frame = self.worker.ready_frame.lock().unwrap().take();
@@ -415,8 +453,7 @@ impl VideoEditor {
                 }
             }
             if stream_done {
-                self.stream = None;
-                self.is_playing = false;
+                self.stop_streams();
                 self.playhead = self.trim_start;
                 self.last_requested_frame = -1.0;
                 self.request_frame(ctx, self.playhead);
@@ -538,6 +575,7 @@ impl VideoEditor {
                 });
             if audio_btn.clicked() {
                 self.mute = !self.mute;
+                self.audio_muted.store(self.mute, Ordering::Relaxed);
             }
 
             ui.separator();
@@ -879,8 +917,7 @@ impl VideoEditor {
             self.toggle_play(ctx);
         }
         if let Some(ts) = seek_to {
-            self.is_playing = false;
-            self.stream = None;
+            self.stop_streams();
             self.playhead = ts;
             self.last_requested_frame = -1.0;
             self.request_frame(ctx, ts);
@@ -1211,8 +1248,7 @@ impl VideoEditor {
                 ))
                 .clicked()
             {
-                self.is_playing = false;
-                self.stream = None;
+                self.stop_streams();
                 self.playhead = self.trim_start;
                 self.last_requested_frame = -1.0;
                 self.request_frame(&ctx, self.playhead);
@@ -1227,8 +1263,7 @@ impl VideoEditor {
                 ))
                 .clicked()
             {
-                self.is_playing = false;
-                self.stream = None;
+                self.stop_streams();
                 self.playhead = (self.playhead - 0.1).max(0.0);
                 self.last_requested_frame = -1.0;
                 self.request_frame(&ctx, self.playhead);
@@ -1246,8 +1281,8 @@ impl VideoEditor {
                     egui::Button::new(play_label).selected(self.is_playing),
                 )
                 .on_hover_text(t!(
-                    "Reproduz ou pausa a prévia visual do trecho (Espaço).",
-                    "Play or pause the visual clip preview (Space)."
+                    "Reproduz ou pausa a prévia visual e de áudio do trecho (Espaço).",
+                    "Play or pause the visual and audio clip preview (Space)."
                 ))
                 .clicked()
             {
@@ -1263,8 +1298,7 @@ impl VideoEditor {
                 ))
                 .clicked()
             {
-                self.is_playing = false;
-                self.stream = None;
+                self.stop_streams();
                 self.playhead = (self.playhead + 0.1).min(duration);
                 self.last_requested_frame = -1.0;
                 self.request_frame(&ctx, self.playhead);
@@ -1279,8 +1313,7 @@ impl VideoEditor {
                 ))
                 .clicked()
             {
-                self.is_playing = false;
-                self.stream = None;
+                self.stop_streams();
                 self.playhead = self.trim_end;
                 self.last_requested_frame = -1.0;
                 self.request_frame(&ctx, self.playhead);
@@ -1415,8 +1448,7 @@ impl VideoEditor {
             if response.drag_started()
                 && let Some(pos) = response.interact_pointer_pos()
             {
-                self.is_playing = false;
-                self.stream = None;
+                self.stop_streams();
                 if trim_start_hit.contains(pos) && (pos.x - start_x).abs() <= (pos.x - end_x).abs() {
                     self.timeline_drag = Some(TimelineDrag::TrimStart);
                 } else if trim_end_hit.contains(pos) {
@@ -1433,8 +1465,7 @@ impl VideoEditor {
             if (response.dragged() || response.clicked())
                 && let Some(pos) = response.interact_pointer_pos()
             {
-                self.is_playing = false;
-                self.stream = None;
+                self.stop_streams();
                 let t = x_to_time(pos.x);
                 match self.timeline_drag.unwrap_or(TimelineDrag::Playhead) {
                     TimelineDrag::TrimStart => {
@@ -1501,6 +1532,34 @@ impl VideoEditor {
                 egui::FontId::proportional(11.5),
                 Color32::from_gray(150),
             );
+        }
+
+        // Overlay audio waveform along the bottom strip of the filmstrip when audio is present
+        if !self.waveform.is_empty() && !self.mute {
+            let wf_h = (bar_rect.height() * 0.42).max(14.0);
+            let wf_rect = Rect::from_min_max(
+                Pos2::new(bar_rect.min.x, bar_rect.max.y - wf_h),
+                bar_rect.max,
+            );
+            painter.rect_filled(wf_rect, 0.0, Color32::from_black_alpha(120));
+            let n = self.waveform.len();
+            let step_x = bar_w / n as f32;
+            let bar_thick = (step_x - 1.0).clamp(1.0, 4.0);
+            let wave_color = Color32::from_rgba_unmultiplied(
+                self.accent.r(),
+                self.accent.g(),
+                self.accent.b(),
+                215,
+            );
+            for (i, &amp) in self.waveform.iter().enumerate() {
+                let h = (amp.clamp(0.0, 1.0) * (wf_h - 3.0)).max(1.5);
+                let cx = bar_rect.min.x + (i as f32 + 0.5) * step_x;
+                let r = Rect::from_min_max(
+                    Pos2::new(cx - bar_thick * 0.5, bar_rect.max.y - 1.5 - h),
+                    Pos2::new(cx + bar_thick * 0.5, bar_rect.max.y - 1.5),
+                );
+                painter.rect_filled(r, 1.0, wave_color);
+            }
         }
 
         // Darken trimmed-out regions outside [trim_start, trim_end]

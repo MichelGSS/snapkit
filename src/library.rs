@@ -43,6 +43,7 @@ pub enum MediaFilter {
     All,
     Images,
     Videos,
+    Favorites,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -59,6 +60,12 @@ pub struct Entry {
     /// Duration in seconds (`0.0` for static images, `> 0.0` for videos/GIFs).
     #[serde(default)]
     pub duration_secs: f32,
+    /// User-starred capture for quick filtering.
+    #[serde(default)]
+    pub favorite: bool,
+    /// Custom user tags (without leading `#`), searchable from the library filter bar.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl Entry {
@@ -75,9 +82,11 @@ impl Entry {
     }
 
     fn matches(&self, query_lower: &str) -> bool {
+        let q_tag = query_lower.trim_start_matches('#');
         self.title.to_lowercase().contains(query_lower)
             || self.when.contains(query_lower)
             || self.file.to_lowercase().contains(query_lower)
+            || (!q_tag.is_empty() && self.tags.iter().any(|t| t.to_lowercase().contains(q_tag)))
     }
 }
 
@@ -152,6 +161,8 @@ impl Library {
                     width,
                     height,
                     duration_secs: 0.0,
+                    favorite: false,
+                    tags: Vec::new(),
                 })
             })
             .collect();
@@ -224,6 +235,7 @@ impl Library {
                 MediaFilter::All => true,
                 MediaFilter::Images => e.is_image(),
                 MediaFilter::Videos => e.is_video(),
+                MediaFilter::Favorites => e.favorite,
             })
             .filter(|e| q.is_empty() || e.matches(&q))
             .collect()
@@ -235,6 +247,41 @@ impl Library {
         let videos = self.entries.iter().filter(|e| e.is_video()).count();
         let images = total.saturating_sub(videos);
         (total, images, videos)
+    }
+
+    /// Number of starred captures in the library.
+    pub fn favorite_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.favorite).count()
+    }
+
+    /// Toggles the favorite flag of `file`, saves the index, and returns the new state.
+    pub fn toggle_favorite(&mut self, file: &str) -> Option<bool> {
+        let e = self.entries.iter_mut().find(|e| e.file == file)?;
+        e.favorite = !e.favorite;
+        let state = e.favorite;
+        self.save_index();
+        Some(state)
+    }
+
+    /// Updates the user-editable title and normalized tags for `file`.
+    pub fn set_metadata(&mut self, file: &str, title: String, tags: Vec<String>) -> bool {
+        let Some(e) = self.entries.iter_mut().find(|e| e.file == file) else {
+            return false;
+        };
+        let clean_title = title.trim().to_owned();
+        let mut clean_tags: Vec<String> = Vec::new();
+        for raw in tags {
+            let trimmed = raw.trim().trim_start_matches('#').trim();
+            if !trimmed.is_empty() && !clean_tags.iter().any(|t| t.eq_ignore_ascii_case(trimmed)) {
+                clean_tags.push(trimmed.to_owned());
+            }
+        }
+        if e.title != clean_title || e.tags != clean_tags {
+            e.title = clean_title;
+            e.tags = clean_tags;
+            self.save_index();
+        }
+        true
     }
 
     pub fn get(&self, file: &str) -> Option<&Entry> {
@@ -288,6 +335,8 @@ impl Library {
                 width,
                 height,
                 duration_secs,
+                favorite: false,
+                tags: Vec::new(),
             },
         );
         self.save_index();
@@ -322,6 +371,8 @@ impl Library {
                     width,
                     height,
                     duration_secs,
+                    favorite: false,
+                    tags: Vec::new(),
                 },
             );
         }
@@ -937,6 +988,49 @@ mod tests {
         assert_eq!(horiz.get_pixel(10, 15).0, [255, 0, 0, 255]); // centered first image
         assert_eq!(horiz.get_pixel(42, 15).0, [30, 30, 34, 255]); // gap
         assert_eq!(horiz.get_pixel(50, 15).0, [0, 255, 0, 255]); // second image
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn favorites_tags_metadata_and_legacy_index_compat() {
+        let dir = temp_dir("favorites-tags");
+        // Write a legacy index.json without `favorite` or `tags`.
+        RgbaImage::new(16, 16).save(dir.join("2026-11-10_02-45-12.png")).unwrap();
+        RgbaImage::new(16, 16).save(dir.join("2026-11-11_09-00-00.png")).unwrap();
+        let legacy_json = r#"[
+            {"file":"2026-11-11_09-00-00.png","when":"11/11/2026 09:00","title":"Old Two","width":16,"height":16},
+            {"file":"2026-11-10_02-45-12.png","when":"10/11/2026 02:45","title":"Old One","width":16,"height":16}
+        ]"#;
+        std::fs::write(dir.join(INDEX_FILE), legacy_json).unwrap();
+
+        let mut lib = Library::open(dir.clone());
+        assert_eq!(lib.len(), 2);
+        assert_eq!(lib.favorite_count(), 0);
+        assert!(lib.search_filtered("", MediaFilter::Favorites).is_empty());
+
+        assert_eq!(lib.toggle_favorite("2026-11-10_02-45-12.png"), Some(true));
+        assert_eq!(lib.favorite_count(), 1);
+        assert_eq!(lib.search_filtered("", MediaFilter::Favorites).len(), 1);
+        assert_eq!(lib.toggle_favorite("missing.png"), None);
+
+        assert!(lib.set_metadata(
+            "2026-11-10_02-45-12.png",
+            "  Login Bug  ".into(),
+            vec!["#bug".into(), "UI".into(), "bug".into(), "  ".into(), "#sprint-4".into()],
+        ));
+        assert!(!lib.set_metadata("missing.png", "X".into(), vec![]));
+
+        let reopened = Library::open(dir.clone());
+        assert_eq!(reopened.favorite_count(), 1);
+        let e = reopened.get("2026-11-10_02-45-12.png").unwrap();
+        assert!(e.favorite);
+        assert_eq!(e.title, "Login Bug");
+        assert_eq!(e.tags, vec!["bug", "UI", "sprint-4"]);
+
+        assert_eq!(reopened.search("#bug").len(), 1);
+        assert_eq!(reopened.search("sprint-4").len(), 1);
+        assert_eq!(reopened.search_filtered("#ui", MediaFilter::Favorites).len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

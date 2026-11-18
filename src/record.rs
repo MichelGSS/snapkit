@@ -59,10 +59,10 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
 
 fn ffmpeg_command(ffmpeg: &Path) -> Command {
     let mut cmd = Command::new(ffmpeg);
-    cmd.creation_flags(CREATE_NO_WINDOW)
-        // Without this, Windows "lies" about the screen coordinates to FFmpeg on monitors scaled
-        // other than 100%, and the recorded area would come out shifted and blurry.
-        .env("__COMPAT_LAYER", "HighDpiAware");
+    // Bundled `ffmpeg.exe` embeds `<dpiAwareness>PerMonitorV2</dpiAwareness>` in its manifest;
+    // clearing `__COMPAT_LAYER` ensures an inherited `HighDpiAware` AppCompat shim never downgrades
+    // it to single-monitor System DPI on mixed-scaling multi-monitor setups.
+    cmd.creation_flags(CREATE_NO_WINDOW).env_remove("__COMPAT_LAYER");
     cmd
 }
 
@@ -885,6 +885,64 @@ impl Default for VideoEditOptions {
     }
 }
 
+/// Public wrapper around [`atempo_filter`] used by [`crate::audio::AudioPlayer`].
+pub fn atempo_filter_str(speed: f64) -> String {
+    atempo_filter(speed)
+}
+
+/// Computes normalized (`0.0..=1.0`) peak/RMS waveform bars from mono float samples.
+pub fn waveform_buckets(samples: &[f32], buckets: usize) -> Vec<f32> {
+    let n = buckets.max(1);
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![0.0f32; n];
+    let len = samples.len();
+    for (b, slot) in out.iter_mut().enumerate() {
+        let s0 = b * len / n;
+        let s1 = ((b + 1) * len / n).max(s0 + 1).min(len);
+        let mut sum_sq = 0.0f32;
+        let mut peak = 0.0f32;
+        for &s in &samples[s0..s1] {
+            let v = if s.is_finite() { s.abs().min(1.5) } else { 0.0 };
+            sum_sq += v * v;
+            peak = peak.max(v);
+        }
+        let rms = (sum_sq / (s1 - s0) as f32).sqrt();
+        *slot = rms * 0.65 + peak * 0.35;
+    }
+    let max_val = out.iter().copied().fold(0.0f32, f32::max);
+    if max_val > 1e-4 {
+        let norm = max_val.max(0.08);
+        for v in &mut out {
+            *v = (*v / norm).clamp(0.0, 1.0);
+        }
+    } else {
+        out.fill(0.0);
+    }
+    out
+}
+
+/// Decodes the audio stream of `video` at 4 kHz mono and returns `buckets` normalized amplitude
+/// values (`0.0..=1.0`) for timeline visualization.
+pub fn extract_waveform(video: &Path, buckets: usize) -> Vec<f32> {
+    let Some(ffmpeg) = find_ffmpeg() else { return Vec::new() };
+    let Ok(output) = ffmpeg_command(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(video)
+        .args(["-vn", "-ac", "1", "-ar", "4000", "-f", "f32le", "-"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() || output.stdout.len() < 4 {
+        return Vec::new();
+    }
+    let (chunks, _) = output.stdout.as_chunks::<4>();
+    let samples: Vec<f32> = chunks.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    waveform_buckets(&samples, buckets)
+}
+
 fn atempo_filter(speed: f64) -> String {
     let mut remaining = speed.clamp(0.25, 4.0);
     let mut stages = Vec::new();
@@ -1303,5 +1361,19 @@ Input #0, mov,mp4, from 'silent.mp4':
         assert!(!description.contains("Audio:"), "{description}");
         assert!(fps(&description) > 25.0, "{description}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waveform_buckets_normalizes_peaks_and_handles_silence() {
+        assert!(waveform_buckets(&[], 16).is_empty());
+        assert_eq!(waveform_buckets(&[0.0; 100], 8), vec![0.0; 8]);
+        let mut samples = vec![0.02f32; 400];
+        for s in &mut samples[100..200] {
+            *s = 0.8;
+        }
+        let bars = waveform_buckets(&samples, 4);
+        assert_eq!(bars.len(), 4);
+        assert!((bars[1] - 1.0).abs() < 1e-4, "loudest quarter normalizes to 1.0: {bars:?}");
+        assert!(bars[0] < 0.1 && bars[2] < 0.1, "{bars:?}");
     }
 }

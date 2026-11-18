@@ -99,12 +99,387 @@ pub fn recognize(img: &RgbaImage, mode: Mode) -> Result<(String, Engine), String
 
 /// A recognized word and its rectangle in the image.
 #[derive(Clone, Debug, PartialEq)]
-struct Word {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    text: String,
+pub struct WordBox {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub text: String,
+}
+
+type Word = WordBox;
+
+/// Recognizes words in `img` and returns their bounding boxes in `img` pixel coordinates.
+pub fn recognize_boxes(img: &RgbaImage) -> Result<Vec<WordBox>, String> {
+    if img.width() == 0 || img.height() == 0 {
+        return Ok(Vec::new());
+    }
+    let mut tess_err = None;
+    if let Some(dir) = find_tesseract() {
+        match tesseract_words_in_image_coords(&dir, img) {
+            Ok(words) => return Ok(words),
+            Err(e) => tess_err = Some(e),
+        }
+    }
+    if let Some(dir) = crate::neural::find_models() {
+        let lines = crate::neural::recognize(&dir, img)?;
+        return Ok(lines
+            .into_iter()
+            .map(|l| WordBox { x: l.x, y: l.y, w: l.w, h: l.h, text: l.text })
+            .collect());
+    }
+    if let Some(e) = tess_err {
+        return Err(e);
+    }
+    Err(t!(
+        "nenhum motor de OCR encontrado (pastas tesseract e ocr-neural)",
+        "no OCR engine found (tesseract and ocr-neural folders)"
+    )
+    .to_owned())
+}
+
+/// Scans `img` locally with OCR and returns `(x1, y1, x2, y2)` pixel rectangles covering sensitive
+/// data (emails, API keys/tokens, passwords after labels, credit cards, CPF/CNPJ, phones, IPs).
+pub fn find_sensitive_regions(img: &RgbaImage) -> Result<Vec<(f32, f32, f32, f32)>, String> {
+    let words = recognize_boxes(img)?;
+    let (iw, ih) = (img.width() as f32, img.height() as f32);
+    let raw = detect_sensitive_boxes(&words);
+    Ok(raw
+        .into_iter()
+        .filter_map(|(x1, y1, x2, y2)| {
+            let h = (y2 - y1).max(4.0);
+            let pad_x = (h * 0.18).clamp(3.0, 8.0);
+            let pad_y = (h * 0.14).clamp(2.0, 6.0);
+            let ax = (x1 - pad_x).clamp(0.0, iw);
+            let ay = (y1 - pad_y).clamp(0.0, ih);
+            let bx = (x2 + pad_x).clamp(0.0, iw);
+            let by = (y2 + pad_y).clamp(0.0, ih);
+            (bx - ax >= 4.0 && by - ay >= 4.0).then_some((ax, ay, bx, by))
+        })
+        .collect())
+}
+
+fn tesseract_words_in_image_coords(dir: &Path, img: &RgbaImage) -> Result<Vec<Word>, String> {
+    let scale = if img.width() * 3 <= 9000 {
+        3
+    } else if img.width() * 2 <= 9000 {
+        2
+    } else {
+        1
+    };
+    let max = 30_000u32;
+    let scaled_w = img.width() * scale;
+    let scaled_h = img.height() * scale;
+    let (eff_w, eff_h, eff_scale) = if scaled_w > max {
+        let h = (scaled_h as u64 * max as u64 / scaled_w as u64).max(1) as u32;
+        (max, h, max as f32 / img.width().max(1) as f32)
+    } else {
+        (scaled_w, scaled_h, scale as f32)
+    };
+    let pad_x = if eff_w < MIN_SIDE { (MIN_SIDE - eff_w) / 2 } else { 0 } as f32;
+    let pad_y = if eff_h < MIN_SIDE { (MIN_SIDE - eff_h) / 2 } else { 0 } as f32;
+
+    let words = tesseract_words(dir, img)?;
+    Ok(words
+        .into_iter()
+        .map(|w| Word {
+            x: ((w.x - pad_x) / eff_scale).max(0.0),
+            y: ((w.y - pad_y) / eff_scale).max(0.0),
+            w: (w.w / eff_scale).max(1.0),
+            h: (w.h / eff_scale).max(1.0),
+            text: w.text,
+        })
+        .collect())
+}
+
+fn trim_token(s: &str) -> &str {
+    s.trim_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '“' | '”' | '‘' | '’' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+        )
+    })
+}
+
+fn is_email(s: &str) -> bool {
+    let s = trim_token(s).trim_end_matches('.');
+    let Some((local, domain)) = s.split_once('@') else { return false };
+    if local.is_empty() || domain.len() < 3 || domain.contains('@') {
+        return false;
+    }
+    let Some((host, tld)) = domain.rsplit_once('.') else { return false };
+    !host.is_empty()
+        && tld.len() >= 2
+        && tld.chars().all(|c| c.is_ascii_alphabetic())
+        && local.chars().all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c))
+}
+
+fn is_ipv4(s: &str) -> bool {
+    let s = trim_token(s);
+    // Strip optional :port
+    let ip = match s.rsplit_once(':') {
+        Some((left, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => left,
+        _ => s,
+    };
+    let parts: Vec<&str> = ip.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| !p.is_empty() && p.len() <= 3 && p.parse::<u8>().is_ok())
+}
+
+fn is_cpf_or_cnpj(s: &str) -> bool {
+    let s = trim_token(s);
+    let b = s.as_bytes();
+    // CPF: ddd.ddd.ddd-dd (14 chars)
+    let is_cpf = b.len() == 14
+        && b[3] == b'.'
+        && b[7] == b'.'
+        && b[11] == b'-'
+        && b.iter().enumerate().all(|(i, c)| matches!(i, 3 | 7 | 11) || c.is_ascii_digit());
+    // CNPJ: dd.ddd.ddd/dddd-dd (18 chars)
+    let is_cnpj = b.len() == 18
+        && b[2] == b'.'
+        && b[6] == b'.'
+        && b[10] == b'/'
+        && b[15] == b'-'
+        && b.iter().enumerate().all(|(i, c)| matches!(i, 2 | 6 | 10 | 15) || c.is_ascii_digit());
+    is_cpf || is_cnpj
+}
+
+fn is_api_key_or_token(s: &str) -> bool {
+    let s = trim_token(s);
+    if s.len() < 12 {
+        return false;
+    }
+    // Check inline key=value or token=... assignments
+    let lower = s.to_ascii_lowercase();
+    for k in ["api_key=", "apikey=", "secret=", "token=", "password=", "senha=", "access_key=", "client_secret="] {
+        if let Some(pos) = lower.find(k)
+            && s.len() > pos + k.len() + 3
+        {
+            return true;
+        }
+    }
+    const PREFIXES: &[&str] = &[
+        "sk-",
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "pk_live_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "github_pat_",
+        "AIza",
+        "AKIA",
+        "ASIA",
+        "xoxb-",
+        "xoxp-",
+        "glpat-",
+    ];
+    if PREFIXES.iter().any(|p| s.starts_with(p)) && s.len() >= 14 {
+        return true;
+    }
+    if s.starts_with("eyJ") && s.len() >= 20 && s.contains('.') {
+        return true;
+    }
+    // Long high-entropy secret token (24+ token chars, mixes upper/lower/digits, not a URL/path)
+    if s.len() >= 24
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !lower.starts_with("http")
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+    {
+        let has_alpha = s.chars().any(|c| c.is_ascii_alphabetic());
+        let has_digit = s.chars().any(|c| c.is_ascii_digit());
+        let has_upper = s.chars().any(|c| c.is_ascii_uppercase());
+        let has_lower = s.chars().any(|c| c.is_ascii_lowercase());
+        let hex_only = s.len() >= 32 && s.chars().all(|c| c.is_ascii_hexdigit());
+        if hex_only || (has_alpha && has_digit && (has_upper && has_lower || s.len() >= 28)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_secret_label(s: &str) -> bool {
+    let clean = trim_token(s)
+        .trim_end_matches([':', '='])
+        .to_ascii_lowercase();
+    matches!(
+        clean.as_str(),
+        "password"
+            | "passwd"
+            | "pwd"
+            | "senha"
+            | "secret"
+            | "segredo"
+            | "api_key"
+            | "apikey"
+            | "api-key"
+            | "access_key"
+            | "private_key"
+            | "client_secret"
+            | "auth_token"
+            | "token"
+            | "bearer"
+            | "chave"
+    )
+}
+
+fn luhn_valid(digits: &[u8]) -> bool {
+    if !(13..=19).contains(&digits.len()) {
+        return false;
+    }
+    // Reject all-identical digits like 0000000000000
+    if digits.iter().all(|&d| d == digits[0]) {
+        return false;
+    }
+    let mut sum = 0u32;
+    for (i, &d) in digits.iter().rev().enumerate() {
+        let mut v = (d - b'0') as u32;
+        if i % 2 == 1 {
+            v *= 2;
+            if v > 9 {
+                v -= 9;
+            }
+        }
+        sum += v;
+    }
+    sum.is_multiple_of(10)
+}
+
+fn looks_like_phone_span(tokens: &[&str]) -> bool {
+    let joined = tokens.join(" ");
+    let trimmed = trim_token(&joined);
+    if !trimmed.chars().all(|c| c.is_ascii_digit() || " +-().–".contains(c)) {
+        return false;
+    }
+    let digits: usize = trimmed.chars().filter(|c| c.is_ascii_digit()).count();
+    let has_sep = trimmed.contains('-') || trimmed.contains('(') || trimmed.starts_with('+');
+    has_sep && (10..=13).contains(&digits)
+}
+
+/// Pure geometric & lexical detector over recognized words: returns `(x1, y1, x2, y2)` boxes.
+pub fn detect_sensitive_boxes(words: &[WordBox]) -> Vec<(f32, f32, f32, f32)> {
+    let Some(line_h) = median(words.iter().map(|w| w.h).collect()) else {
+        return Vec::new();
+    };
+    let mut sorted: Vec<&WordBox> = words.iter().collect();
+    sorted.sort_by(|a, b| (a.y + a.h * 0.5).total_cmp(&(b.y + b.h * 0.5)));
+    let mut rows: Vec<(f32, Vec<&WordBox>)> = Vec::new();
+    for w in sorted {
+        let cy = w.y + w.h * 0.5;
+        match rows.last_mut() {
+            Some((row_cy, row)) if (cy - *row_cy).abs() < line_h * 0.55 => {
+                row.push(w);
+                *row_cy += (cy - *row_cy) / row.len() as f32;
+            }
+            _ => rows.push((cy, vec![w])),
+        }
+    }
+
+    let mut hits: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let span_box = |slice: &[&WordBox]| -> (f32, f32, f32, f32) {
+        let x1 = slice.iter().map(|w| w.x).fold(f32::INFINITY, f32::min);
+        let y1 = slice.iter().map(|w| w.y).fold(f32::INFINITY, f32::min);
+        let x2 = slice.iter().map(|w| w.x + w.w).fold(f32::NEG_INFINITY, f32::max);
+        let y2 = slice.iter().map(|w| w.y + w.h).fold(f32::NEG_INFINITY, f32::max);
+        (x1, y1, x2, y2)
+    };
+
+    for (_, mut row) in rows {
+        row.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let n = row.len();
+
+        for i in 0..n {
+            let t = row[i].text.as_str();
+            if is_email(t) || is_ipv4(t) || is_cpf_or_cnpj(t) || is_api_key_or_token(t) {
+                hits.push(span_box(&row[i..=i]));
+            }
+            // Split email across adjacent tokens (e.g. "user@" + "domain.com")
+            if i + 1 < n && row[i + 1].x - (row[i].x + row[i].w) < line_h * 1.2 {
+                let pair = format!("{}{}", row[i].text, row[i + 1].text);
+                if is_email(&pair) {
+                    hits.push(span_box(&row[i..=i + 1]));
+                }
+            }
+            // Key: Value secret label (e.g. "Password: mySecret123" or "API Key : sk_123")
+            let raw_trim = trim_token(t);
+            let has_colon = raw_trim.ends_with(':') || raw_trim.ends_with('=');
+            if is_secret_label(t) {
+                let mut val_idx = if has_colon {
+                    Some(i + 1)
+                } else if i + 1 < n && matches!(row[i + 1].text.as_str(), ":" | "=") {
+                    Some(i + 2)
+                } else {
+                    None
+                };
+                if let Some(vi) = val_idx.take().filter(|&vi| vi < n) {
+                    let val_tok = trim_token(&row[vi].text);
+                    if !val_tok.is_empty() && !is_secret_label(val_tok) {
+                        hits.push(span_box(&row[vi..=vi]));
+                    }
+                }
+            } else if i >= 1
+                && row[i - 1].text.eq_ignore_ascii_case("api")
+                && matches!(
+                    raw_trim.trim_end_matches([':', '=']).to_ascii_lowercase().as_str(),
+                    "key" | "token" | "secret"
+                )
+            {
+                let next_i = if has_colon {
+                    Some(i + 1)
+                } else if i + 1 < n && matches!(row[i + 1].text.as_str(), ":" | "=") {
+                    Some(i + 2)
+                } else {
+                    None
+                };
+                if let Some(vi) = next_i.filter(|&vi| vi < n) {
+                    hits.push(span_box(&row[vi..=vi]));
+                }
+            }
+
+            // Multi-token credit cards (Luhn) & phone numbers (1..=5 tokens)
+            for end in i..(i + 5).min(n) {
+                if end > i && row[end].x - (row[end - 1].x + row[end - 1].w) > line_h * 2.5 {
+                    break;
+                }
+                let slice = &row[i..=end];
+                let texts: Vec<&str> = slice.iter().map(|w| w.text.as_str()).collect();
+                if looks_like_phone_span(&texts) {
+                    hits.push(span_box(slice));
+                }
+                let joined = texts.join("");
+                let clean = trim_token(&joined);
+                if clean.chars().all(|c| c.is_ascii_digit() || c == '-') {
+                    let digits: Vec<u8> = clean.bytes().filter(|b| b.is_ascii_digit()).collect();
+                    if luhn_valid(&digits) {
+                        hits.push(span_box(slice));
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge overlapping or nearly touching boxes on the same line
+    hits.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.total_cmp(&b.0)));
+    let mut merged: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for b in hits {
+        if let Some(prev) = merged.iter_mut().find(|m| {
+            let v_overlap = m.1.max(b.1) < m.3.min(b.3);
+            let h_touch = b.0 <= m.2 + 4.0 && b.2 >= m.0 - 4.0;
+            v_overlap && h_touch
+        }) {
+            prev.0 = prev.0.min(b.0);
+            prev.1 = prev.1.min(b.1);
+            prev.2 = prev.2.max(b.2);
+            prev.3 = prev.3.max(b.3);
+        } else {
+            merged.push(b);
+        }
+    }
+    merged
 }
 
 // ---------------------------------------------------------------- Tesseract
@@ -584,5 +959,79 @@ three");
         assert_eq!(engine, Engine::Neural);
         assert!(text.to_lowercase().contains("segunda linha"), "text read: {text:?}");
         assert!(text.lines().count() >= 3, "text read: {text:?}");
+    }
+
+    #[test]
+    fn sensitive_detector_finds_emails_secrets_cpf_cards_phones_and_ips() {
+        let words = vec![
+            word(0, 0, "Email:"),
+            word(8, 0, "cliente@empresa.com.br"),
+            word(0, 1, "API"),
+            word(4, 1, "Key:"),
+            word(9, 1, "sk-proj-AbCdEf1234567890XyZ"),
+            word(0, 2, "CPF:"),
+            word(6, 2, "123.456.789-00"),
+            word(0, 3, "Cartão:"),
+            word(9, 3, "4532"),
+            word(14, 3, "0151"),
+            word(19, 3, "1283"),
+            word(24, 3, "0366"),
+            word(0, 4, "Tel:"),
+            word(6, 4, "(11)"),
+            word(11, 4, "98765-4321"),
+            word(0, 5, "Host:"),
+            word(7, 5, "192.168.1.42"),
+            word(0, 6, "Senha:"),
+            word(8, 6, "minhaSenhaSecreta!"),
+            word(0, 7, "Clique"),
+            word(8, 7, "em"),
+            word(12, 7, "Salvar"),
+            word(20, 7, "2026"),
+        ];
+        let boxes = detect_sensitive_boxes(&words);
+        assert_eq!(boxes.len(), 7, "expected 7 sensitive regions, got {boxes:?}");
+        // Verify none of the boxes are on row 7 ("Clique em Salvar 2026", y ~ 143)
+        assert!(boxes.iter().all(|b| b.1 < 135.0), "{boxes:?}");
+        // Verify label "Email:" at x=0..60 is NOT inside row 0's redaction box (starts at col 8 -> x=80)
+        assert_eq!(boxes[0].0, 80.0);
+    }
+
+    #[test]
+    fn find_sensitive_regions_maps_ocr_boxes_back_to_image_pixels() {
+        if crate::in_ci() {
+            return;
+        }
+        let mut img = white(640, 160);
+        let font = crate::editor::default_font();
+        render::apply(
+            &mut img,
+            &Op::Text {
+                pos: (24.0, 30.0),
+                text: "Contato: maria@exemplo.com".into(),
+                color: [20, 20, 20, 255],
+                size: 28.0,
+                boxed: false,
+                angle: 0.0,
+            },
+            &font,
+        );
+        render::apply(
+            &mut img,
+            &Op::Text {
+                pos: (24.0, 90.0),
+                text: "CPF: 123.456.789-00".into(),
+                color: [20, 20, 20, 255],
+                size: 28.0,
+                boxed: false,
+                angle: 0.0,
+            },
+            &font,
+        );
+        let boxes = find_sensitive_regions(&img).unwrap();
+        assert!(boxes.len() >= 2, "expected email and CPF boxes: {boxes:?}");
+        // Both boxes must lie after the label ("Contato:" / "CPF:") and within image bounds.
+        for &(x1, y1, x2, y2) in &boxes {
+            assert!(x1 > 70.0 && x2 <= 640.0 && y1 >= 0.0 && y2 <= 160.0, "box=({x1},{y1},{x2},{y2})");
+        }
     }
 }

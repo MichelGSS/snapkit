@@ -91,8 +91,9 @@ Press **Alt+Shift+S**, drag over what you need, annotate it right where it is, a
   <tr>
     <td valign="top">
 
-- **Region, window, full screen** and **all screens**
-- **Live overlay**: nothing freezes, windows are detected, and a magnifier helps you hit the pixel
+- **Region, window, full screen** and **all screens**, each with its own optional global shortcut
+- **Pin to screen**: float any capture always on top (`25%–400%` zoom, adjustable opacity)
+- **Live overlay**: nothing freezes, windows are detected, and a magnifier helps you hit the pixel across mixed-DPI monitors
 - **Scrolling capture**: vertical, horizontal or both, with fixed headers detected
 - **Panoramic capture**: scroll by hand in any direction
 - **Step by step**: every click becomes a numbered, captioned shot of one guide
@@ -103,18 +104,18 @@ Press **Alt+Shift+S**, drag over what you need, annotate it right where it is, a
 
 - **Quick annotation** right on the screen
 - **19 tools**: arrows, shapes, pen, text, callouts, numbered steps, 16 stamps, highlighter, spotlight, magnifier, pixelate, blur, eraser, crop, cut out
-- **Everything stays editable**: move, resize, recolor or retype any annotation later
-- **Styles** to reuse your favorite settings in one click
-- Rotate, flip, resize, border and **drop shadow**
+- **Auto-redact**: one-click local OCR blurs emails, API keys, cards, CPF/CNPJ, phones and IPs
+- **Everything stays editable**: multi-select, align and distribute, rotate, reorder (`[` / `]`), or paste clipboard images as layers (`Ctrl+V`)
+- **Styles**, eyedropper (`I`), rounded corners, frames, drop shadows and **Beautifier** background mockups
 
 </td>
     <td valign="top">
 
-- **OCR** with Tesseract (English and Portuguese) that keeps indentation and blank lines
-- A **neural engine** for handwriting
-- **Screen recording** to MP4 with system sound and microphone, pause and resume
-- **Trim** and convert to **GIF** in one window
-- **Library** of every capture, with thumbnails and search
+- **OCR** with Tesseract (English and Portuguese) that keeps indentation, plus a **neural engine** for handwriting
+- **Multi-format export**: save as **PNG, JPEG, WebP, BMP** or **PDF** (including multi-page PDFs and stitched images)
+- **Screen recording** to MP4 (`15–60` FPS) with system sound, microphone and optional click highlights
+- **Video editor**: visual filmstrip, live audio preview with waveform, trim, crop, speed (`0.5×–2×`) and **GIF** export
+- **Library** of images, MP4s and GIFs with editable layers, favorites (`★`), tags, search and drag-and-drop
 - English and Portuguese, **9 themes**, tray icon
 
 </td>
@@ -160,8 +161,11 @@ Prefer a portable app? Download `SnapKit-<version>-windows-x64.zip`, extract it 
 |---|---|
 | <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> | Start a region capture from any app |
 | <kbd>Enter</kbd> | Copy the annotated capture and close |
-| <kbd>Ctrl</kbd>+<kbd>S</kbd> | Save the capture to a file |
+| <kbd>P</kbd> | Pin the capture on top of your screen |
+| <kbd>Ctrl</kbd>+<kbd>S</kbd> | Save as PNG, JPEG, WebP, BMP or PDF |
 | <kbd>Ctrl</kbd>+<kbd>E</kbd> | Continue in the full editor |
+| <kbd>Ctrl</kbd>+<kbd>V</kbd> | Paste clipboard image as an editable layer |
+| <kbd>I</kbd> | Pick any color from the canvas (eyedropper) |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> | Undo / redo |
 | <kbd>Esc</kbd> | Cancel |
 
@@ -242,15 +246,17 @@ You need [Rust](https://rustup.rs) (stable) and the Visual Studio Build Tools wi
 |---|---|
 | `src/main.rs` | Main window, selection overlay, floating panels, preferences |
 | `src/capture.rs` | Monitor capture and window list |
-| `src/editor.rs`, `src/render.rs` | Annotation editor and image rendering |
+| `src/pin.rs` | Pin to screen: floating always-on-top reference windows |
+| `src/editor.rs`, `src/render.rs` | Annotation editor, multi-selection, alignment and image rendering |
+| `src/export.rs` | PNG, JPEG, WebP, BMP and multi-page PDF export |
 | `src/scroll.rs` | Scrolling and panoramic capture: motion detection and stitching |
 | `src/steps.rs` | Step-by-step capture |
-| `src/ocr.rs`, `src/neural.rs` | Text recognition: Tesseract, neural engine and layout |
-| `src/record.rs`, `src/audio.rs` | Video recording (FFmpeg) and audio capture |
-| `src/library.rs` | Capture library on disk |
+| `src/ocr.rs`, `src/neural.rs` | Text recognition: Tesseract, neural engine, layout and auto-redaction |
+| `src/record.rs`, `src/video_editor.rs`, `src/audio.rs` | Video recording (FFmpeg), integrated filmstrip editor and audio |
+| `src/library.rs` | Capture library, persistent annotation layers, favorites and tags |
 | `src/i18n.rs` | English and Portuguese interface texts |
-| `src/win.rs` | Direct Windows API calls |
-| `src/tray.rs`, `src/config.rs`, `src/theme.rs`, `src/autostart.rs` | Tray, preferences, themes, start with Windows |
+| `src/win.rs` | Direct Windows API calls and Per-Monitor V2 DPI handling |
+| `src/tray.rs`, `src/config.rs`, `src/theme.rs`, `src/autostart.rs`, `src/update.rs` | Tray, preferences, themes, start with Windows and updates |
 
 </details>
 

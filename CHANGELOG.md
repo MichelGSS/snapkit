@@ -2,6 +2,21 @@
 
 All notable changes to SnapKit are listed here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.7.0] - 2026-11-18
+
+### Added
+
+- **Pin to Screen**: float any capture as an always-on-top reference window (**📌 Pin** in the editor and library, or **P** in quick annotation) with cursor-anchored mouse-wheel zoom (`25%–400%`), **Ctrl** + wheel opacity (`20%–100%`), a right-click context menu, **Ctrl+C** copy, and multiple simultaneous pins.
+- **Smart Sensitive-Data Auto-Redact**: one-click local OCR detection (**🔒 Auto-redact**) of emails, API keys and tokens, passwords, credit cards (Luhn-checked), CPF/CNPJ numbers, phone numbers and IP addresses, covering matches with editable Blur or Pixelate boxes in a single undo step.
+- **Editor Pro**:
+  - Multi-selection (**Ctrl+Click**, **Shift+Click**, **Ctrl+A** and rubber-band marquee drag) with an alignment and distribution toolbar (Left, Horizontal Center, Right, Top, Vertical Middle, Bottom, Distribute Horizontally and Distribute Vertically) plus group move, recolor, duplicate and delete.
+  - Paste any clipboard image onto the canvas as a movable, resizable and rotatable layer (**Ctrl+V** or **Image** > **Paste image as layer**).
+  - Adjustable corner radius (`0–64 px`) for rectangles, annotation rotation with **Shift** 45° snap, Z-order layer reordering (**[** / **]**, **Shift+[** / **Shift+]**), canvas eyedropper (**I**), smart alignment guides, and **Beautifier** gradient background mockups.
+- **Multi-Format & Multi-Page PDF Export**: save captures as **PNG**, **JPEG**, **WebP**, **BMP** or **PDF** (**Ctrl+S**), plus batch multi-page PDF export and vertical or horizontal image stitching in the library.
+- **Integrated Video Editor & Recording**: visual filmstrip timeline, 60 FPS raw-RGBA preview with synchronized live audio playback and an audio waveform overlay, area crop, playback speed (`0.5×–2.0×`), resolution scaling, frame-to-editor capture, configurable recording FPS (`15–60`), quality presets and countdown, optional animated mouse-click highlights, and native Per-Monitor V2 DPI accuracy across mixed-scaling monitors.
+- **Library & Global Shortcuts**: unified image, MP4 and GIF library with persistent editable annotation layers when reopening captures, favorites (**★**), custom titles and searchable tags, multi-selection (**Ctrl+Click** / **Shift+Click**), native OLE file drag-and-drop (`CF_HDROP`) into other apps, and optional global shortcuts for every capture mode.
+- **Release CI**: automated GitHub Actions release workflow (`.github/workflows/release.yml`) that fetches vendor binaries, runs the locked test suite, builds the portable zip and Inno Setup installer, generates `SHA256SUMS.txt`, and publishes GitHub Releases on version tags.
+
 ## [0.6.0] - 2026-11-13
 
 ### Added
@@ -66,6 +81,7 @@ First public release.
 - Nine color themes, a configurable global shortcut, tray icon and start with Windows.
 - Windows no longer flash on the screen when a capture starts or ends.
 
+[0.7.0]: https://github.com/MichelGSS/snapkit/releases/tag/v0.7.0
 [0.6.0]: https://github.com/MichelGSS/snapkit/releases/tag/v0.6.0
 [0.5.3]: https://github.com/MichelGSS/snapkit/releases/tag/v0.5.3
 [0.5.2]: https://github.com/MichelGSS/snapkit/releases/tag/v0.5.2
