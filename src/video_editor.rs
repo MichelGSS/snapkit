@@ -5,7 +5,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
@@ -17,7 +16,7 @@ const FILMSTRIP_COUNT: usize = 8;
 const FILMSTRIP_HEIGHT: u32 = 56;
 const MIN_TRIM_GAP: f64 = 0.1;
 const MIN_CROP_PX: u32 = 32;
-const PREVIEW_STEP_SECS: f64 = 0.11; // ~9 fps smooth preview stepping
+const STREAM_MAX_WIDTH: u32 = 1280;
 
 /// Action requested from the video editor toolbar or canvas, handled by the main application.
 #[derive(Clone, Debug)]
@@ -80,7 +79,7 @@ pub struct VideoEditor {
     trim_start: f64,
     trim_end: f64,
     is_playing: bool,
-    last_play_tick: Option<Instant>,
+    stream: Option<record::FrameStream>,
     last_requested_frame: f64,
     timeline_drag: Option<TimelineDrag>,
 
@@ -156,7 +155,7 @@ impl VideoEditor {
             trim_start: 0.0,
             trim_end: duration,
             is_playing: false,
-            last_play_tick: None,
+            stream: None,
             last_requested_frame: -1.0,
             timeline_drag: None,
             speed: 1.0,
@@ -204,14 +203,14 @@ impl VideoEditor {
         self.busy = busy;
         if busy {
             self.is_playing = false;
-            self.last_play_tick = None;
+            self.stream = None;
         }
     }
 
     /// Re-probes the video file and reloads the preview frame and filmstrip after an in-place overwrite.
     pub fn reload_after_overwrite(&mut self, ctx: &egui::Context) {
         self.is_playing = false;
-        self.last_play_tick = None;
+        self.stream = None;
         if let Some(info) = record::probe(&self.path) {
             self.info = info;
         }
@@ -267,6 +266,7 @@ impl VideoEditor {
             let path = self.path.clone();
             let worker = self.worker.clone();
             let ctx_clone = ctx.clone();
+            let (init_w, init_h) = (self.info.width, self.info.height);
             std::thread::spawn(move || {
                 loop {
                     let next = worker.requested_secs.lock().unwrap().take();
@@ -280,12 +280,78 @@ impl VideoEditor {
                         }
                         break;
                     };
-                    if let Ok(frame) = record::extract_frame(&path, ts) {
+                    let (w, h) = worker
+                        .ready_info
+                        .lock()
+                        .unwrap()
+                        .map(|i| (i.width, i.height))
+                        .unwrap_or((init_w, init_h));
+                    if let Ok(frame) = record::extract_frame_fast(&path, ts, w, h) {
                         *worker.ready_frame.lock().unwrap() = Some((ts, frame));
                         ctx_clone.request_repaint();
                     }
                 }
             });
+        }
+    }
+
+    fn update_preview_texture(&mut self, ctx: &egui::Context, frame: &RgbaImage, max_side: usize) {
+        let color_img = editor::texture_image(frame, max_side);
+        if let Some(tex) = &mut self.preview_tex
+            && tex.size() == color_img.size
+        {
+            tex.set(color_img, TextureOptions::LINEAR);
+        } else {
+            self.preview_tex = Some(ctx.load_texture(
+                "video_preview",
+                color_img,
+                TextureOptions::LINEAR,
+            ));
+        }
+    }
+
+    fn playback_end_limit(&self) -> f64 {
+        if self.trim_end > self.trim_start + MIN_TRIM_GAP {
+            self.trim_end
+        } else {
+            self.info.duration.max(0.1)
+        }
+    }
+
+    fn start_playback(&mut self, ctx: &egui::Context) {
+        self.stream = None;
+        let end_limit = self.playback_end_limit();
+        if self.playhead >= end_limit - 0.05 || self.playhead < self.trim_start {
+            self.playhead = self.trim_start;
+        }
+        *self.worker.requested_secs.lock().unwrap() = None;
+        let ctx_clone = ctx.clone();
+        match record::FrameStream::start(
+            &self.path,
+            self.playhead,
+            Some(end_limit),
+            self.info,
+            self.speed,
+            STREAM_MAX_WIDTH,
+            move || ctx_clone.request_repaint(),
+        ) {
+            Ok(stream) => {
+                self.stream = Some(stream);
+                self.is_playing = true;
+            }
+            Err(_) => {
+                self.is_playing = false;
+            }
+        }
+    }
+
+    fn pause_playback(&mut self, ctx: &egui::Context) {
+        let was_playing = self.is_playing || self.stream.is_some();
+        self.is_playing = false;
+        self.stream = None;
+        if was_playing {
+            self.last_requested_frame = -1.0;
+            self.request_frame(ctx, self.playhead);
         }
     }
 
@@ -301,18 +367,16 @@ impl VideoEditor {
             }
         }
 
-        if let Some((_ts, frame)) = self.worker.ready_frame.lock().unwrap().take() {
+        let ready_frame = self.worker.ready_frame.lock().unwrap().take();
+        if let Some((_ts, frame)) = ready_frame
+            && !self.is_playing
+        {
             // If probe had fallback dimensions, refine from actual frame.
             if self.info.width == 0 || self.info.height == 0 {
                 self.info.width = frame.width().max(2);
                 self.info.height = frame.height().max(2);
             }
-            let tex = ctx.load_texture(
-                "video_preview",
-                editor::texture_image(&frame, max_side),
-                TextureOptions::LINEAR,
-            );
-            self.preview_tex = Some(tex);
+            self.update_preview_texture(ctx, &frame, max_side);
             self.current_frame = Some(frame);
         }
 
@@ -331,37 +395,32 @@ impl VideoEditor {
             self.filmstrip_loading = false;
         }
 
-        // Advance playhead when playing preview
-        if self.is_playing {
-            let now = Instant::now();
-            let dt = self
-                .last_play_tick
-                .map(|prev| now.duration_since(prev).as_secs_f64())
-                .unwrap_or(0.0);
-            self.last_play_tick = Some(now);
-
-            let end_limit = if self.trim_end > self.trim_start + MIN_TRIM_GAP {
-                self.trim_end
-            } else {
-                self.info.duration.max(0.1)
-            };
-
-            self.playhead += dt * self.speed;
-            if self.playhead >= end_limit {
-                self.playhead = self.trim_start;
-                self.is_playing = false;
-                self.last_play_tick = None;
-                self.request_frame(ctx, self.playhead);
-            } else {
-                // Step frame extraction every ~0.11s of source time so FFmpeg isn't flooded
-                let step = (PREVIEW_STEP_SECS * self.speed).max(0.06);
-                if (self.playhead - self.last_requested_frame).abs() >= step {
-                    self.request_frame(ctx, self.playhead);
+        // Pull streamed frames when playing preview
+        if self.stream.is_some() {
+            let end_limit = self.playback_end_limit();
+            let mut stream_done = false;
+            let mut next_frame = None;
+            if let Some(stream) = &self.stream {
+                next_frame = stream.take_frame();
+                if stream.is_finished() {
+                    stream_done = true;
                 }
-                ctx.request_repaint_after(Duration::from_millis(33));
             }
-        } else {
-            self.last_play_tick = None;
+            if let Some((ts, frame)) = next_frame {
+                self.playhead = ts.min(end_limit);
+                self.update_preview_texture(ctx, &frame, max_side);
+                self.current_frame = Some(frame);
+                if self.playhead >= end_limit {
+                    stream_done = true;
+                }
+            }
+            if stream_done {
+                self.stream = None;
+                self.is_playing = false;
+                self.playhead = self.trim_start;
+                self.last_requested_frame = -1.0;
+                self.request_frame(ctx, self.playhead);
+            }
         }
     }
 
@@ -431,6 +490,7 @@ impl VideoEditor {
         ui.horizontal_wrapped(|ui| {
             // Speed selector
             ui.label(t!("Velocidade:", "Speed:"));
+            let prev_speed = self.speed;
             let speed_label = format!("{}×", self.speed);
             egui::ComboBox::from_id_salt("video_speed_combo")
                 .width(64.0)
@@ -447,6 +507,10 @@ impl VideoEditor {
                         ui.selectable_value(&mut self.speed, spd, label);
                     }
                 });
+            if (self.speed - prev_speed).abs() > 1e-4 && self.is_playing {
+                let ctx = ui.ctx().clone();
+                self.start_playback(&ctx);
+            }
 
             ui.separator();
 
@@ -698,18 +762,38 @@ impl VideoEditor {
                     "Captures the currently displayed frame and opens it in the annotation editor (arrows, text, highlight, OCR)."
                 ))
                 .clicked()
-                && let Some(mut frame) = self.current_frame.clone()
             {
-                if self.crop_enabled
-                    && let Some((cx, cy, cw, ch)) = self.crop_rect
-                    && cw >= MIN_CROP_PX
-                    && ch >= MIN_CROP_PX
-                    && cx + cw <= frame.width()
-                    && cy + ch <= frame.height()
-                {
-                    frame = image::imageops::crop_imm(&frame, cx, cy, cw, ch).to_image();
+                if self.is_playing {
+                    let ctx = ui.ctx().clone();
+                    self.pause_playback(&ctx);
                 }
-                action = Some(VideoAction::CaptureFrame { image: frame });
+                let mut full_frame = self.current_frame.clone();
+                if let Some(ref f) = full_frame
+                    && self.info.width > 0
+                    && self.info.height > 0
+                    && (f.width() != self.info.width || f.height() != self.info.height)
+                    && let Ok(hi_res) = record::extract_frame_fast(
+                        &self.path,
+                        self.playhead,
+                        self.info.width,
+                        self.info.height,
+                    )
+                {
+                    self.current_frame = Some(hi_res.clone());
+                    full_frame = Some(hi_res);
+                }
+                if let Some(mut frame) = full_frame {
+                    if self.crop_enabled
+                        && let Some((cx, cy, cw, ch)) = self.crop_rect
+                        && cw >= MIN_CROP_PX
+                        && ch >= MIN_CROP_PX
+                        && cx + cw <= frame.width()
+                        && cy + ch <= frame.height()
+                    {
+                        frame = image::imageops::crop_imm(&frame, cx, cy, cw, ch).to_image();
+                    }
+                    action = Some(VideoAction::CaptureFrame { image: frame });
+                }
             }
 
             if busy {
@@ -760,28 +844,25 @@ impl VideoEditor {
             return;
         }
         let duration = self.info.duration.max(0.0);
+        let mut toggle = false;
         let mut seek_to = None;
 
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Space) {
-                self.toggle_play();
+                toggle = true;
             }
             if i.key_pressed(egui::Key::ArrowLeft) {
-                self.is_playing = false;
                 let step = if i.modifiers.shift { 1.0 } else { 0.1 };
                 seek_to = Some((self.playhead - step).max(0.0));
             }
             if i.key_pressed(egui::Key::ArrowRight) && duration > 0.0 {
-                self.is_playing = false;
                 let step = if i.modifiers.shift { 1.0 } else { 0.1 };
                 seek_to = Some((self.playhead + step).min(duration));
             }
             if i.key_pressed(egui::Key::Home) {
-                self.is_playing = false;
                 seek_to = Some(self.trim_start);
             }
             if i.key_pressed(egui::Key::End) && duration > 0.0 {
-                self.is_playing = false;
                 seek_to = Some(self.trim_end);
             }
             if i.key_pressed(egui::Key::OpenBracket) && duration > MIN_TRIM_GAP {
@@ -794,27 +875,23 @@ impl VideoEditor {
             }
         });
 
+        if toggle {
+            self.toggle_play(ctx);
+        }
         if let Some(ts) = seek_to {
+            self.is_playing = false;
+            self.stream = None;
             self.playhead = ts;
+            self.last_requested_frame = -1.0;
             self.request_frame(ctx, ts);
         }
     }
 
-    fn toggle_play(&mut self) {
+    fn toggle_play(&mut self, ctx: &egui::Context) {
         if self.is_playing {
-            self.is_playing = false;
-            self.last_play_tick = None;
+            self.pause_playback(ctx);
         } else {
-            let end_limit = if self.trim_end > self.trim_start + MIN_TRIM_GAP {
-                self.trim_end
-            } else {
-                self.info.duration
-            };
-            if self.playhead >= end_limit - 0.05 || self.playhead < self.trim_start {
-                self.playhead = self.trim_start;
-            }
-            self.is_playing = true;
-            self.last_play_tick = Some(Instant::now());
+            self.start_playback(ctx);
         }
     }
 
@@ -901,7 +978,8 @@ impl VideoEditor {
             self.crop_overlay_ui(ui, &painter, &response, video_rect, scale);
         } else if response.clicked() && !self.busy {
             // Clicking on the video frame toggles play/pause when crop mode is off
-            self.toggle_play();
+            let ctx = ui.ctx().clone();
+            self.toggle_play(&ctx);
         }
     }
 
@@ -1134,7 +1212,9 @@ impl VideoEditor {
                 .clicked()
             {
                 self.is_playing = false;
+                self.stream = None;
                 self.playhead = self.trim_start;
+                self.last_requested_frame = -1.0;
                 self.request_frame(&ctx, self.playhead);
             }
 
@@ -1148,7 +1228,9 @@ impl VideoEditor {
                 .clicked()
             {
                 self.is_playing = false;
+                self.stream = None;
                 self.playhead = (self.playhead - 0.1).max(0.0);
+                self.last_requested_frame = -1.0;
                 self.request_frame(&ctx, self.playhead);
             }
 
@@ -1169,7 +1251,7 @@ impl VideoEditor {
                 ))
                 .clicked()
             {
-                self.toggle_play();
+                self.toggle_play(&ctx);
             }
 
             // Step +0.1s
@@ -1182,7 +1264,9 @@ impl VideoEditor {
                 .clicked()
             {
                 self.is_playing = false;
+                self.stream = None;
                 self.playhead = (self.playhead + 0.1).min(duration);
+                self.last_requested_frame = -1.0;
                 self.request_frame(&ctx, self.playhead);
             }
 
@@ -1196,7 +1280,9 @@ impl VideoEditor {
                 .clicked()
             {
                 self.is_playing = false;
+                self.stream = None;
                 self.playhead = self.trim_end;
+                self.last_requested_frame = -1.0;
                 self.request_frame(&ctx, self.playhead);
             }
 
@@ -1330,6 +1416,7 @@ impl VideoEditor {
                 && let Some(pos) = response.interact_pointer_pos()
             {
                 self.is_playing = false;
+                self.stream = None;
                 if trim_start_hit.contains(pos) && (pos.x - start_x).abs() <= (pos.x - end_x).abs() {
                     self.timeline_drag = Some(TimelineDrag::TrimStart);
                 } else if trim_end_hit.contains(pos) {
@@ -1338,6 +1425,7 @@ impl VideoEditor {
                     self.timeline_drag = Some(TimelineDrag::Playhead);
                     let t = x_to_time(pos.x);
                     self.playhead = t;
+                    self.last_requested_frame = -1.0;
                     self.request_frame(ctx, t);
                 }
             }
@@ -1345,6 +1433,8 @@ impl VideoEditor {
             if (response.dragged() || response.clicked())
                 && let Some(pos) = response.interact_pointer_pos()
             {
+                self.is_playing = false;
+                self.stream = None;
                 let t = x_to_time(pos.x);
                 match self.timeline_drag.unwrap_or(TimelineDrag::Playhead) {
                     TimelineDrag::TrimStart => {
@@ -1359,7 +1449,6 @@ impl VideoEditor {
                         self.request_frame(ctx, self.playhead);
                     }
                     TimelineDrag::Playhead => {
-                        self.is_playing = false;
                         self.playhead = t;
                         self.request_frame(ctx, t);
                     }
@@ -1368,6 +1457,8 @@ impl VideoEditor {
 
             if response.drag_stopped() {
                 self.timeline_drag = None;
+                self.last_requested_frame = -1.0;
+                self.request_frame(ctx, self.playhead);
             }
 
             if let Some(pos) = response.hover_pos() {

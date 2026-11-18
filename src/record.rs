@@ -13,6 +13,8 @@ use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::audio::AudioRecording;
@@ -74,7 +76,16 @@ fn capture_args(rect: PxRect, options: Options, out: &Path) -> Vec<String> {
     let kbps = ((base_kbps as f64 * options.quality.bitrate_factor()).round() as i64).clamp(1000, 35_000);
     let draw_mouse = if options.draw_mouse { "1" } else { "0" };
     let mut a: Vec<String> = [
-        "-y", "-hide_banner", "-loglevel", "error", "-f", "gdigrab", "-draw_mouse", draw_mouse,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-thread_queue_size",
+        "1024",
+        "-f",
+        "gdigrab",
+        "-draw_mouse",
+        draw_mouse,
     ]
     .iter()
     .map(|s| s.to_string())
@@ -535,6 +546,301 @@ pub fn extract_frame(video: &Path, at_secs: f64) -> Result<image::RgbaImage, Str
     extract_frame_with(&ffmpeg, video, at_secs, None)
 }
 
+/// Fast single-frame RGBA extraction using rawvideo pipe instead of PNG encode/decode when
+/// dimensions `(width, height)` are known; falls back to [`extract_frame`] otherwise.
+pub fn extract_frame_fast(
+    video: &Path,
+    at_secs: f64,
+    width: u32,
+    height: u32,
+) -> Result<image::RgbaImage, String> {
+    if width == 0 || height == 0 {
+        return extract_frame(video, at_secs);
+    }
+    let ffmpeg = find_ffmpeg().ok_or(t!(
+        "o FFmpeg não foi encontrado (pasta ffmpeg)",
+        "FFmpeg was not found (ffmpeg folder)"
+    ))?;
+    let need = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .unwrap_or(0);
+    if need == 0 {
+        return extract_frame_with(&ffmpeg, video, at_secs, None);
+    }
+
+    let run_raw = |secs: f64| -> Option<image::RgbaImage> {
+        let mut child = ffmpeg_command(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                &format!("{:.3}", secs.max(0.0)),
+                "-i",
+            ])
+            .arg(video)
+            .args([
+                "-frames:v",
+                "1",
+                "-s",
+                &format!("{width}x{height}"),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        crate::win::end_with_us(&child);
+        let mut stdout = child.stdout.take()?;
+        let mut buf = vec![0u8; need];
+        let ok = stdout.read_exact(&mut buf).is_ok();
+        drop(stdout);
+        let _ = child.kill();
+        let _ = child.wait();
+        if ok {
+            image::RgbaImage::from_raw(width, height, buf)
+        } else {
+            None
+        }
+    };
+
+    if let Some(img) = run_raw(at_secs) {
+        return Ok(img);
+    }
+    if at_secs > 0.0
+        && let Some(img) = run_raw(0.0)
+    {
+        return Ok(img);
+    }
+    extract_frame_with(&ffmpeg, video, at_secs, None)
+}
+
+fn stream_args(
+    video: &Path,
+    start_secs: f64,
+    end_secs: Option<f64>,
+    info: VideoInfo,
+    max_width: u32,
+) -> (Vec<String>, u32, u32, u32) {
+    let w0 = info.width.max(2);
+    let h0 = info.height.max(2);
+    let (pw, ph) = if max_width > 0 && w0 > max_width {
+        let scale = max_width as f64 / w0 as f64;
+        let sw = ((w0 as f64 * scale).round() as u32 & !1).max(2);
+        let sh = ((h0 as f64 * scale).round() as u32 & !1).max(2);
+        (sw, sh)
+    } else {
+        ((w0 & !1).max(2), (h0 & !1).max(2))
+    };
+    let fps = info.fps.round().clamp(15.0, 60.0) as u32;
+    let start = start_secs.max(0.0);
+    let mut a = vec![
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-ss".to_owned(),
+        format!("{start:.3}"),
+    ];
+    if let Some(end) = end_secs
+        && end > start
+    {
+        a.extend(["-to".to_owned(), format!("{end:.3}")]);
+    }
+    a.extend([
+        "-i".to_owned(),
+        video.to_string_lossy().into_owned(),
+        "-vf".to_owned(),
+        format!("scale={pw}:{ph}:flags=fast_bilinear"),
+        "-r".to_owned(),
+        fps.to_string(),
+        "-f".to_owned(),
+        "rawvideo".to_owned(),
+        "-pix_fmt".to_owned(),
+        "rgba".to_owned(),
+        "-".to_owned(),
+    ]);
+    (a, pw, ph, fps)
+}
+
+/// Continuous raw-RGBA video frame stream decoded by a single background `ffmpeg` child process.
+pub struct FrameStream {
+    child: Child,
+    stop: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    latest: Arc<Mutex<Option<(f64, image::RgbaImage)>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
+    stopped: bool,
+}
+
+impl FrameStream {
+    /// Starts streaming scaled raw-RGBA frames from `video` starting at `start_secs` up to `end_secs`,
+    /// paced in real time according to `info.fps` and `speed`.
+    pub fn start(
+        video: &Path,
+        start_secs: f64,
+        end_secs: Option<f64>,
+        info: VideoInfo,
+        speed: f64,
+        max_width: u32,
+        on_frame: impl Fn() + Send + 'static,
+    ) -> Result<Self, String> {
+        let ffmpeg = find_ffmpeg().ok_or(t!(
+            "o FFmpeg não foi encontrado (pasta ffmpeg)",
+            "FFmpeg was not found (ffmpeg folder)"
+        ))?;
+        let start = start_secs.max(0.0);
+        let (args, pw, ph, fps) = stream_args(video, start, end_secs, info, max_width);
+        let frame_bytes = (pw as usize) * (ph as usize) * 4;
+        let eff_speed = speed.clamp(0.25, 4.0);
+
+        let mut child = ffmpeg_command(&ffmpeg)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| tf!("não foi possível iniciar o FFmpeg: {e}", "could not start FFmpeg: {e}"))?;
+        crate::win::end_with_us(&child);
+
+        let stderr_reader = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut sink = [0u8; 1024];
+                while let Ok(n) = stderr.read(&mut sink) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            })
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let latest: Arc<Mutex<Option<(f64, image::RgbaImage)>>> = Arc::new(Mutex::new(None));
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "FFmpeg stdout unavailable".to_owned())?;
+        let stop_clone = stop.clone();
+        let finished_clone = finished.clone();
+        let latest_clone = latest.clone();
+
+        let reader = std::thread::spawn(move || {
+            let mut stream_started: Option<Instant> = None;
+            let frame_interval = 1.0 / (fps as f64 * eff_speed);
+            let max_lag = Duration::from_secs_f64(frame_interval);
+            let mut frame_idx: u64 = 0;
+            let mut skipped_in_a_row: u32 = 0;
+            let mut scratch = vec![0u8; frame_bytes];
+
+            while !stop_clone.load(Ordering::Relaxed) {
+                let ts = start + (frame_idx as f64) / (fps as f64);
+                if let Some(end) = end_secs
+                    && ts > end + 1e-4
+                {
+                    break;
+                }
+                if stdout.read_exact(&mut scratch).is_err() {
+                    break;
+                }
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let started = *stream_started.get_or_insert_with(Instant::now);
+                let target = started + Duration::from_secs_f64(frame_idx as f64 * frame_interval);
+                let now = Instant::now();
+
+                if target > now {
+                    // Ahead of schedule: sleep in short slices so stop() wakes quickly.
+                    while !stop_clone.load(Ordering::Relaxed) {
+                        let cur = Instant::now();
+                        if cur >= target {
+                            break;
+                        }
+                        let rem = (target - cur).min(Duration::from_millis(12));
+                        std::thread::sleep(rem);
+                    }
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                } else if frame_idx > 0
+                    && now.duration_since(target) > max_lag
+                    && skipped_in_a_row < 3
+                {
+                    // Behind schedule by more than 1 frame: advance pipe without publishing
+                    // so playback stays real-time without building latency.
+                    skipped_in_a_row += 1;
+                    frame_idx += 1;
+                    continue;
+                }
+
+                skipped_in_a_row = 0;
+                if let Some(img) = image::RgbaImage::from_raw(pw, ph, scratch.clone()) {
+                    *latest_clone.lock().unwrap() = Some((ts, img));
+                    on_frame();
+                }
+                frame_idx += 1;
+            }
+
+            if !stop_clone.load(Ordering::Relaxed) {
+                finished_clone.store(true, Ordering::SeqCst);
+                on_frame();
+            }
+        });
+
+        Ok(Self {
+            child,
+            stop,
+            finished,
+            latest,
+            reader: Some(reader),
+            stderr_reader,
+            stopped: false,
+        })
+    }
+
+    /// Takes the most recently decoded `(timestamp_secs, RgbaImage)` frame, if a new one arrived.
+    pub fn take_frame(&self) -> Option<(f64, image::RgbaImage)> {
+        self.latest.lock().unwrap().take()
+    }
+
+    /// Returns true once the stream has reached `end_secs` or EOF.
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    /// Stops the background FFmpeg process and cleans up reader threads.
+    pub fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.child.kill();
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stderr_reader.take() {
+            let _ = handle.join();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for FrameStream {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Extracts `count` evenly spaced thumbnail frames scaled to `thumb_height` pixels tall.
 pub fn extract_filmstrip(video: &Path, count: usize, thumb_height: u32) -> Vec<image::RgbaImage> {
     let Some(ffmpeg) = find_ffmpeg() else { return Vec::new() };
@@ -765,6 +1071,7 @@ mod tests {
     fn capture_uses_even_size_and_screen_offsets() {
         // Monitor to the left of the primary one: negative coordinates; an odd size becomes even.
         let a = capture_args((-1920, 191, -1119, 792), Options::default(), Path::new("saida.mp4")).join(" ");
+        assert!(a.contains("-thread_queue_size 1024 -f gdigrab"), "{a}");
         assert!(a.contains("-offset_x -1920 -offset_y 191 -video_size 800x600 -i desktop"), "{a}");
         assert!(a.contains("-framerate 30") && a.contains("-c:v libopenh264"), "{a}");
         assert!(a.contains("-draw_mouse 1"), "{a}");
@@ -773,6 +1080,24 @@ mod tests {
         let no_mouse = Options { fps: 60, draw_mouse: false, ..Options::default() };
         let b = capture_args((0, 0, 800, 600), no_mouse, Path::new("b.mp4")).join(" ");
         assert!(b.contains("-draw_mouse 0") && b.contains("-framerate 60"), "{b}");
+    }
+
+    #[test]
+    fn stream_args_scales_to_even_max_width_and_clamps_fps() {
+        let info = VideoInfo {
+            width: 1920,
+            height: 1080,
+            duration: 10.0,
+            fps: 59.94,
+            has_audio: true,
+        };
+        let (args, pw, ph, fps) = stream_args(Path::new("clip.mp4"), 1.25, Some(5.5), info, 1280);
+        let joined = args.join(" ");
+        assert_eq!((pw, ph, fps), (1280, 720, 60));
+        assert!(
+            joined.contains("-ss 1.250 -to 5.500 -i clip.mp4 -vf scale=1280:720:flags=fast_bilinear -r 60 -f rawvideo -pix_fmt rgba -"),
+            "{joined}"
+        );
     }
 
     #[test]
