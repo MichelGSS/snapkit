@@ -320,6 +320,10 @@ struct App {
     /// Library file open in the editor, and its revision that has already been saved.
     current_file: Option<String>,
     saved_revision: u64,
+    /// Multi-selected library files for batch operations (`Ctrl+Click` / `Shift+Click`).
+    selected_files: Vec<String>,
+    /// Anchor file for `Shift+Click` range selection in the library.
+    selection_anchor: Option<String>,
     /// Thumbnails already loaded, by file name.
     thumbs: HashMap<String, TextureHandle>,
     show_library: bool,
@@ -526,6 +530,8 @@ impl App {
             writer: library::Writer::spawn(),
             current_file: None,
             saved_revision: 0,
+            selected_files: Vec::new(),
+            selection_anchor: None,
             thumbs: HashMap::new(),
             show_library: true,
             search: String::new(),
@@ -1208,6 +1214,10 @@ impl App {
                 self.library.remove_layers(file);
                 self.library.forget(file);
                 self.thumbs.remove(file);
+                self.selected_files.retain(|f| f != file);
+                if self.selection_anchor.as_deref() == Some(file) {
+                    self.selection_anchor = None;
+                }
                 if self.current_file.as_deref() == Some(file) {
                     self.current_file = None;
                     self.editor = None;
@@ -1216,6 +1226,117 @@ impl App {
                 self.status = tf!("{file} foi para a Lixeira.", "{file} was moved to the Recycle Bin.");
             }
             Err(e) => self.status = tf!("Não foi possível apagar {file}: {e}", "Could not delete {file}: {e}"),
+        }
+    }
+
+    fn delete_batch_from_library(&mut self, files: &[String]) {
+        let mut ok = 0usize;
+        for file in files {
+            if trash::delete(self.library.path(file)).is_ok() {
+                let _ = std::fs::remove_file(self.library.thumb_path(file));
+                self.library.remove_layers(file);
+                self.library.forget(file);
+                self.thumbs.remove(file);
+                if self.current_file.as_deref() == Some(file.as_str()) {
+                    self.current_file = None;
+                    self.editor = None;
+                    self.video_editor = None;
+                }
+                ok += 1;
+            }
+        }
+        self.selected_files.retain(|f| !files.contains(f));
+        if self
+            .selection_anchor
+            .as_ref()
+            .is_some_and(|a| files.contains(a))
+        {
+            self.selection_anchor = None;
+        }
+        if ok > 0 {
+            self.status = tf!(
+                "{ok} itens foram para a Lixeira.",
+                "{ok} items were moved to the Recycle Bin."
+            );
+        }
+    }
+
+    fn export_files_to_folder(&mut self, files: &[String]) {
+        if files.is_empty() {
+            return;
+        }
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let mut copied = 0usize;
+        for f in files {
+            let src = self.library.path(f);
+            let dst = folder.join(f);
+            if std::fs::copy(&src, &dst).is_ok() {
+                copied += 1;
+            }
+        }
+        self.status = tf!(
+            "{copied} arquivos exportados para {}",
+            "{copied} files exported to {}",
+            folder.display()
+        );
+    }
+
+    fn copy_library_files_to_clipboard(&mut self, files: &[String]) {
+        let paths: Vec<std::path::PathBuf> = files.iter().map(|f| self.library.path(f)).collect();
+        match win::copy_files_to_clipboard(&paths) {
+            Ok(()) => {
+                self.status = if paths.len() == 1 {
+                    t!(
+                        "Arquivo copiado para a área de transferência.",
+                        "File copied to the clipboard."
+                    )
+                    .to_owned()
+                } else {
+                    tf!(
+                        "{} arquivos copiados para a área de transferência.",
+                        "{} files copied to the clipboard.",
+                        paths.len()
+                    )
+                };
+            }
+            Err(e) => {
+                self.status = tf!(
+                    "Não foi possível copiar os arquivos: {e}",
+                    "Could not copy the files: {e}"
+                );
+            }
+        }
+    }
+
+    fn combine_selected_images(
+        &mut self,
+        ctx: &egui::Context,
+        files: &[String],
+        vertical: bool,
+    ) {
+        let img_paths: Vec<std::path::PathBuf> = files
+            .iter()
+            .filter(|f| !f.to_ascii_lowercase().ends_with(".mp4"))
+            .map(|f| self.library.path(f))
+            .collect();
+        match library::combine_images(&img_paths, vertical, 12) {
+            Ok(combined) => {
+                let count = img_paths.len();
+                self.selected_files.clear();
+                let title = tf!(
+                    "{count} imagens combinadas",
+                    "{count} combined images"
+                );
+                self.set_captured(ctx, combined, title);
+            }
+            Err(e) => {
+                self.status = tf!(
+                    "Não foi possível juntar as imagens: {e}",
+                    "Could not combine the images: {e}"
+                );
+            }
         }
     }
 
@@ -1244,6 +1365,7 @@ impl App {
 
     fn library_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.selected_files.retain(|f| self.library.get(f).is_some());
         ui.add_space(6.0);
         ui.add(
             egui::TextEdit::singleline(&mut self.search)
@@ -1283,21 +1405,121 @@ impl App {
                 }
             });
         });
+
+        let mut batch_delete = false;
+        let mut batch_export = false;
+        let mut batch_copy: Option<Vec<String>> = None;
+        let mut batch_combine: Option<bool> = None;
+
+        if !self.selected_files.is_empty() {
+            ui.add_space(2.0);
+            let selected_img_count = self
+                .selected_files
+                .iter()
+                .filter(|f| !f.to_ascii_lowercase().ends_with(".mp4"))
+                .count();
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(tf!(
+                            "{} selecionadas",
+                            "{} selected",
+                            self.selected_files.len()
+                        ));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text(t!("Limpar seleção", "Clear selection"))
+                                .clicked()
+                            {
+                                self.selected_files.clear();
+                            }
+                        });
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if ui
+                            .small_button(t!("🗑 Apagar", "🗑 Delete"))
+                            .on_hover_text(t!(
+                                "Move todas as selecionadas para a Lixeira",
+                                "Moves all selected items to the Recycle Bin"
+                            ))
+                            .clicked()
+                        {
+                            batch_delete = true;
+                        }
+                        if ui
+                            .small_button(t!("📂 Exportar…", "📂 Export…"))
+                            .on_hover_text(t!(
+                                "Copia os arquivos selecionados para uma pasta",
+                                "Copies the selected files to a folder"
+                            ))
+                            .clicked()
+                        {
+                            batch_export = true;
+                        }
+                        if ui
+                            .small_button(t!("📋 Copiar", "📋 Copy"))
+                            .on_hover_text(t!("📋 Copiar arquivos", "📋 Copy files"))
+                            .clicked()
+                        {
+                            batch_copy = Some(self.selected_files.clone());
+                        }
+                        if selected_img_count >= 2 {
+                            if ui
+                                .small_button(t!("↕ Juntar V", "↕ Combine V"))
+                                .on_hover_text(t!("↕ Juntar (Vertical)", "↕ Combine (Vertical)"))
+                                .clicked()
+                            {
+                                batch_combine = Some(true);
+                            }
+                            if ui
+                                .small_button(t!("↔ Juntar H", "↔ Combine H"))
+                                .on_hover_text(t!(
+                                    "↔ Juntar (Horizontal)",
+                                    "↔ Combine (Horizontal)"
+                                ))
+                                .clicked()
+                            {
+                                batch_combine = Some(false);
+                            }
+                        }
+                    });
+                });
+        }
+
         ui.separator();
 
         let mut to_open = None;
         let mut to_delete = None;
+        let mut to_drag: Option<Vec<std::path::PathBuf>> = None;
         let thumb_h = 96.0;
         let row_h = thumb_h + 44.0;
         let accent = self.accent();
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, entries.len(), |ui, rows| {
             for entry in &entries[rows] {
                 let selected = self.current_file.as_deref() == Some(entry.file.as_str());
-                let (rect, response) =
-                    ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
-                if selected || response.hovered() {
-                    let fill = if selected { accent.gamma_multiply(0.25) } else { ui.visuals().widgets.hovered.weak_bg_fill };
+                let multi_selected = self.selected_files.iter().any(|f| f == &entry.file);
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), row_h),
+                    Sense::click_and_drag(),
+                );
+                if selected || multi_selected || response.hovered() {
+                    let fill = if selected || multi_selected {
+                        accent.gamma_multiply(0.25)
+                    } else {
+                        ui.visuals().widgets.hovered.weak_bg_fill
+                    };
                     ui.painter().rect_filled(rect, 6.0, fill);
+                    if multi_selected {
+                        ui.painter().rect_stroke(
+                            rect,
+                            6.0,
+                            Stroke::new(1.5, accent),
+                            StrokeKind::Inside,
+                        );
+                    }
                 }
                 let inner = rect.shrink(6.0);
                 let mut thumb_rect = Rect::from_min_size(inner.min, egui::vec2(inner.width(), thumb_h));
@@ -1350,6 +1572,20 @@ impl App {
                         painter.galley(d_pos + egui::vec2(5.0, 2.0), d_galley, Color32::WHITE);
                     }
                 }
+                if multi_selected {
+                    let check_rect = Rect::from_min_size(
+                        Pos2::new(inner.max.x - 20.0, inner.min.y + 4.0),
+                        egui::vec2(16.0, 16.0),
+                    );
+                    painter.rect_filled(check_rect, 4.0, accent);
+                    painter.text(
+                        check_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "✓",
+                        egui::FontId::proportional(11.0),
+                        theme::text_on(accent),
+                    );
+                }
                 let text_top = inner.min + egui::vec2(0.0, thumb_h + 2.0);
                 let title = if entry.title.is_empty() { t!("(sem título)", "(untitled)") } else { &entry.title };
                 // Theme colors: a fixed white disappeared on the light theme's background.
@@ -1376,7 +1612,56 @@ impl App {
                     detail_color,
                 );
                 if response.clicked() {
-                    to_open = Some(entry.file.clone());
+                    let (ctrl, shift) =
+                        ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
+                    if shift {
+                        let anchor = self
+                            .selection_anchor
+                            .clone()
+                            .or_else(|| self.current_file.clone());
+                        if let Some(anchor_file) = anchor
+                            && let Some(a_idx) = entries.iter().position(|e| e.file == anchor_file)
+                            && let Some(b_idx) = entries.iter().position(|e| e.file == entry.file)
+                        {
+                            let (lo, hi) = (a_idx.min(b_idx), a_idx.max(b_idx));
+                            self.selected_files =
+                                entries[lo..=hi].iter().map(|e| e.file.clone()).collect();
+                        } else {
+                            self.selected_files = vec![entry.file.clone()];
+                            self.selection_anchor = Some(entry.file.clone());
+                        }
+                    } else if ctrl {
+                        if self.selected_files.is_empty()
+                            && let Some(cur) = &self.current_file
+                            && cur != &entry.file
+                        {
+                            self.selected_files.push(cur.clone());
+                        }
+                        if let Some(pos) = self.selected_files.iter().position(|f| f == &entry.file)
+                        {
+                            self.selected_files.remove(pos);
+                        } else {
+                            self.selected_files.push(entry.file.clone());
+                        }
+                        self.selection_anchor = Some(entry.file.clone());
+                    } else {
+                        self.selected_files.clear();
+                        self.selection_anchor = Some(entry.file.clone());
+                        to_open = Some(entry.file.clone());
+                    }
+                }
+                if response.drag_started() {
+                    let paths = if self.selected_files.contains(&entry.file)
+                        && !self.selected_files.is_empty()
+                    {
+                        self.selected_files
+                            .iter()
+                            .map(|f| self.library.path(f))
+                            .collect()
+                    } else {
+                        vec![self.library.path(&entry.file)]
+                    };
+                    to_drag = Some(paths);
                 }
                 response.context_menu(|ui| {
                     if ui.button(t!("Abrir", "Open")).clicked() {
@@ -1391,6 +1676,13 @@ impl App {
                             .spawn();
                         ui.close();
                     }
+                    if ui
+                        .button(t!("📋 Copiar arquivo", "📋 Copy file"))
+                        .clicked()
+                    {
+                        batch_copy = Some(vec![entry.file.clone()]);
+                        ui.close();
+                    }
                     if ui.button(t!("Mostrar na pasta", "Show in folder")).clicked() {
                         let _ = std::process::Command::new("explorer")
                             .arg("/select,")
@@ -1402,9 +1694,62 @@ impl App {
                         to_delete = Some(entry.file.clone());
                         ui.close();
                     }
+                    if multi_selected && self.selected_files.len() >= 2 {
+                        ui.separator();
+                        ui.weak(tf!(
+                            "{} selecionadas",
+                            "{} selected",
+                            self.selected_files.len()
+                        ));
+                        if ui
+                            .button(t!("📋 Copiar arquivos", "📋 Copy files"))
+                            .clicked()
+                        {
+                            batch_copy = Some(self.selected_files.clone());
+                            ui.close();
+                        }
+                        if ui
+                            .button(t!("📂 Exportar…", "📂 Export…"))
+                            .clicked()
+                        {
+                            batch_export = true;
+                            ui.close();
+                        }
+                        let img_count = self
+                            .selected_files
+                            .iter()
+                            .filter(|f| !f.to_ascii_lowercase().ends_with(".mp4"))
+                            .count();
+                        if img_count >= 2 {
+                            if ui
+                                .button(t!("↕ Juntar (Vertical)", "↕ Combine (Vertical)"))
+                                .clicked()
+                            {
+                                batch_combine = Some(true);
+                                ui.close();
+                            }
+                            if ui
+                                .button(t!("↔ Juntar (Horizontal)", "↔ Combine (Horizontal)"))
+                                .clicked()
+                            {
+                                batch_combine = Some(false);
+                                ui.close();
+                            }
+                        }
+                        if ui
+                            .button(t!("🗑 Apagar selecionadas", "🗑 Delete selected"))
+                            .clicked()
+                        {
+                            batch_delete = true;
+                            ui.close();
+                        }
+                    }
                 });
             }
         });
+        if let Some(drag_paths) = to_drag {
+            let _ = win::start_file_drag(&drag_paths);
+        }
         // Delete removes the selected capture, with the mouse over the library. It doesn't apply
         // while typing in the search, nor when the key is meant for an annotation selected in the
         // editor.
@@ -1415,11 +1760,30 @@ impl App {
             && ctx.input(|i| i.key_pressed(egui::Key::Delete));
         let mut open_after = None;
         if delete_key {
-            let files: Vec<&str> = entries.iter().map(|e| e.file.as_str()).collect();
-            if let Some(file) = self.current_file.clone() {
-                open_after = library::neighbor(&files, &file).map(str::to_owned);
-                to_delete = Some(file);
+            if !self.selected_files.is_empty() {
+                batch_delete = true;
+            } else {
+                let files: Vec<&str> = entries.iter().map(|e| e.file.as_str()).collect();
+                if let Some(file) = self.current_file.clone() {
+                    open_after = library::neighbor(&files, &file).map(str::to_owned);
+                    to_delete = Some(file);
+                }
             }
+        }
+        if batch_delete {
+            let files = self.selected_files.clone();
+            self.delete_batch_from_library(&files);
+        }
+        if batch_export {
+            let files = self.selected_files.clone();
+            self.export_files_to_folder(&files);
+        }
+        if let Some(files) = batch_copy {
+            self.copy_library_files_to_clipboard(&files);
+        }
+        if let Some(vertical) = batch_combine {
+            let files = self.selected_files.clone();
+            self.combine_selected_images(&ctx, &files, vertical);
         }
         if let Some(file) = to_open {
             self.open_from_library(&ctx, &file);

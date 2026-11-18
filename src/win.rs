@@ -742,6 +742,518 @@ impl Drop for RegionFrame {
     }
 }
 
+const CF_HDROP: u32 = 15;
+const GMEM_MOVEABLE: u32 = 0x0002;
+const GMEM_ZEROINIT: u32 = 0x0040;
+
+#[repr(C)]
+struct DropFilesHeader {
+    p_files: u32,
+    pt_x: i32,
+    pt_y: i32,
+    f_nc: i32,
+    f_wide: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Guid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+const IID_IUNKNOWN: Guid = Guid {
+    data1: 0x0000_0000,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+const IID_IDATAOBJECT: Guid = Guid {
+    data1: 0x0000_010E,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+const IID_IDROPSOURCE: Guid = Guid {
+    data1: 0x0000_0121,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FormatEtc {
+    cf_format: u16,
+    ptd: *mut c_void,
+    dw_aspect: u32,
+    lindex: i32,
+    tymed: u32,
+}
+
+#[repr(C)]
+struct StgMedium {
+    tymed: u32,
+    hglobal: *mut c_void,
+    p_unk_for_release: *mut c_void,
+}
+
+const S_OK: i32 = 0;
+const S_FALSE: i32 = 1;
+const E_INVALIDARG: i32 = -2147024809i32; // 0x80070057
+const E_NOINTERFACE: i32 = -2147467262i32; // 0x80004002
+const E_NOTIMPL: i32 = -2147467263i32; // 0x80004001
+const E_OUTOFMEMORY: i32 = -2147024882i32; // 0x8007000E
+const DV_E_FORMATETC: i32 = -2147221404i32; // 0x80040064
+const OLE_E_ADVISENOTSUPPORTED: i32 = -2147221501i32; // 0x80040003
+const DATA_S_SAMEFORMATETC: i32 = 0x0004_0130;
+const DRAGDROP_S_DROP: i32 = 0x0004_0100;
+const DRAGDROP_S_CANCEL: i32 = 0x0004_0101;
+const DRAGDROP_S_USEDEFAULTCURSORS: i32 = 0x0004_0102;
+
+const DVASPECT_CONTENT: u32 = 1;
+const TYMED_HGLOBAL: u32 = 1;
+const DATADIR_GET: u32 = 1;
+const DROPEFFECT_COPY: u32 = 1;
+const MK_LBUTTON: u32 = 0x0001;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> *mut c_void;
+    fn GlobalLock(hMem: *mut c_void) -> *mut c_void;
+    fn GlobalUnlock(hMem: *mut c_void) -> i32;
+    fn GlobalFree(hMem: *mut c_void) -> *mut c_void;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn OpenClipboard(hWndNewOwner: HWND) -> i32;
+    fn EmptyClipboard() -> i32;
+    fn SetClipboardData(uFormat: u32, hMem: *mut c_void) -> *mut c_void;
+    fn CloseClipboard() -> i32;
+    fn ReleaseCapture() -> i32;
+}
+
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn OleInitialize(pvReserved: *mut c_void) -> i32;
+    fn DoDragDrop(
+        pDataObj: *mut c_void,
+        pDropSource: *mut c_void,
+        dwOKEffects: u32,
+        pdwEffect: *mut u32,
+    ) -> i32;
+}
+
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn SHCreateStdEnumFmtEtc(
+        cfmt: u32,
+        afmt: *const FormatEtc,
+        ppenumFormatEtc: *mut *mut c_void,
+    ) -> i32;
+}
+
+fn normalize_win_path(p: &std::path::Path) -> String {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().map(|d| d.join(p)).unwrap_or_else(|_| p.to_path_buf())
+    };
+    let s = abs.to_string_lossy();
+    s.strip_prefix(r"\\?\").unwrap_or(&s).to_owned()
+}
+
+fn build_dropfiles_hglobal(paths: &[std::path::PathBuf]) -> Result<*mut c_void, String> {
+    if paths.is_empty() {
+        return Err("No files provided".into());
+    }
+    let mut wide_paths: Vec<u16> = Vec::new();
+    for p in paths {
+        let s = normalize_win_path(p);
+        wide_paths.extend(s.encode_utf16());
+        wide_paths.push(0);
+    }
+    wide_paths.push(0); // Double null-terminator
+
+    let header_bytes = size_of::<DropFilesHeader>();
+    let chars_bytes = wide_paths.len() * size_of::<u16>();
+    let total_bytes = header_bytes + chars_bytes;
+
+    // SAFETY: allocates movable, zero-initialized global memory and copies the DROPFILES header + UTF-16 paths.
+    unsafe {
+        let hglobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_bytes);
+        if hglobal.is_null() {
+            return Err("GlobalAlloc failed".into());
+        }
+        let ptr = GlobalLock(hglobal);
+        if ptr.is_null() {
+            GlobalFree(hglobal);
+            return Err("GlobalLock failed".into());
+        }
+        let header = DropFilesHeader {
+            p_files: header_bytes as u32,
+            pt_x: 0,
+            pt_y: 0,
+            f_nc: 0,
+            f_wide: 1,
+        };
+        std::ptr::copy_nonoverlapping(
+            (&raw const header).cast::<u8>(),
+            ptr.cast::<u8>(),
+            header_bytes,
+        );
+        std::ptr::copy_nonoverlapping(
+            wide_paths.as_ptr().cast::<u8>(),
+            ptr.cast::<u8>().add(header_bytes),
+            chars_bytes,
+        );
+        GlobalUnlock(hglobal);
+        Ok(hglobal)
+    }
+}
+
+/// Copies one or more files to the Windows clipboard as `CF_HDROP` so they can be pasted directly
+/// into Explorer, browsers, Discord, Slack, WhatsApp, or email clients.
+pub fn copy_files_to_clipboard(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    let hglobal = build_dropfiles_hglobal(paths)?;
+    // SAFETY: standard Win32 clipboard sequence; on SetClipboardData success the system owns `hglobal`.
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            GlobalFree(hglobal);
+            return Err("Could not open Windows clipboard".into());
+        }
+        EmptyClipboard();
+        let ok = !SetClipboardData(CF_HDROP, hglobal).is_null();
+        CloseClipboard();
+        if !ok {
+            GlobalFree(hglobal);
+            return Err("SetClipboardData(CF_HDROP) failed".into());
+        }
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct IDataObjectVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    get_data: unsafe extern "system" fn(*mut c_void, *const FormatEtc, *mut StgMedium) -> i32,
+    get_data_here: unsafe extern "system" fn(*mut c_void, *const FormatEtc, *mut StgMedium) -> i32,
+    query_get_data: unsafe extern "system" fn(*mut c_void, *const FormatEtc) -> i32,
+    get_canonical_format_etc: unsafe extern "system" fn(*mut c_void, *const FormatEtc, *mut FormatEtc) -> i32,
+    set_data: unsafe extern "system" fn(*mut c_void, *const FormatEtc, *const StgMedium, i32) -> i32,
+    enum_format_etc: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32,
+    d_advise: unsafe extern "system" fn(*mut c_void, *const FormatEtc, u32, *mut c_void, *mut u32) -> i32,
+    d_unadvise: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+    enum_d_advise: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
+}
+
+#[repr(C)]
+struct FileDataObject {
+    vtbl: *const IDataObjectVtbl,
+    ref_count: std::sync::atomic::AtomicU32,
+    paths: Vec<std::path::PathBuf>,
+}
+
+fn matches_hdrop_format(fmt: &FormatEtc) -> bool {
+    fmt.cf_format == CF_HDROP as u16
+        && (fmt.dw_aspect & DVASPECT_CONTENT) != 0
+        && (fmt.tymed & TYMED_HGLOBAL) != 0
+}
+
+unsafe extern "system" fn data_obj_query_interface(
+    this: *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> i32 {
+    if ppv.is_null() || riid.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `riid` and `ppv` are non-null and `this` is a valid `FileDataObject`.
+    unsafe {
+        let iid = *riid;
+        if iid == IID_IUNKNOWN || iid == IID_IDATAOBJECT {
+            *ppv = this;
+            data_obj_add_ref(this);
+            S_OK
+        } else {
+            *ppv = std::ptr::null_mut();
+            E_NOINTERFACE
+        }
+    }
+}
+
+unsafe extern "system" fn data_obj_add_ref(this: *mut c_void) -> u32 {
+    // SAFETY: `this` points to a valid `FileDataObject`.
+    let obj = unsafe { &*(this as *const FileDataObject) };
+    obj.ref_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn data_obj_release(this: *mut c_void) -> u32 {
+    // SAFETY: `this` points to a heap-allocated `FileDataObject`.
+    let obj = unsafe { &*(this as *const FileDataObject) };
+    let prev = obj.ref_count.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    if prev == 1 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        unsafe { drop(Box::from_raw(this as *mut FileDataObject)) };
+    }
+    prev - 1
+}
+
+unsafe extern "system" fn data_obj_get_data(
+    this: *mut c_void,
+    pformatetc_in: *const FormatEtc,
+    pmedium: *mut StgMedium,
+) -> i32 {
+    if pformatetc_in.is_null() || pmedium.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: pointers validated above.
+    unsafe {
+        if !matches_hdrop_format(&*pformatetc_in) {
+            return DV_E_FORMATETC;
+        }
+        let obj = &*(this as *const FileDataObject);
+        match build_dropfiles_hglobal(&obj.paths) {
+            Ok(hglobal) => {
+                *pmedium = StgMedium {
+                    tymed: TYMED_HGLOBAL,
+                    hglobal,
+                    p_unk_for_release: std::ptr::null_mut(),
+                };
+                S_OK
+            }
+            Err(_) => E_OUTOFMEMORY,
+        }
+    }
+}
+
+unsafe extern "system" fn data_obj_get_data_here(
+    _this: *mut c_void,
+    _pformatetc: *const FormatEtc,
+    _pmedium: *mut StgMedium,
+) -> i32 {
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn data_obj_query_get_data(
+    _this: *mut c_void,
+    pformatetc: *const FormatEtc,
+) -> i32 {
+    if pformatetc.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `pformatetc` is non-null.
+    if unsafe { matches_hdrop_format(&*pformatetc) } {
+        S_OK
+    } else {
+        DV_E_FORMATETC
+    }
+}
+
+unsafe extern "system" fn data_obj_get_canonical_format_etc(
+    _this: *mut c_void,
+    _pformatect_in: *const FormatEtc,
+    pformatetc_out: *mut FormatEtc,
+) -> i32 {
+    if !pformatetc_out.is_null() {
+        // SAFETY: `pformatetc_out` is non-null.
+        unsafe { (*pformatetc_out).ptd = std::ptr::null_mut() };
+    }
+    DATA_S_SAMEFORMATETC
+}
+
+unsafe extern "system" fn data_obj_set_data(
+    _this: *mut c_void,
+    _pformatetc: *const FormatEtc,
+    _pmedium: *const StgMedium,
+    _f_release: i32,
+) -> i32 {
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn data_obj_enum_format_etc(
+    _this: *mut c_void,
+    dw_direction: u32,
+    ppenum_format_etc: *mut *mut c_void,
+) -> i32 {
+    if ppenum_format_etc.is_null() {
+        return E_INVALIDARG;
+    }
+    if dw_direction == DATADIR_GET {
+        let fmt = FormatEtc {
+            cf_format: CF_HDROP as u16,
+            ptd: std::ptr::null_mut(),
+            dw_aspect: DVASPECT_CONTENT,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL,
+        };
+        // SAFETY: `SHCreateStdEnumFmtEtc` creates a standard COM enumerator for `fmt`.
+        unsafe { SHCreateStdEnumFmtEtc(1, &fmt, ppenum_format_etc) }
+    } else {
+        // SAFETY: `ppenum_format_etc` is non-null.
+        unsafe { *ppenum_format_etc = std::ptr::null_mut() };
+        E_NOTIMPL
+    }
+}
+
+unsafe extern "system" fn data_obj_d_advise(
+    _this: *mut c_void,
+    _pformatetc: *const FormatEtc,
+    _advf: u32,
+    _padv_sink: *mut c_void,
+    _pdw_connection: *mut u32,
+) -> i32 {
+    OLE_E_ADVISENOTSUPPORTED
+}
+
+unsafe extern "system" fn data_obj_d_unadvise(_this: *mut c_void, _dw_connection: u32) -> i32 {
+    OLE_E_ADVISENOTSUPPORTED
+}
+
+unsafe extern "system" fn data_obj_enum_d_advise(
+    _this: *mut c_void,
+    _ppenum_advise: *mut *mut c_void,
+) -> i32 {
+    OLE_E_ADVISENOTSUPPORTED
+}
+
+static DATA_OBJECT_VTBL: IDataObjectVtbl = IDataObjectVtbl {
+    query_interface: data_obj_query_interface,
+    add_ref: data_obj_add_ref,
+    release: data_obj_release,
+    get_data: data_obj_get_data,
+    get_data_here: data_obj_get_data_here,
+    query_get_data: data_obj_query_get_data,
+    get_canonical_format_etc: data_obj_get_canonical_format_etc,
+    set_data: data_obj_set_data,
+    enum_format_etc: data_obj_enum_format_etc,
+    d_advise: data_obj_d_advise,
+    d_unadvise: data_obj_d_unadvise,
+    enum_d_advise: data_obj_enum_d_advise,
+};
+
+#[repr(C)]
+struct IDropSourceVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    query_continue_drag: unsafe extern "system" fn(*mut c_void, i32, u32) -> i32,
+    give_feedback: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+}
+
+#[repr(C)]
+struct FileDropSource {
+    vtbl: *const IDropSourceVtbl,
+    ref_count: std::sync::atomic::AtomicU32,
+}
+
+unsafe extern "system" fn drop_src_query_interface(
+    this: *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> i32 {
+    if ppv.is_null() || riid.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `riid` and `ppv` are non-null and `this` is a valid `FileDropSource`.
+    unsafe {
+        let iid = *riid;
+        if iid == IID_IUNKNOWN || iid == IID_IDROPSOURCE {
+            *ppv = this;
+            drop_src_add_ref(this);
+            S_OK
+        } else {
+            *ppv = std::ptr::null_mut();
+            E_NOINTERFACE
+        }
+    }
+}
+
+unsafe extern "system" fn drop_src_add_ref(this: *mut c_void) -> u32 {
+    // SAFETY: `this` points to a valid `FileDropSource`.
+    let obj = unsafe { &*(this as *const FileDropSource) };
+    obj.ref_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn drop_src_release(this: *mut c_void) -> u32 {
+    // SAFETY: `this` points to a heap-allocated `FileDropSource`.
+    let obj = unsafe { &*(this as *const FileDropSource) };
+    let prev = obj.ref_count.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    if prev == 1 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        unsafe { drop(Box::from_raw(this as *mut FileDropSource)) };
+    }
+    prev - 1
+}
+
+unsafe extern "system" fn drop_src_query_continue_drag(
+    _this: *mut c_void,
+    f_escape_pressed: i32,
+    grf_key_state: u32,
+) -> i32 {
+    if f_escape_pressed != 0 {
+        DRAGDROP_S_CANCEL
+    } else if (grf_key_state & MK_LBUTTON) == 0 {
+        DRAGDROP_S_DROP
+    } else {
+        S_OK
+    }
+}
+
+unsafe extern "system" fn drop_src_give_feedback(_this: *mut c_void, _dw_effect: u32) -> i32 {
+    DRAGDROP_S_USEDEFAULTCURSORS
+}
+
+static DROP_SOURCE_VTBL: IDropSourceVtbl = IDropSourceVtbl {
+    query_interface: drop_src_query_interface,
+    add_ref: drop_src_add_ref,
+    release: drop_src_release,
+    query_continue_drag: drop_src_query_continue_drag,
+    give_feedback: drop_src_give_feedback,
+};
+
+/// Starts a native Windows OLE file drag-and-drop operation (`CF_HDROP`) for the given paths.
+/// Returns `true` if the user dropped the files onto a target that accepted them.
+pub fn start_file_drag(paths: &[std::path::PathBuf]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let data_obj = Box::into_raw(Box::new(FileDataObject {
+        vtbl: &DATA_OBJECT_VTBL,
+        ref_count: std::sync::atomic::AtomicU32::new(1),
+        paths: paths.to_vec(),
+    }));
+    let drop_src = Box::into_raw(Box::new(FileDropSource {
+        vtbl: &DROP_SOURCE_VTBL,
+        ref_count: std::sync::atomic::AtomicU32::new(1),
+    }));
+
+    let mut effect: u32 = 0;
+    // SAFETY: initializes OLE on this thread (harmless if already initialized), releases winit mouse
+    // capture so the Shell modal drag loop receives mouse input, runs `DoDragDrop`, and releases our COM refs.
+    let hr = unsafe {
+        let _ = OleInitialize(std::ptr::null_mut());
+        ReleaseCapture();
+        let hr = DoDragDrop(
+            data_obj.cast::<c_void>(),
+            drop_src.cast::<c_void>(),
+            DROPEFFECT_COPY,
+            &mut effect,
+        );
+        data_obj_release(data_obj.cast::<c_void>());
+        drop_src_release(drop_src.cast::<c_void>());
+        hr
+    };
+    (hr == DRAGDROP_S_DROP || hr == S_OK || hr == S_FALSE) && effect != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +1297,45 @@ mod tests {
         let frame = RegionFrame::show((-30000, -30000, -29900, -29900));
         assert!(frame.is_some());
         drop(frame);
+    }
+
+    #[test]
+    fn dropfiles_hglobal_and_com_data_object_work() {
+        assert!(build_dropfiles_hglobal(&[]).is_err());
+        let paths = vec![std::path::PathBuf::from(r"C:\Temp\a.png"), std::path::PathBuf::from(r"C:\Temp\b.mp4")];
+        let hglobal = build_dropfiles_hglobal(&paths).unwrap();
+        unsafe {
+            let ptr = GlobalLock(hglobal).cast::<DropFilesHeader>();
+            assert!(!ptr.is_null());
+            assert_eq!((*ptr).p_files, 20);
+            assert_eq!((*ptr).f_wide, 1);
+            GlobalUnlock(hglobal);
+            GlobalFree(hglobal);
+
+            let data_obj = Box::into_raw(Box::new(FileDataObject {
+                vtbl: &DATA_OBJECT_VTBL,
+                ref_count: std::sync::atomic::AtomicU32::new(1),
+                paths,
+            }));
+            let fmt = FormatEtc {
+                cf_format: CF_HDROP as u16,
+                ptd: std::ptr::null_mut(),
+                dw_aspect: DVASPECT_CONTENT,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL,
+            };
+            assert_eq!(data_obj_query_get_data(data_obj.cast(), &fmt), S_OK);
+            let mut medium: StgMedium = std::mem::zeroed();
+            assert_eq!(data_obj_get_data(data_obj.cast(), &fmt, &mut medium), S_OK);
+            assert_eq!(medium.tymed, TYMED_HGLOBAL);
+            assert!(!medium.hglobal.is_null());
+            GlobalFree(medium.hglobal);
+            assert_eq!(data_obj_release(data_obj.cast()), 0);
+
+            assert_eq!(drop_src_query_continue_drag(std::ptr::null_mut(), 1, MK_LBUTTON), DRAGDROP_S_CANCEL);
+            assert_eq!(drop_src_query_continue_drag(std::ptr::null_mut(), 0, 0), DRAGDROP_S_DROP);
+            assert_eq!(drop_src_query_continue_drag(std::ptr::null_mut(), 0, MK_LBUTTON), S_OK);
+        }
     }
 
     /// Manual diagnosis: `cargo test cursor_report -- --ignored --nocapture`.

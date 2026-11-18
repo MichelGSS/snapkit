@@ -453,6 +453,51 @@ pub fn make_thumb(image: &RgbaImage) -> RgbaImage {
     image::imageops::thumbnail(image, THUMB_WIDTH, h)
 }
 
+/// Stitches two or more images together vertically (top-to-bottom) or horizontally (left-to-right),
+/// separated by `gap` pixels and centered along the cross axis.
+pub fn combine_images(paths: &[PathBuf], vertical: bool, gap: u32) -> Result<RgbaImage, String> {
+    if paths.len() < 2 {
+        return Err("Select at least 2 images to combine".into());
+    }
+    let mut images = Vec::with_capacity(paths.len());
+    for p in paths {
+        let img = image::open(p)
+            .map_err(|e| format!("{}: {e}", p.display()))?
+            .to_rgba8();
+        if img.width() == 0 || img.height() == 0 {
+            return Err(format!("{}: empty image", p.display()));
+        }
+        images.push(img);
+    }
+
+    let total_gap = gap.saturating_mul((images.len() - 1) as u32);
+    let (out_w, out_h) = if vertical {
+        let w = images.iter().map(|i| i.width()).max().unwrap_or(1);
+        let h = images.iter().map(|i| i.height()).fold(0u32, u32::saturating_add).saturating_add(total_gap);
+        (w, h)
+    } else {
+        let w = images.iter().map(|i| i.width()).fold(0u32, u32::saturating_add).saturating_add(total_gap);
+        let h = images.iter().map(|i| i.height()).max().unwrap_or(1);
+        (w, h)
+    };
+
+    let mut canvas = RgbaImage::from_pixel(out_w, out_h, image::Rgba([30, 30, 34, 255]));
+    let mut offset = 0u32;
+    for img in &images {
+        let (dx, dy) = if vertical {
+            ((out_w.saturating_sub(img.width())) / 2, offset)
+        } else {
+            (offset, (out_h.saturating_sub(img.height())) / 2)
+        };
+        image::imageops::replace(&mut canvas, img, dx as i64, dy as i64);
+        offset = offset
+            .saturating_add(if vertical { img.height() } else { img.width() })
+            .saturating_add(gap);
+    }
+
+    Ok(canvas)
+}
+
 pub struct LayersJob {
     pub base_path: PathBuf,
     pub base_image: Option<RgbaImage>,
@@ -866,6 +911,33 @@ mod tests {
         let lib = Library::open(dir.clone());
         let files: Vec<&str> = lib.search("").iter().map(|e| e.file.as_str()).collect();
         assert_eq!(files, ["2026-11-10_02-46-00.mp4", "2026-11-10_02-45-12.png"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn combine_images_stitches_vertically_and_horizontally() {
+        let dir = temp_dir("combine");
+        let p1 = dir.join("one.png");
+        let p2 = dir.join("two.png");
+        RgbaImage::from_pixel(40, 20, image::Rgba([255, 0, 0, 255])).save(&p1).unwrap();
+        RgbaImage::from_pixel(20, 30, image::Rgba([0, 255, 0, 255])).save(&p2).unwrap();
+
+        assert!(combine_images(std::slice::from_ref(&p1), true, 4).is_err());
+
+        let vert = combine_images(&[p1.clone(), p2.clone()], true, 6).unwrap();
+        assert_eq!((vert.width(), vert.height()), (40, 20 + 30 + 6));
+        assert_eq!(vert.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(vert.get_pixel(20, 22).0, [30, 30, 34, 255]); // gap
+        assert_eq!(vert.get_pixel(5, 30).0, [30, 30, 34, 255]); // left margin of centered narrower image
+        assert_eq!(vert.get_pixel(15, 30).0, [0, 255, 0, 255]); // centered second image
+
+        let horiz = combine_images(&[p1, p2], false, 4).unwrap();
+        assert_eq!((horiz.width(), horiz.height()), (40 + 20 + 4, 30));
+        assert_eq!(horiz.get_pixel(0, 2).0, [30, 30, 34, 255]); // top margin of centered shorter image
+        assert_eq!(horiz.get_pixel(10, 15).0, [255, 0, 0, 255]); // centered first image
+        assert_eq!(horiz.get_pixel(42, 15).0, [30, 30, 34, 255]); // gap
+        assert_eq!(horiz.get_pixel(50, 15).0, [0, 255, 0, 255]); // second image
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

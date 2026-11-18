@@ -346,7 +346,7 @@ mod tests {
         let mut img = RgbaImage::from_pixel(700, 200, image::Rgba([255, 255, 255, 255]));
         let font = crate::editor::default_font();
         for (y, text) in [(20.0, "Dear Santa 2026"), (110.0, "second line here")] {
-            let op = Op::Text { pos: (30.0, y), text: text.into(), color: [0, 0, 0, 255], size: 44.0, boxed: false };
+            let op = Op::Text { pos: (30.0, y), text: text.into(), color: [0, 0, 0, 255], size: 44.0, boxed: false, angle: 0.0 };
             render::apply(&mut img, &op, &font);
         }
         let lines = recognize(&dir, &img).unwrap();

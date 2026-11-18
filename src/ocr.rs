@@ -546,7 +546,7 @@ three");
         let font = crate::editor::default_font();
         let lines = [(20.0, 20.0, "Recorte de tela 2026"), (80.0, 70.0, "segunda linha"), (20.0, 190.0, "depois do espaço")];
         for (x, y, text) in lines {
-            let op = Op::Text { pos: (x, y), text: text.into(), color: [230, 230, 230, 255], size: 34.0, boxed: false };
+            let op = Op::Text { pos: (x, y), text: text.into(), color: [230, 230, 230, 255], size: 34.0, boxed: false, angle: 0.0 };
             render::apply(&mut img, &op, &font);
         }
         img

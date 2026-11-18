@@ -169,7 +169,14 @@ fn tool_for(op: &Op) -> Tool {
         Op::Pixelate { .. } => Tool::Pixelate,
         Op::Blur { .. } => Tool::Blur,
         Op::Magnify { .. } => Tool::Magnify,
-        Op::Crop { .. } | Op::Rotate { .. } | Op::Flip { .. } | Op::Resize { .. } | Op::Border { .. } | Op::Shadow { .. } | Op::CutOut { .. } => Tool::Crop,
+        Op::Crop { .. }
+        | Op::Rotate { .. }
+        | Op::Flip { .. }
+        | Op::Resize { .. }
+        | Op::Border { .. }
+        | Op::Shadow { .. }
+        | Op::Beautify { .. }
+        | Op::CutOut { .. } => Tool::Crop,
     }
 }
 
@@ -321,6 +328,29 @@ impl History {
         }
     }
 
+    /// Moves an editable object backward or forward in the Z-order within `first_object()..ops.len()`.
+    pub fn reorder_object(&mut self, idx: usize, to_front: bool, all_the_way: bool, font: &FontArc) -> Option<usize> {
+        let first = self.first_object();
+        if idx < first || idx >= self.ops.len() {
+            return None;
+        }
+        let last = self.ops.len() - 1;
+        let target = match (to_front, all_the_way) {
+            (true, true) => last,
+            (true, false) => (idx + 1).min(last),
+            (false, true) => first,
+            (false, false) => idx.saturating_sub(1).max(first),
+        };
+        if target == idx {
+            return Some(idx);
+        }
+        self.checkpoint();
+        let op = self.ops.remove(idx);
+        self.ops.insert(target, op);
+        self.current = render::render_all(&self.original, &self.ops, font);
+        Some(target)
+    }
+
     fn rerender(&mut self) {
         self.current = render::render_all(&self.original, &self.ops, &self.font);
     }
@@ -335,7 +365,14 @@ impl History {
                     op.rebase_translate(dx, dy);
                     // Operations after a crop or whole-image transform are already in the
                     // coordinate system of that transform, not the original capture's.
-                    if matches!(op, Op::Crop { .. } | Op::Rotate { .. } | Op::Flip { .. } | Op::Resize { .. }) {
+                    if matches!(
+                        op,
+                        Op::Crop { .. }
+                            | Op::Rotate { .. }
+                            | Op::Flip { .. }
+                            | Op::Resize { .. }
+                            | Op::Beautify { .. }
+                    ) {
                         break;
                     }
                 }
@@ -444,6 +481,15 @@ pub struct Editor {
     resize_lock: bool,
     /// Border width in the Image menu, in pixels.
     border_px: u32,
+    /// Beautifier mockup settings in the Image menu.
+    beautify_preset: u8,
+    beautify_padding: u32,
+    beautify_radius: u32,
+    beautify_shadow: u32,
+    /// Eyedropper mode: next click on the image picks its pixel color.
+    eyedropper: bool,
+    /// Active smart alignment guides while dragging an object: `(true, x_px)` for vertical, `(false, y_px)` for horizontal.
+    smart_guides: Vec<(bool, f32)>,
     drag_start: Option<Point>,
     pen_points: Vec<Point>,
     pending_text: Option<PendingText>,
@@ -495,6 +541,12 @@ impl Editor {
             resize_to: (0, 0),
             resize_lock: true,
             border_px: 4,
+            beautify_preset: 0,
+            beautify_padding: 48,
+            beautify_radius: 12,
+            beautify_shadow: 24,
+            eyedropper: false,
+            smart_guides: Vec::new(),
             drag_start: None,
             pen_points: Vec::new(),
             pending_text: None,
@@ -852,12 +904,75 @@ impl Editor {
             {
                 op = Some(Op::Shadow { size: 24 });
             }
+            ui.separator();
+            ui.weak(t!("✨ Plano de fundo (Mockup)", "✨ Background mockup"));
+            let preset_idx = (self.beautify_preset as usize).min(render::BEAUTIFY_PRESETS.len() - 1);
+            let (_, _, pt_name, en_name) = render::BEAUTIFY_PRESETS[preset_idx];
+            egui::ComboBox::from_id_salt("beautify_preset")
+                .selected_text(pick(pt_name, en_name))
+                .show_ui(ui, |ui| {
+                    for (idx, (ca, cb, pt, en)) in render::BEAUTIFY_PRESETS.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let (swatch, _) = ui.allocate_exact_size(Vec2::new(20.0, 12.0), Sense::hover());
+                            let left = Rect::from_min_max(swatch.min, Pos2::new(swatch.center().x, swatch.max.y));
+                            let right = Rect::from_min_max(Pos2::new(swatch.center().x, swatch.min.y), swatch.max);
+                            ui.painter().rect_filled(left, 2.0, Color32::from_rgba_unmultiplied(ca[0], ca[1], ca[2], ca[3]));
+                            ui.painter().rect_filled(right, 2.0, Color32::from_rgba_unmultiplied(cb[0], cb[1], cb[2], cb[3]));
+                            ui.selectable_value(&mut self.beautify_preset, idx as u8, pick(pt, en));
+                        });
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.label(t!("Margem", "Padding"));
+                ui.add(egui::DragValue::new(&mut self.beautify_padding).range(8..=200).suffix(" px"));
+            });
+            ui.horizontal(|ui| {
+                ui.label(t!("Cantos", "Corners"));
+                ui.add(egui::DragValue::new(&mut self.beautify_radius).range(0..=64).suffix(" px"));
+            });
+            ui.horizontal(|ui| {
+                ui.label(t!("Sombra", "Shadow"));
+                ui.add(egui::DragValue::new(&mut self.beautify_shadow).range(0..=64).suffix(" px"));
+            });
+            if ui.button(t!("✨ Aplicar plano de fundo", "✨ Apply background")).clicked() {
+                op = Some(Op::Beautify {
+                    preset: self.beautify_preset,
+                    padding: self.beautify_padding,
+                    radius: self.beautify_radius,
+                    shadow: self.beautify_shadow,
+                });
+            }
         });
         if let Some(op) = op {
             self.commit_pending_text();
             self.selected = None;
             self.drag = None;
             self.commit(op);
+        }
+    }
+
+    fn color_ui(&mut self, ui: &mut egui::Ui) {
+        for c in PALETTE {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+            ui.painter().rect_filled(rect, 4.0, c);
+            if self.color == c {
+                ui.painter().rect_stroke(rect, 4.0, Stroke::new(2.0, ui.visuals().strong_text_color()), StrokeKind::Outside);
+            }
+            if resp.clicked() {
+                self.color = c;
+                self.eyedropper = false;
+            }
+        }
+        ui.color_edit_button_srgba(&mut self.color).on_hover_text(t!("Outra cor", "Other color"));
+        if ui
+            .add(egui::Button::new("💧").selected(self.eyedropper))
+            .on_hover_text(t!(
+                "Conta-gotas: clique em qualquer ponto da imagem para copiar a cor (I)",
+                "Eyedropper: click anywhere on the image to pick its color (I)"
+            ))
+            .clicked()
+        {
+            self.eyedropper = !self.eyedropper;
         }
     }
 
@@ -889,17 +1004,7 @@ impl Editor {
             };
             if show.color {
                 ui.separator();
-                for c in PALETTE {
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-                    ui.painter().rect_filled(rect, 4.0, c);
-                    if self.color == c {
-                        ui.painter().rect_stroke(rect, 4.0, Stroke::new(2.0, ui.visuals().strong_text_color()), StrokeKind::Outside);
-                    }
-                    if resp.clicked() {
-                        self.color = c;
-                    }
-                }
-                ui.color_edit_button_srgba(&mut self.color).on_hover_text(t!("Outra cor", "Other color"));
+                self.color_ui(ui);
             }
             if let Some(label) = show.thickness {
                 ui.separator();
@@ -946,8 +1051,52 @@ impl Editor {
                             self.change(i, op);
                         }
                     }
-                    if ui.button(t!("Duplicar", "Duplicate")).on_hover_text("Ctrl D").clicked() {
-                        self.duplicate(i);
+                    let angle = self.history.ops()[i].angle();
+                    if angle.abs() > 0.01 {
+                        ui.label(format!("{:.0}°", angle.to_degrees()));
+                        if ui
+                            .button("0°")
+                            .on_hover_text(t!("Redefinir rotação", "Reset rotation"))
+                            .clicked()
+                        {
+                            let mut op = self.history.ops()[i].clone();
+                            op.set_angle(0.0);
+                            self.gesture_open = false;
+                            self.change(i, op);
+                            self.gesture_open = false;
+                        }
+                    }
+                    if ui
+                        .button("⬆")
+                        .on_hover_text(t!("Trazer para a frente (])", "Bring forward (])"))
+                        .clicked()
+                    {
+                        self.reorder(i, true, false);
+                    }
+                    if ui
+                        .button("⬇")
+                        .on_hover_text(t!("Enviar para trás ([)", "Send backward ([)"))
+                        .clicked()
+                    {
+                        self.reorder(i, false, false);
+                    }
+                    if ui
+                        .button("⤒")
+                        .on_hover_text(t!("Trazer para o topo (Shift ])", "Bring to front (Shift ])"))
+                        .clicked()
+                    {
+                        self.reorder(i, true, true);
+                    }
+                    if ui
+                        .button("⤓")
+                        .on_hover_text(t!("Enviar para o fundo (Shift [)", "Send to back (Shift [)"))
+                        .clicked()
+                    {
+                        self.reorder(i, false, true);
+                    }
+                    if ui.button(t!("⧉ Duplicar", "⧉ Duplicate")).on_hover_text("Ctrl D").clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.duplicate_selected(&ctx);
                     }
                     if ui.button(t!("Apagar", "Delete")).on_hover_text("Delete").clicked() {
                         self.delete(i);
@@ -1052,7 +1201,18 @@ impl Editor {
             }
             if resp.clicked() {
                 self.color = c;
+                self.eyedropper = false;
             }
+        }
+        if ui
+            .add(egui::Button::new("💧").selected(self.eyedropper))
+            .on_hover_text(t!(
+                "Conta-gotas: clique em qualquer ponto da imagem para copiar a cor (I)",
+                "Eyedropper: click anywhere on the image to pick its color (I)"
+            ))
+            .clicked()
+        {
+            self.eyedropper = !self.eyedropper;
         }
         ui.spacing_mut().slider_width = 70.0;
         ui.add(egui::Slider::new(&mut self.width, 1.0..=24.0).show_value(false)).on_hover_text(t!("Espessura ou tamanho", "Thickness or size"));
@@ -1084,11 +1244,18 @@ impl Editor {
         let ctx = ui.ctx().clone();
         // Shortcuts only apply when no text field is being edited.
         if self.pending_text.is_none() && !ctx.egui_wants_keyboard_input() {
-            let (undo, redo) = ctx.input_mut(|i| {
+            let (undo, redo, toggle_eyedropper, cancel_eyedropper) = ctx.input_mut(|i| {
                 let redo = i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
                     || i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z);
-                (i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z), redo)
+                let toggle_eyedropper = i.consume_key(egui::Modifiers::NONE, egui::Key::I);
+                let cancel_eyedropper = self.eyedropper && i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                (i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z), redo, toggle_eyedropper, cancel_eyedropper)
             });
+            if toggle_eyedropper {
+                self.eyedropper = !self.eyedropper;
+            } else if cancel_eyedropper {
+                self.eyedropper = false;
+            }
             let zoom_keys = self.fixed_rect.is_none();
             let (fit, actual, zoom_in, zoom_out) = ctx.input_mut(|i| {
                 if !zoom_keys {
@@ -1182,6 +1349,55 @@ impl Editor {
         };
         let to_screen = |p: Point| img_rect.min + Vec2::new(p.0, p.1) * scale;
 
+        if self.eyedropper {
+            if response.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            let sample_pos = response.hover_pos().or_else(|| response.interact_pointer_pos());
+            if let Some(p) = sample_pos
+                && img_rect.contains(p)
+            {
+                let (w, h) = self.history.current.dimensions();
+                if w > 0 && h > 0 {
+                    let (ix, iy) = to_img(p);
+                    let px = (ix.floor() as u32).min(w - 1);
+                    let py = (iy.floor() as u32).min(h - 1);
+                    let rgba = self.history.current.get_pixel(px, py).0;
+                    let [r, g, b, a] = rgba;
+                    let picked = Color32::from_rgba_unmultiplied(r, g, b, a);
+                    let hex = format!("#{r:02X}{g:02X}{b:02X}");
+
+                    let pill_pos = p + Vec2::new(16.0, -28.0);
+                    let pill_rect = Rect::from_min_size(pill_pos, Vec2::new(92.0, 24.0));
+                    painter.rect_filled(pill_rect, 6.0, Color32::from_black_alpha(210));
+                    painter.rect_stroke(pill_rect, 6.0, Stroke::new(1.0, Color32::from_white_alpha(80)), StrokeKind::Middle);
+                    let swatch = Rect::from_min_size(pill_rect.min + Vec2::new(6.0, 4.0), Vec2::splat(16.0));
+                    painter.rect_filled(swatch, 3.0, picked);
+                    painter.rect_stroke(swatch, 3.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Middle);
+                    painter.text(
+                        Pos2::new(swatch.max.x + 6.0, pill_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        hex,
+                        egui::FontId::monospace(12.0),
+                        Color32::WHITE,
+                    );
+
+                    if response.clicked() || response.drag_started() {
+                        self.color = picked;
+                        if let Some(idx) = self.selection() {
+                            let mut op = self.history.ops()[idx].clone();
+                            op.set_color(rgba);
+                            self.gesture_open = false;
+                            self.change(idx, op);
+                            self.gesture_open = false;
+                        }
+                        self.eyedropper = false;
+                    }
+                }
+            }
+            return;
+        }
+
         if self.tool == Tool::Select {
             // Not clamped to the image: an object can be dragged partly outside it.
             let free = |p: Pos2| -> Point {
@@ -1190,6 +1406,18 @@ impl Editor {
             };
             self.pending_text_ui(&ctx, to_screen, scale);
             self.select_ui(&ctx, &response, &painter, free, to_screen, scale);
+            for &(vertical, px) in &self.smart_guides {
+                let guide_color = Color32::from_rgb(0, 210, 255);
+                let stroke = Stroke::new(1.5, guide_color);
+                let (start, end) = if vertical {
+                    let x = to_screen((px, 0.0)).x;
+                    (Pos2::new(x, img_rect.min.y), Pos2::new(x, img_rect.max.y))
+                } else {
+                    let y = to_screen((0.0, px)).y;
+                    (Pos2::new(img_rect.min.x, y), Pos2::new(img_rect.max.x, y))
+                };
+                draw_dashed_line(&painter, start, end, stroke, 6.0, 4.0);
+            }
             return;
         }
 
@@ -1210,7 +1438,7 @@ impl Editor {
                 && let Some(p) = response.interact_pointer_pos()
             {
                 let color = self.rgba();
-                self.commit(Op::Stamp { kind: self.stamp, center: to_img(p), radius, color });
+                self.commit(Op::Stamp { kind: self.stamp, center: to_img(p), radius, color, angle: 0.0 });
             }
             return;
         }
@@ -1236,7 +1464,7 @@ impl Editor {
             {
                 let color = self.rgba();
                 let (shape, glyph) = (self.step_shape, self.step_glyph);
-                self.commit(Op::Step { center: to_img(p), number, color, radius, shape, glyph });
+                self.commit(Op::Step { center: to_img(p), number, color, radius, shape, glyph, angle: 0.0 });
             }
             return;
         }
@@ -1350,12 +1578,43 @@ impl Editor {
         self.history.remove(index);
         self.selected = None;
         self.drag = None;
+        self.smart_guides.clear();
         self.refresh_texture();
+    }
+
+    fn reorder(&mut self, idx: usize, to_front: bool, all_the_way: bool) {
+        let font = self.history.font().clone();
+        if let Some(new_idx) = self.history.reorder_object(idx, to_front, all_the_way, &font)
+            && new_idx != idx
+        {
+            self.selected = Some(new_idx);
+            self.drag = None;
+            self.gesture_open = false;
+            self.refresh_texture();
+        }
+    }
+
+    /// Duplicates the currently selected annotation, offsetting it by `(16, 16)` (clamped to the
+    /// image bounds) and selecting the new copy.
+    pub fn duplicate_selected(&mut self, _ctx: &egui::Context) -> bool {
+        let Some(index) = self.selection() else { return false };
+        self.duplicate(index);
+        true
     }
 
     fn duplicate(&mut self, index: usize) {
         let Some(mut op) = self.history.ops().get(index).cloned() else { return };
-        op.translate(16.0, 16.0);
+        let (mut dx, mut dy) = (16.0, 16.0);
+        let (iw, ih) = (self.history.image().width() as f32, self.history.image().height() as f32);
+        if let Some((_min, max)) = op.bounds(self.history.font()) {
+            if max.0 + dx > iw {
+                dx = (iw - max.0).max(0.0);
+            }
+            if max.1 + dy > ih {
+                dy = (ih - max.1).max(0.0);
+            }
+        }
+        op.translate(dx, dy);
         if let Op::Step { number, .. } = &mut op {
             *number = self.history.next_step();
         }
@@ -1407,12 +1666,69 @@ impl Editor {
         }
 
         if let Some(mut d) = self.drag.take() {
+            self.smart_guides.clear();
             if let Some(cur) = response.interact_pointer_pos().map(&to_img) {
                 d.current = match d.handle {
                     Some(h) => d.orig.with_handle(h, cur, &font),
                     None => {
                         let mut op = d.orig.clone();
                         op.translate(cur.0 - d.start.0, cur.1 - d.start.1);
+                        if !ctx.input(|i| i.modifiers.alt)
+                            && let Some((min, max)) = op.bounds(&font)
+                        {
+                            let cand_x = [min.0, (min.0 + max.0) * 0.5, max.0];
+                            let cand_y = [min.1, (min.1 + max.1) * 0.5, max.1];
+                            let (iw, ih) = (
+                                self.history.image().width() as f32,
+                                self.history.image().height() as f32,
+                            );
+                            let mut targets_x = vec![iw * 0.5];
+                            let mut targets_y = vec![ih * 0.5];
+                            let first = self.history.first_object();
+                            for (idx, other) in self.history.ops().iter().enumerate().skip(first) {
+                                if idx == d.index {
+                                    continue;
+                                }
+                                if let Some((omin, omax)) = other.bounds(&font) {
+                                    targets_x.extend([omin.0, (omin.0 + omax.0) * 0.5, omax.0]);
+                                    targets_y.extend([omin.1, (omin.1 + omax.1) * 0.5, omax.1]);
+                                }
+                            }
+                            let snap_tol = 5.0_f32;
+                            let mut best_x: Option<(f32, f32)> = None;
+                            for cx in cand_x {
+                                for &tx in &targets_x {
+                                    let diff = tx - cx;
+                                    if diff.abs() <= snap_tol
+                                        && best_x.is_none_or(|(bd, _)| diff.abs() < bd.abs())
+                                    {
+                                        best_x = Some((diff, tx));
+                                    }
+                                }
+                            }
+                            let mut best_y: Option<(f32, f32)> = None;
+                            for cy in cand_y {
+                                for &ty in &targets_y {
+                                    let diff = ty - cy;
+                                    if diff.abs() <= snap_tol
+                                        && best_y.is_none_or(|(bd, _)| diff.abs() < bd.abs())
+                                    {
+                                        best_y = Some((diff, ty));
+                                    }
+                                }
+                            }
+                            let snap_dx = best_x.map_or(0.0, |(dx, _)| dx);
+                            let snap_dy = best_y.map_or(0.0, |(dy, _)| dy);
+                            if snap_dx != 0.0 || snap_dy != 0.0 {
+                                op.translate(snap_dx, snap_dy);
+                            }
+                            if let Some((_, tx)) = best_x {
+                                self.smart_guides.push((true, tx));
+                            }
+                            if let Some((_, ty)) = best_y {
+                                self.smart_guides.push((false, ty));
+                            }
+                        }
                         op
                     }
                 };
@@ -1430,7 +1746,11 @@ impl Editor {
             }
             if response.dragged() && !stop {
                 self.drag = Some(d);
+            } else {
+                self.smart_guides.clear();
             }
+        } else {
+            self.smart_guides.clear();
         }
 
         let click_pos = response.interact_pointer_pos().map(&to_img);
@@ -1461,8 +1781,9 @@ impl Editor {
             && !ctx.egui_wants_keyboard_input()
             && let Some(i) = self.selection()
         {
-            let (delete, escape, duplicate, dx, dy) = ctx.input_mut(|inp| {
-                let step = if inp.modifiers.shift { 10.0 } else { 1.0 };
+            let (delete, escape, duplicate, send_back, bring_front, shift, dx, dy) = ctx.input_mut(|inp| {
+                let shift = inp.modifiers.shift;
+                let step = if shift { 10.0 } else { 1.0 };
                 let axis = |neg: egui::Key, pos: egui::Key| {
                     step * (inp.key_pressed(pos) as i32 - inp.key_pressed(neg) as i32) as f32
                 };
@@ -1474,6 +1795,9 @@ impl Editor {
                     inp.key_pressed(egui::Key::Delete) || inp.key_pressed(egui::Key::Backspace),
                     inp.key_pressed(egui::Key::Escape),
                     inp.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
+                    inp.key_pressed(egui::Key::OpenBracket),
+                    inp.key_pressed(egui::Key::CloseBracket),
+                    shift,
                     dx,
                     dy,
                 )
@@ -1483,7 +1807,11 @@ impl Editor {
             } else if escape {
                 self.selected = None;
             } else if duplicate {
-                self.duplicate(i);
+                self.duplicate_selected(ctx);
+            } else if bring_front {
+                self.reorder(i, true, shift);
+            } else if send_back {
+                self.reorder(i, false, shift);
             } else if dx != 0.0 || dy != 0.0 {
                 let mut op = self.history.ops()[i].clone();
                 op.translate(dx, dy);
@@ -1491,13 +1819,14 @@ impl Editor {
             }
         }
 
-        if let Some(p) = response.hover_pos().map(&to_img) {
-            ctx.set_cursor_icon(if handle_at(self, p).is_some() {
-                egui::CursorIcon::Crosshair
-            } else if self.drag.is_some() || self.pick(p, tol).is_some() {
-                egui::CursorIcon::Move
-            } else {
-                egui::CursorIcon::Default
+        if self.drag.as_ref().is_some_and(|d| d.handle == Some(Handle::Rotate)) {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if let Some(p) = response.hover_pos().map(&to_img) {
+            ctx.set_cursor_icon(match handle_at(self, p) {
+                Some((_, Handle::Rotate)) => egui::CursorIcon::Grab,
+                Some((_, _)) => egui::CursorIcon::Crosshair,
+                None if self.drag.is_some() || self.pick(p, tol).is_some() => egui::CursorIcon::Move,
+                None => egui::CursorIcon::Default,
             });
         }
 
@@ -1513,7 +1842,17 @@ impl Editor {
                 let frame = Rect::from_min_max(to_screen(min), to_screen(max)).expand(3.0);
                 painter.rect_stroke(frame, 2.0, Stroke::new(1.5, self.accent), StrokeKind::Middle);
             }
-            for (_, hp) in op.handles(&font) {
+            if let Some((stem_start, knob_pos)) = op.rotation_handle(&font) {
+                let stem_screen = to_screen(stem_start);
+                let knob_screen = to_screen(knob_pos);
+                painter.line_segment([stem_screen, knob_screen], Stroke::new(1.5, self.accent));
+                painter.circle_filled(knob_screen, 6.5, Color32::WHITE);
+                painter.circle_stroke(knob_screen, 6.5, Stroke::new(1.5, self.accent));
+            }
+            for (h, hp) in op.handles(&font) {
+                if h == Handle::Rotate {
+                    continue;
+                }
                 let knob = Rect::from_center_size(to_screen(hp), Vec2::splat(9.0));
                 painter.rect_filled(knob, 2.0, Color32::WHITE);
                 painter.rect_stroke(knob, 2.0, Stroke::new(1.5, self.accent), StrokeKind::Middle);
@@ -1531,8 +1870,8 @@ impl Editor {
                 (dist >= 3.0).then_some(Op::Arrow { from: a, to: b, color, width, dashed: self.dashed, double: self.double })
             }
             Tool::Line => (dist >= 3.0).then_some(Op::Line { from: a, to: b, color, width, dashed: self.dashed }),
-            Tool::Rect => area_ok.then_some(Op::Rect { a, b, color, width, filled: self.filled, dashed: self.dashed }),
-            Tool::Ellipse => area_ok.then_some(Op::Ellipse { a, b, color, width, filled: self.filled, dashed: self.dashed }),
+            Tool::Rect => area_ok.then_some(Op::Rect { a, b, color, width, filled: self.filled, dashed: self.dashed, angle: 0.0 }),
+            Tool::Ellipse => area_ok.then_some(Op::Ellipse { a, b, color, width, filled: self.filled, dashed: self.dashed, angle: 0.0 }),
             Tool::Pen => {
                 let points = std::mem::take(&mut self.pen_points);
                 (points.len() >= 2).then_some(Op::Pen { points, color, width })
@@ -1541,7 +1880,7 @@ impl Editor {
                 let points = std::mem::take(&mut self.pen_points);
                 (points.len() >= 2).then_some(Op::Erase { points, width })
             }
-            Tool::Highlight => area_ok.then_some(Op::Highlight { a, b, color: HIGHLIGHT_COLOR }),
+            Tool::Highlight => area_ok.then_some(Op::Highlight { a, b, color: HIGHLIGHT_COLOR, angle: 0.0 }),
             Tool::Pixelate => area_ok.then_some(Op::Pixelate { a, b }),
             Tool::Blur => area_ok.then_some(Op::Blur { a, b }),
             Tool::Spotlight => area_ok.then_some(Op::Spotlight { a, b }),
@@ -1702,7 +2041,7 @@ impl Editor {
                         let (_, (w, h)) = render::callout_box((0.0, 0.0), &p.text, size, self.history.font());
                         Op::Callout { tip, pos: (p.pos.0 - w / 2.0, p.pos.1 - h / 2.0), text: p.text, color, size, style: self.callout_style }
                     }
-                    None => Op::Text { pos: p.pos, text: p.text, color, size, boxed: self.boxed },
+                    None => Op::Text { pos: p.pos, text: p.text, color, size, boxed: self.boxed, angle: 0.0 },
                 };
                 self.commit(op);
             }
@@ -1762,6 +2101,23 @@ impl Editor {
         } else if done {
             self.commit_pending_text();
         }
+    }
+}
+
+/// Draws a crisp dashed line segment on the screen painter.
+fn draw_dashed_line(painter: &egui::Painter, start: Pos2, end: Pos2, stroke: Stroke, dash: f32, gap: f32) {
+    let dir = end - start;
+    let total = dir.length();
+    if total <= 0.0 {
+        return;
+    }
+    let u = dir / total;
+    let step = (dash + gap).max(1.0);
+    let mut t = 0.0;
+    while t < total {
+        let t_end = (t + dash).min(total);
+        painter.line_segment([start + u * t, start + u * t_end], stroke);
+        t += step;
     }
 }
 
@@ -1876,7 +2232,7 @@ mod tests {
     #[test]
     fn step_numbers_follow_the_markers_on_the_image() {
         let mut h = history();
-        let step = |n| Op::Step { center: (20.0 * n as f32, 20.0), number: n, color: RED, radius: 8.0, shape: StepShape::Circle, glyph: StepGlyph::Number };
+        let step = |n| Op::Step { center: (20.0 * n as f32, 20.0), number: n, color: RED, radius: 8.0, shape: StepShape::Circle, glyph: StepGlyph::Number, angle: 0.0 };
         assert_eq!(h.next_step(), 1);
         h.push(step(1));
         h.push(line()); // other annotations don't count
@@ -1934,7 +2290,7 @@ mod tests {
     #[test]
     fn next_step_skips_past_the_highest_number() {
         let mut h = history();
-        let step = |n| Op::Step { center: (20.0, 20.0), number: n, color: RED, radius: 8.0, shape: StepShape::Circle, glyph: StepGlyph::Number };
+        let step = |n| Op::Step { center: (20.0, 20.0), number: n, color: RED, radius: 8.0, shape: StepShape::Circle, glyph: StepGlyph::Number, angle: 0.0 };
         h.push(step(1));
         h.push(step(2));
         h.push(step(3));
@@ -1967,7 +2323,7 @@ mod tests {
         assert!(Relevant::for_tool(Tool::Text).boxed && !Relevant::for_tool(Tool::Callout).boxed);
         // A selected object shows the options of the tool that created it.
         assert_eq!(Relevant::for_op(&line()), Relevant::for_tool(Tool::Line));
-        let highlight = Op::Highlight { a: (0.0, 0.0), b: (9.0, 9.0), color: RED };
+        let highlight = Op::Highlight { a: (0.0, 0.0), b: (9.0, 9.0), color: RED, angle: 0.0 };
         assert!(Relevant::for_op(&highlight).color && !Relevant::for_tool(Tool::Highlight).color);
     }
 
@@ -2063,15 +2419,15 @@ mod tests {
         let ops = vec![
             Op::Arrow { from: (1.0, 2.0), to: (30.0, 40.0), color: RED, width: 4.0, dashed: true, double: true },
             Op::Line { from: (0.0, 5.0), to: (10.0, 5.0), color: RED, width: 2.0, dashed: false },
-            Op::Rect { a: (5.0, 5.0), b: (25.0, 25.0), color: RED, width: 3.0, filled: true, dashed: false },
-            Op::Ellipse { a: (10.0, 10.0), b: (20.0, 30.0), color: RED, width: 2.0, filled: false, dashed: true },
+            Op::Rect { a: (5.0, 5.0), b: (25.0, 25.0), color: RED, width: 3.0, filled: true, dashed: false, angle: 0.0 },
+            Op::Ellipse { a: (10.0, 10.0), b: (20.0, 30.0), color: RED, width: 2.0, filled: false, dashed: true, angle: 0.0 },
             Op::Pen { points: vec![(1.0, 1.0), (5.0, 8.0)], color: RED, width: 3.0 },
             Op::Erase { points: vec![(2.0, 2.0), (6.0, 6.0)], width: 10.0 },
-            Op::Highlight { a: (0.0, 0.0), b: (20.0, 10.0), color: [255, 255, 0, 128] },
-            Op::Text { pos: (12.0, 15.0), text: "Hello".into(), color: RED, size: 18.0, boxed: true },
+            Op::Highlight { a: (0.0, 0.0), b: (20.0, 10.0), color: [255, 255, 0, 128], angle: 0.0 },
+            Op::Text { pos: (12.0, 15.0), text: "Hello".into(), color: RED, size: 18.0, boxed: true, angle: 0.0 },
             Op::Callout { tip: (5.0, 5.0), pos: (20.0, 20.0), text: "Note".into(), color: RED, size: 16.0, style: CalloutStyle::Outline },
-            Op::Step { center: (15.0, 15.0), number: 3, color: RED, radius: 14.0, shape: StepShape::Pin, glyph: StepGlyph::Upper },
-            Op::Stamp { kind: Stamp::Check, center: (40.0, 40.0), radius: 16.0, color: RED },
+            Op::Step { center: (15.0, 15.0), number: 3, color: RED, radius: 14.0, shape: StepShape::Pin, glyph: StepGlyph::Upper, angle: 0.0 },
+            Op::Stamp { kind: Stamp::Check, center: (40.0, 40.0), radius: 16.0, color: RED, angle: 0.0 },
             Op::Spotlight { a: (10.0, 10.0), b: (50.0, 50.0) },
             Op::Pixelate { a: (0.0, 0.0), b: (20.0, 20.0) },
             Op::Blur { a: (20.0, 20.0), b: (40.0, 40.0) },
@@ -2082,6 +2438,7 @@ mod tests {
             Op::Resize { width: 80, height: 60 },
             Op::Border { width: 4, color: RED },
             Op::Shadow { size: 12 },
+            Op::Beautify { preset: 1, padding: 32, radius: 12, shadow: 16 },
             Op::CutOut { from: (0.0, 10.0), to: (0.0, 20.0), rows: true },
         ];
         let json = serde_json::to_string(&ops).unwrap();
@@ -2102,6 +2459,7 @@ mod tests {
                 radius: 10.0,
                 shape: StepShape::Circle,
                 glyph: StepGlyph::Number,
+                angle: 0.0,
             },
         ];
         let mut ed = Editor::from_parts(&ctx, base.clone(), ops.clone(), Color32::WHITE);
@@ -2119,5 +2477,21 @@ mod tests {
         assert!(ed.history.undo());
         assert_eq!(ed.ops().len(), 2);
         assert_eq!(ed.image().get_pixel(50, 50).0, RED);
+    }
+
+    #[test]
+    fn reorder_object_respects_first_object_and_rerenders() {
+        let mut h = history();
+        let font = h.font().clone();
+        let blue: Rgba = [0, 0, 255, 255];
+        let r1 = Op::Rect { a: (10.0, 10.0), b: (60.0, 60.0), color: RED, width: 2.0, filled: true, dashed: false, angle: 0.0 };
+        let r2 = Op::Rect { a: (10.0, 10.0), b: (60.0, 60.0), color: blue, width: 2.0, filled: true, dashed: false, angle: 0.0 };
+        h.push(r1);
+        h.push(r2);
+        assert_eq!(h.image().get_pixel(30, 30).0, blue);
+        assert_eq!(h.reorder_object(1, false, false, &font), Some(0));
+        assert_eq!(h.image().get_pixel(30, 30).0, RED);
+        assert!(h.undo());
+        assert_eq!(h.image().get_pixel(30, 30).0, blue);
     }
 }

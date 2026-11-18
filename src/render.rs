@@ -111,6 +111,18 @@ impl Stamp {
     ];
 }
 
+/// Gradient presets for [`Op::Beautify`]: `(top_left_rgba, bottom_right_rgba, pt_name, en_name)`.
+pub const BEAUTIFY_PRESETS: [(Rgba, Rgba, &str, &str); 8] = [
+    ([37, 99, 235, 255], [6, 182, 212, 255], "Oceano", "Ocean"),
+    ([249, 115, 22, 255], [236, 72, 153, 255], "Pôr do sol", "Sunset"),
+    ([16, 185, 129, 255], [59, 130, 246, 255], "Aurora", "Aurora"),
+    ([139, 92, 246, 255], [217, 70, 239, 255], "Violeta", "Violet"),
+    ([5, 150, 105, 255], [163, 230, 53, 255], "Esmeralda", "Emerald"),
+    ([30, 41, 59, 255], [15, 23, 42, 255], "Ardósia", "Slate"),
+    ([245, 158, 11, 255], [239, 68, 68, 255], "Dourado", "Gold"),
+    ([241, 245, 249, 255], [203, 213, 225, 255], "Gelo", "Frost"),
+];
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     /// `double`: a head on both ends. `dashed` (here and in the shapes below): dashed stroke.
@@ -142,6 +154,8 @@ pub enum Op {
         filled: bool,
         #[serde(default)]
         dashed: bool,
+        #[serde(default)]
+        angle: f32,
     },
     Ellipse {
         a: Point,
@@ -152,13 +166,21 @@ pub enum Op {
         filled: bool,
         #[serde(default)]
         dashed: bool,
+        #[serde(default)]
+        angle: f32,
     },
     Pen { points: Vec<Point>, color: Rgba, width: f32 },
     /// Eraser: wherever the stroke passes, the image goes back to the original capture, erasing
     /// what was drawn there before.
     Erase { points: Vec<Point>, width: f32 },
     /// Highlighter: a translucent rectangle that keeps the text underneath readable.
-    Highlight { a: Point, b: Point, color: Rgba },
+    Highlight {
+        a: Point,
+        b: Point,
+        color: Rgba,
+        #[serde(default)]
+        angle: f32,
+    },
     /// `boxed`: draws a contrasting background box behind the text.
     Text {
         pos: Point,
@@ -167,14 +189,32 @@ pub enum Op {
         size: f32,
         #[serde(default)]
         boxed: bool,
+        #[serde(default)]
+        angle: f32,
     },
     /// Speech callout: a colored box with text and a tail that points to `tip`. `pos` is the
     /// top-left corner of the box, which grows with the text.
     Callout { tip: Point, pos: Point, text: String, color: Rgba, size: f32, style: CalloutStyle },
     /// Step marker: a filled circle with a number inside, for step-by-step tutorials.
-    Step { center: Point, number: u32, color: Rgba, radius: f32, shape: StepShape, glyph: StepGlyph },
+    Step {
+        center: Point,
+        number: u32,
+        color: Rgba,
+        radius: f32,
+        shape: StepShape,
+        glyph: StepGlyph,
+        #[serde(default)]
+        angle: f32,
+    },
     /// Stamp: a ready-made symbol (check, cross, warning…) of size `radius`.
-    Stamp { kind: Stamp, center: Point, radius: f32, color: Rgba },
+    Stamp {
+        kind: Stamp,
+        center: Point,
+        radius: f32,
+        color: Rgba,
+        #[serde(default)]
+        angle: f32,
+    },
     /// Spotlight: darkens the whole image except the area between `a` and `b`.
     Spotlight { a: Point, b: Point },
     /// Pixelates the area to hide information.
@@ -196,6 +236,8 @@ pub enum Op {
     Border { width: u32, color: Rgba },
     /// White margin with a drop shadow, so the capture stands out in a document.
     Shadow { size: u32 },
+    /// Places the capture on a gradient background with rounded corners and a drop shadow.
+    Beautify { preset: u8, padding: u32, radius: u32, shadow: u32 },
     /// Removes a strip from the image and joins the two parts. `rows`: the strip is horizontal (the
     /// rows between `from` and `to` go away); otherwise it's vertical (the columns go away).
     CutOut { from: Point, to: Point, rows: bool },
@@ -208,6 +250,8 @@ pub enum Handle {
     End,
     /// Box corner: 0 = top-left, 1 = top-right, 2 = bottom-right, 3 = bottom-left.
     Corner(usize),
+    /// Rotation handle above the object's top edge.
+    Rotate,
 }
 
 /// Text size for a value of the Width control.
@@ -237,6 +281,16 @@ pub fn distance(a: Point, b: Point) -> f32 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
 }
 
+/// Rotates `p` around `center` by `angle` radians (clockwise in screen coordinates).
+pub fn rotate_point(p: Point, center: Point, angle: f32) -> Point {
+    if angle.abs() <= 1e-6 {
+        return p;
+    }
+    let (sin, cos) = angle.sin_cos();
+    let (dx, dy) = (p.0 - center.0, p.1 - center.1);
+    (center.0 + dx * cos - dy * sin, center.1 + dx * sin + dy * cos)
+}
+
 fn segment_distance(p: Point, a: Point, b: Point) -> f32 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len2 = dx * dx + dy * dy;
@@ -264,18 +318,85 @@ pub fn text_extent(text: &str, size: f32, font: &FontArc) -> (f32, f32) {
 impl Op {
     /// Crop, rotate, resize and the like change the whole image; they aren't selectable objects.
     pub fn is_object(&self) -> bool {
-        !matches!(self, Op::Crop { .. } | Op::Rotate { .. } | Op::Flip { .. } | Op::Resize { .. } | Op::Border { .. } | Op::Shadow { .. } | Op::CutOut { .. })
+        !matches!(
+            self,
+            Op::Crop { .. }
+                | Op::Rotate { .. }
+                | Op::Flip { .. }
+                | Op::Resize { .. }
+                | Op::Border { .. }
+                | Op::Shadow { .. }
+                | Op::Beautify { .. }
+                | Op::CutOut { .. }
+        )
+    }
+
+    /// Rotation angle in radians (`0.0` is upright, positive is clockwise).
+    pub fn angle(&self) -> f32 {
+        match self {
+            Op::Rect { angle, .. }
+            | Op::Ellipse { angle, .. }
+            | Op::Highlight { angle, .. }
+            | Op::Text { angle, .. }
+            | Op::Step { angle, .. }
+            | Op::Stamp { angle, .. } => *angle,
+            _ => 0.0,
+        }
+    }
+
+    /// Sets the rotation angle in radians on rotatable shape/text/marker variants.
+    pub fn set_angle(&mut self, new_angle: f32) {
+        match self {
+            Op::Rect { angle, .. }
+            | Op::Ellipse { angle, .. }
+            | Op::Highlight { angle, .. }
+            | Op::Text { angle, .. }
+            | Op::Step { angle, .. }
+            | Op::Stamp { angle, .. } => *angle = new_angle,
+            _ => {}
+        }
+    }
+
+    /// Center of the object's unrotated frame.
+    pub fn center(&self, font: &FontArc) -> Option<Point> {
+        let (min, max) = self.frame(font)?;
+        Some(((min.0 + max.0) / 2.0, (min.1 + max.1) / 2.0))
+    }
+
+    /// Stem base (`top_center`) and draggable knob (`knob_pos`) of the rotation handle, in image
+    /// pixels, rotated by [`Self::angle`].
+    pub fn rotation_handle(&self, font: &FontArc) -> Option<(Point, Point)> {
+        if !matches!(
+            self,
+            Op::Rect { .. }
+                | Op::Ellipse { .. }
+                | Op::Highlight { .. }
+                | Op::Text { .. }
+                | Op::Step { .. }
+                | Op::Stamp { .. }
+                | Op::Arrow { .. }
+                | Op::Line { .. }
+                | Op::Pen { .. }
+        ) {
+            return None;
+        }
+        let (min, max) = self.frame(font)?;
+        let center = ((min.0 + max.0) / 2.0, (min.1 + max.1) / 2.0);
+        let top_center = rotate_point((center.0, min.1), center, self.angle());
+        let knob_pos = rotate_point((center.0, min.1 - 24.0), center, self.angle());
+        Some((top_center, knob_pos))
     }
 
     /// Object box, not counting the stroke width.
     fn frame(&self, font: &FontArc) -> Option<(Point, Point)> {
         match self {
             Op::Arrow { from, to, .. } | Op::Line { from, to, .. } => Some(ordered(*from, *to)),
-            Op::Rect { a, b, .. } | Op::Ellipse { a, b, .. } | Op::Highlight { a, b, .. } | Op::Pixelate { a, b }
+            Op::Rect { a, b, .. }
+            | Op::Ellipse { a, b, .. }
+            | Op::Highlight { a, b, .. }
+            | Op::Pixelate { a, b }
             | Op::Blur { a, b }
-            | Op::Spotlight { a, b } => {
-                Some(ordered(*a, *b))
-            }
+            | Op::Spotlight { a, b } => Some(ordered(*a, *b)),
             Op::Pen { points, .. } | Op::Erase { points, .. } => {
                 let first = *points.first()?;
                 Some(points.iter().fold((first, first), |(min, max), p| {
@@ -295,7 +416,14 @@ impl Op {
             }
             Op::Callout { pos, text, size, .. } => Some(callout_box(*pos, text, *size, font)),
             Op::Magnify { a, b, .. } => Some(ordered(*a, *b)),
-            Op::Crop { .. } | Op::Rotate { .. } | Op::Flip { .. } | Op::Resize { .. } | Op::Border { .. } | Op::Shadow { .. } | Op::CutOut { .. } => None,
+            Op::Crop { .. }
+            | Op::Rotate { .. }
+            | Op::Flip { .. }
+            | Op::Resize { .. }
+            | Op::Border { .. }
+            | Op::Shadow { .. }
+            | Op::Beautify { .. }
+            | Op::CutOut { .. } => None,
         }
     }
 
@@ -303,9 +431,11 @@ impl Op {
     pub fn bounds(&self, font: &FontArc) -> Option<(Point, Point)> {
         let pad = match self {
             Op::Arrow { width, .. } => (width / 2.0).max(arrow_head_len(*width) * 0.45),
-            Op::Line { width, .. } | Op::Rect { width, .. } | Op::Ellipse { width, .. } | Op::Pen { width, .. } | Op::Erase { width, .. } => {
-                width / 2.0
-            }
+            Op::Line { width, .. }
+            | Op::Rect { width, .. }
+            | Op::Ellipse { width, .. }
+            | Op::Pen { width, .. }
+            | Op::Erase { width, .. } => width / 2.0,
             Op::Text { size, boxed: true, .. } => text_box_pad(*size),
             Op::Magnify { .. } => 2.5,
             _ => 0.0,
@@ -315,12 +445,32 @@ impl Op {
             min = (min.0.min(tip.0), min.1.min(tip.1));
             max = (max.0.max(tip.0), max.1.max(tip.1));
         }
-        Some(((min.0 - pad, min.1 - pad), (max.0 + pad, max.1 + pad)))
+        let unrotated = ((min.0 - pad, min.1 - pad), (max.0 + pad, max.1 + pad));
+        let angle = self.angle();
+        if angle.abs() > 1e-4 {
+            let center = ((min.0 + max.0) / 2.0, (min.1 + max.1) / 2.0);
+            let corners = (0..4).map(|i| rotate_point(corner(unrotated, i), center, angle));
+            let first = rotate_point(unrotated.0, center, angle);
+            return Some(corners.fold((first, first), |(bmin, bmax), p| {
+                ((bmin.0.min(p.0), bmin.1.min(p.1)), (bmax.0.max(p.0), bmax.1.max(p.1)))
+            }));
+        }
+        Some(unrotated)
     }
 
     /// Does the point `p` touch the object? `tol` is the slack in image pixels. Rectangles and
     /// ellipses only count on the outline, so what's inside them can still be picked.
     pub fn hit(&self, p: Point, tol: f32, font: &FontArc) -> bool {
+        let angle = self.angle();
+        let p = if angle.abs() > 1e-4 {
+            if let Some(c) = self.center(font) {
+                rotate_point(p, c, -angle)
+            } else {
+                p
+            }
+        } else {
+            p
+        };
         match self {
             Op::Arrow { from, to, width, .. } | Op::Line { from, to, width, .. } => {
                 segment_distance(p, *from, *to) <= width / 2.0 + tol
@@ -358,7 +508,11 @@ impl Op {
     /// Is `p` inside a rectangle or ellipse? Used when nothing was touched on the outline.
     pub fn encloses(&self, p: Point) -> bool {
         match self {
-            Op::Rect { a, b, .. } | Op::Ellipse { a, b, .. } => in_box(p, ordered(*a, *b), 0.0),
+            Op::Rect { a, b, angle, .. } | Op::Ellipse { a, b, angle, .. } => {
+                let center = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+                let p = if angle.abs() > 1e-4 { rotate_point(p, center, -*angle) } else { p };
+                in_box(p, ordered(*a, *b), 0.0)
+            }
             _ => false,
         }
     }
@@ -396,6 +550,7 @@ impl Op {
             | Op::Resize { .. }
             | Op::Border { .. }
             | Op::Shadow { .. }
+            | Op::Beautify { .. }
             | Op::CutOut { .. } => {}
         }
     }
@@ -420,18 +575,29 @@ impl Op {
 
     /// The object's control points, in image pixels.
     pub fn handles(&self, font: &FontArc) -> Vec<(Handle, Point)> {
-        match self {
+        let angle = self.angle();
+        let center = self.center(font);
+        let rot = |p: Point| match center {
+            Some(c) if angle.abs() > 1e-4 => rotate_point(p, c, angle),
+            _ => p,
+        };
+        let mut list = match self {
             Op::Arrow { from, to, .. } | Op::Line { from, to, .. } => {
                 vec![(Handle::Start, *from), (Handle::End, *to)]
             }
-            Op::Rect { .. } | Op::Ellipse { .. } | Op::Highlight { .. } | Op::Pixelate { .. } | Op::Blur { .. } | Op::Spotlight { .. } | Op::Pen { .. } | Op::Erase { .. } => {
-                match self.frame(font) {
-                    Some(f) => (0..4).map(|i| (Handle::Corner(i), corner(f, i))).collect(),
-                    None => Vec::new(),
-                }
-            }
+            Op::Rect { .. }
+            | Op::Ellipse { .. }
+            | Op::Highlight { .. }
+            | Op::Pixelate { .. }
+            | Op::Blur { .. }
+            | Op::Spotlight { .. }
+            | Op::Pen { .. }
+            | Op::Erase { .. } => match self.frame(font) {
+                Some(f) => (0..4).map(|i| (Handle::Corner(i), rot(corner(f, i)))).collect(),
+                None => Vec::new(),
+            },
             Op::Text { .. } => match self.frame(font) {
-                Some(f) => vec![(Handle::Corner(2), f.1)],
+                Some(f) => vec![(Handle::Corner(2), rot(f.1))],
                 None => Vec::new(),
             },
             // Corners of the copy, plus two points on the source region: the middle moves, the
@@ -448,26 +614,77 @@ impl Op {
                 Some(f) => vec![(Handle::Start, *tip), (Handle::Corner(2), f.1)],
                 None => Vec::new(),
             },
-            Op::Step { center, radius, .. } | Op::Stamp { center, radius, .. } => vec![(Handle::End, (center.0 + radius, center.1))],
-            Op::Crop { .. } | Op::Rotate { .. } | Op::Flip { .. } | Op::Resize { .. } | Op::Border { .. } | Op::Shadow { .. } | Op::CutOut { .. } => Vec::new(),
+            Op::Step { center, radius, .. } | Op::Stamp { center, radius, .. } => {
+                vec![(Handle::End, rot((center.0 + radius, center.1)))]
+            }
+            Op::Crop { .. }
+            | Op::Rotate { .. }
+            | Op::Flip { .. }
+            | Op::Resize { .. }
+            | Op::Border { .. }
+            | Op::Shadow { .. }
+            | Op::Beautify { .. }
+            | Op::CutOut { .. } => Vec::new(),
+        };
+        if let Some((_, knob_pos)) = self.rotation_handle(font) {
+            list.push((Handle::Rotate, knob_pos));
         }
+        list
     }
 
     /// The object as it looks with the control point `handle` dragged to `to`.
     pub fn with_handle(&self, handle: Handle, to: Point, font: &FontArc) -> Op {
         let mut op = self.clone();
         let frame = self.frame(font);
+        if handle == Handle::Rotate {
+            if let Some((min, max)) = frame {
+                let (cx, cy) = ((min.0 + max.0) / 2.0, (min.1 + max.1) / 2.0);
+                let mut raw = (to.0 - cx).atan2(-(to.1 - cy));
+                let step = std::f32::consts::FRAC_PI_4;
+                let snapped = (raw / step).round() * step;
+                if (raw - snapped).abs() < 0.05 {
+                    raw = snapped;
+                }
+                match &mut op {
+                    Op::Rect { angle, .. }
+                    | Op::Ellipse { angle, .. }
+                    | Op::Highlight { angle, .. }
+                    | Op::Text { angle, .. }
+                    | Op::Step { angle, .. }
+                    | Op::Stamp { angle, .. } => *angle = raw,
+                    Op::Arrow { from, to: end, .. } | Op::Line { from, to: end, .. } => {
+                        *from = rotate_point(*from, (cx, cy), raw);
+                        *end = rotate_point(*end, (cx, cy), raw);
+                    }
+                    Op::Pen { points, .. } => {
+                        for p in points.iter_mut() {
+                            *p = rotate_point(*p, (cx, cy), raw);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return op;
+        }
         match (&mut op, handle) {
             (Op::Arrow { from, .. } | Op::Line { from, .. }, Handle::Start) => *from = to,
             (Op::Arrow { to: end, .. } | Op::Line { to: end, .. }, Handle::End) => *end = to,
             (
-                Op::Rect { a, b, .. } | Op::Ellipse { a, b, .. } | Op::Highlight { a, b, .. }
+                Op::Rect { a, b, .. }
+                | Op::Ellipse { a, b, .. }
+                | Op::Highlight { a, b, .. }
                 | Op::Pixelate { a, b }
                 | Op::Blur { a, b }
                 | Op::Spotlight { a, b },
                 Handle::Corner(i),
             ) => {
                 if let Some(f) = frame {
+                    let to = if self.angle().abs() > 1e-4 {
+                        let c = ((f.0.0 + f.1.0) / 2.0, (f.0.1 + f.1.1) / 2.0);
+                        rotate_point(to, c, -self.angle())
+                    } else {
+                        to
+                    };
                     *a = corner(f, i + 2);
                     *b = to;
                 }
@@ -505,7 +722,8 @@ impl Op {
                     let aspect = (s_max.1 - s_min.1) / (s_max.0 - s_min.0).max(1.0);
                     let fixed = corner(f, i + 2);
                     let w = (to.0 - fixed.0).abs().max(8.0);
-                    let (dir_x, dir_y) = (if to.0 >= fixed.0 { 1.0 } else { -1.0 }, if to.1 >= fixed.1 { 1.0 } else { -1.0 });
+                    let (dir_x, dir_y) =
+                        (if to.0 >= fixed.0 { 1.0 } else { -1.0 }, if to.1 >= fixed.1 { 1.0 } else { -1.0 });
                     *a = fixed;
                     *b = (fixed.0 + dir_x * w, fixed.1 + dir_y * w * aspect);
                 }
@@ -526,12 +744,20 @@ impl Op {
             }
             (Op::Callout { tip, .. }, Handle::Start) => *tip = to,
             (Op::Text { pos, size, .. } | Op::Callout { pos, size, .. }, Handle::Corner(_)) => {
-                if let Some((_, max)) = frame {
+                if let Some((min, max)) = frame {
+                    let to = if self.angle().abs() > 1e-4 {
+                        let c = ((min.0 + max.0) / 2.0, (min.1 + max.1) / 2.0);
+                        rotate_point(to, c, -self.angle())
+                    } else {
+                        to
+                    };
                     let height = (max.1 - pos.1).max(1.0);
                     *size = (*size * (to.1 - pos.1) / height).clamp(8.0, 400.0);
                 }
             }
-            (Op::Step { center, radius, .. } | Op::Stamp { center, radius, .. }, _) => *radius = distance(*center, to).clamp(6.0, 300.0),
+            (Op::Step { center, radius, .. } | Op::Stamp { center, radius, .. }, Handle::End) => {
+                *radius = distance(*center, to).clamp(6.0, 300.0);
+            }
             _ => {}
         }
         op
@@ -549,7 +775,19 @@ impl Op {
             | Op::Callout { color, .. }
             | Op::Stamp { color, .. }
             | Op::Step { color, .. } => Some(*color),
-            Op::Pixelate { .. } | Op::Blur { .. } | Op::Spotlight { .. } | Op::Magnify { .. } | Op::Erase { .. } | Op::Crop { .. } | Op::Rotate { .. } | Op::Flip { .. } | Op::Resize { .. } | Op::Border { .. } | Op::Shadow { .. } | Op::CutOut { .. } => None,
+            Op::Pixelate { .. }
+            | Op::Blur { .. }
+            | Op::Spotlight { .. }
+            | Op::Magnify { .. }
+            | Op::Erase { .. }
+            | Op::Crop { .. }
+            | Op::Rotate { .. }
+            | Op::Flip { .. }
+            | Op::Resize { .. }
+            | Op::Border { .. }
+            | Op::Shadow { .. }
+            | Op::Beautify { .. }
+            | Op::CutOut { .. } => None,
         }
     }
 
@@ -565,7 +803,19 @@ impl Op {
             | Op::Callout { color, .. }
             | Op::Stamp { color, .. }
             | Op::Step { color, .. } => *color = new,
-            Op::Pixelate { .. } | Op::Blur { .. } | Op::Spotlight { .. } | Op::Magnify { .. } | Op::Erase { .. } | Op::Crop { .. } | Op::Rotate { .. } | Op::Flip { .. } | Op::Resize { .. } | Op::Border { .. } | Op::Shadow { .. } | Op::CutOut { .. } => {}
+            Op::Pixelate { .. }
+            | Op::Blur { .. }
+            | Op::Spotlight { .. }
+            | Op::Magnify { .. }
+            | Op::Erase { .. }
+            | Op::Crop { .. }
+            | Op::Rotate { .. }
+            | Op::Flip { .. }
+            | Op::Resize { .. }
+            | Op::Border { .. }
+            | Op::Shadow { .. }
+            | Op::Beautify { .. }
+            | Op::CutOut { .. } => {}
         }
     }
 
@@ -696,6 +946,88 @@ fn with_shadow(img: &RgbaImage, size: u32) -> RgbaImage {
     out
 }
 
+fn rounded_rect_sdf(px: f32, py: f32, cx: f32, cy: f32, hx: f32, hy: f32, r: f32) -> f32 {
+    let qx = (px - cx).abs() - (hx - r);
+    let qy = (py - cy).abs() - (hy - r);
+    let out_dist = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    let in_dist = qx.max(qy).min(0.0);
+    out_dist + in_dist - r
+}
+
+/// Places `img` on a diagonal gradient backdrop (`preset`) with padding, rounded corners, and a
+/// soft drop shadow.
+pub fn beautify(img: &RgbaImage, preset: u8, padding: u32, radius: u32, shadow: u32) -> RgbaImage {
+    let pad = padding.clamp(8, 240);
+    let (iw, ih) = (img.width(), img.height());
+    if iw == 0 || ih == 0 || iw + 2 * pad > MAX_SIDE || ih + 2 * pad > MAX_SIDE {
+        return img.clone();
+    }
+    let (w, h) = (iw + 2 * pad, ih + 2 * pad);
+    let r = (radius.clamp(0, 64) as f32).min(iw as f32 / 2.0).min(ih as f32 / 2.0);
+    let sh = shadow.clamp(0, 64) as f32;
+    let (color_a, color_b, _, _) = BEAUTIFY_PRESETS[(preset as usize) % BEAUTIFY_PRESETS.len()];
+
+    let mut out = RgbaImage::new(w, h);
+    let (wf, hf) = (w.max(1) as f32, h.max(1) as f32);
+    let (hx, hy) = (iw as f32 / 2.0, ih as f32 / 2.0);
+    let (scx, scy) = (pad as f32 + hx, pad as f32 + hy + sh * 0.25);
+    let spread = sh * 1.25;
+
+    for y in 0..h {
+        let ty = y as f32 / hf;
+        for x in 0..w {
+            let t = ((x as f32 / wf) + ty) * 0.5;
+            let mut rgb = [
+                (color_a[0] as f32 + (color_b[0] as f32 - color_a[0] as f32) * t).round() as u8,
+                (color_a[1] as f32 + (color_b[1] as f32 - color_a[1] as f32) * t).round() as u8,
+                (color_a[2] as f32 + (color_b[2] as f32 - color_a[2] as f32) * t).round() as u8,
+            ];
+            if spread > 0.5 {
+                let d = rounded_rect_sdf(x as f32 + 0.5, y as f32 + 0.5, scx, scy, hx, hy, r);
+                if d < spread {
+                    let u = (1.0 - (d.max(0.0) / spread)).clamp(0.0, 1.0);
+                    let alpha = 0.45 * u * u * (3.0 - 2.0 * u);
+                    let keep = 1.0 - alpha;
+                    for c in &mut rgb {
+                        *c = (*c as f32 * keep).round() as u8;
+                    }
+                }
+            }
+            out.put_pixel(x, y, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+        }
+    }
+
+    let r_bound = (r.ceil() as u32) + 2;
+    for iy in 0..ih {
+        let near_y = r > 0.0 && (iy < r_bound || iy + r_bound >= ih);
+        for ix in 0..iw {
+            let near_x = r > 0.0 && (ix < r_bound || ix + r_bound >= iw);
+            let coverage = if near_x && near_y {
+                let d = rounded_rect_sdf(ix as f32 + 0.5, iy as f32 + 0.5, hx, hy, hx, hy, r);
+                (0.5 - d).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            if coverage <= 0.0 {
+                continue;
+            }
+            let src = img.get_pixel(ix, iy).0;
+            let src_a = (src[3] as f32 / 255.0) * coverage;
+            let dst = out.get_pixel_mut(ix + pad, iy + pad);
+            if src_a >= 0.999 {
+                *dst = image::Rgba([src[0], src[1], src[2], 255]);
+            } else if src_a > 0.0 {
+                let keep = 1.0 - src_a;
+                for (d, s) in dst.0[..3].iter_mut().zip(&src[..3]) {
+                    *d = (*s as f32 * src_a + *d as f32 * keep).round() as u8;
+                }
+                dst.0[3] = 255;
+            }
+        }
+    }
+    out
+}
+
 /// Start and end of the strip removed by [`cut_out`], or `None` if nothing (or the whole image)
 /// would be removed.
 pub fn cut_out_range(img: &RgbaImage, from: Point, to: Point, rows: bool) -> Option<(u32, u32)> {
@@ -738,6 +1070,14 @@ const BLUR_SIGMA: f32 = 7.0;
 /// Pixelation block size, in pixels.
 const PIXEL_BLOCK: u32 = 12;
 
+fn rotation_transform(angle: f32, center: Point) -> Transform {
+    if angle.abs() > 1e-4 {
+        Transform::from_rotate_at(angle.to_degrees(), center.0, center.1)
+    } else {
+        Transform::identity()
+    }
+}
+
 /// Applies an operation to the image.
 pub fn apply(img: &mut RgbaImage, op: &Op, font: &FontArc) {
     match op {
@@ -747,49 +1087,56 @@ pub fn apply(img: &mut RgbaImage, op: &Op, font: &FontArc) {
         Op::Line { from, to, color, width, dashed } => {
             stroke_points(img, &[*from, *to], *color, *width, *dashed);
         }
-        Op::Rect { a, b, color, width, filled, dashed } => {
+        Op::Rect { a, b, color, width, filled, dashed, angle } => {
             if let Some(r) = skia_rect(*a, *b) {
-                shape(img, &PathBuilder::from_rect(r), *color, *width, *filled, *dashed);
+                let xform = rotation_transform(*angle, ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0));
+                shape_xform(img, &PathBuilder::from_rect(r), *color, *width, *filled, *dashed, xform);
             }
         }
-        Op::Ellipse { a, b, color, width, filled, dashed } => {
+        Op::Ellipse { a, b, color, width, filled, dashed, angle } => {
             if let Some(path) = skia_rect(*a, *b).and_then(PathBuilder::from_oval) {
-                shape(img, &path, *color, *width, *filled, *dashed);
+                let xform = rotation_transform(*angle, ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0));
+                shape_xform(img, &path, *color, *width, *filled, *dashed, xform);
             }
         }
         Op::Pen { points, color, width } => stroke_points(img, points, *color, *width, false),
         // The eraser needs the original capture; only [`render_all`] has access to it.
         Op::Erase { .. } => {}
-        Op::Highlight { a, b, color } => {
+        Op::Highlight { a, b, color, angle } => {
             if let Some(r) = skia_rect(*a, *b) {
+                let xform = rotation_transform(*angle, ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0));
+                let path = PathBuilder::from_rect(r);
                 let on_clear = img.pixels().next().is_some_and(|p| p.0[3] == 0);
                 if on_clear {
                     let translucent = [color[0], color[1], color[2], (color[3] as u16 * 110 / 255) as u8];
                     let paint = paint(translucent);
-                    with_pixmap(img, |pm| pm.fill_rect(r, &paint, Transform::identity(), None));
+                    with_pixmap(img, |pm| pm.fill_path(&path, &paint, FillRule::Winding, xform, None));
                 } else {
                     let mut paint = paint(*color);
                     paint.blend_mode = BlendMode::Multiply;
-                    with_pixmap(img, |pm| pm.fill_rect(r, &paint, Transform::identity(), None));
+                    with_pixmap(img, |pm| pm.fill_path(&path, &paint, FillRule::Winding, xform, None));
                 }
             }
         }
-        Op::Text { pos, text, color, size, boxed } => {
+        Op::Text { pos, text, color, size, boxed, angle } => {
+            let (w, h) = text_extent(text, *size, font);
+            let center = (pos.0 + w / 2.0, pos.1 + h / 2.0);
             if *boxed {
-                let (w, h) = text_extent(text, *size, font);
                 let pad = text_box_pad(*size);
                 let frame = ((pos.0 - pad, pos.1 - pad), (pos.0 + w + pad, pos.1 + h + pad));
-                fill_rounded(img, frame, pad, step_text_color(*color));
+                fill_rounded_xform(img, frame, pad, step_text_color(*color), rotation_transform(*angle, center));
             }
-            draw_text(img, *pos, text, *color, *size, font);
+            draw_text_rotated(img, *pos, center, text, *color, *size, font, *angle);
         }
         Op::Callout { tip, pos, text, color, size, style } => {
             callout(img, *tip, *pos, text, *color, *size, *style, font);
         }
-        Op::Step { center, number, color, radius, shape, glyph } => {
-            step(img, *center, *number, *color, *radius, *shape, *glyph, font);
+        Op::Step { center, number, color, radius, shape, glyph, angle } => {
+            step(img, *center, *number, *color, *radius, *shape, *glyph, *angle, font);
         }
-        Op::Stamp { kind, center, radius, color } => stamp(img, *kind, *center, *radius, *color, font),
+        Op::Stamp { kind, center, radius, color, angle } => {
+            stamp(img, *kind, *center, *radius, *color, *angle, font);
+        }
         Op::Spotlight { a, b } => {
             let (min, max) = ordered(*a, *b);
             for (x, y, pixel) in img.enumerate_pixels_mut() {
@@ -831,6 +1178,9 @@ pub fn apply(img: &mut RgbaImage, op: &Op, font: &FontArc) {
             *img = out;
         }
         Op::Shadow { size } => *img = with_shadow(img, (*size).clamp(4, 200)),
+        Op::Beautify { preset, padding, radius, shadow } => {
+            *img = beautify(img, *preset, *padding, *radius, *shadow);
+        }
         Op::CutOut { from, to, rows } => cut_out(img, *from, *to, *rows),
         Op::Crop { a, b } => {
             if let Some((x, y, w, h)) = pixel_rect(img, *a, *b) {
@@ -912,11 +1262,22 @@ fn skia_rect(a: Point, b: Point) -> Option<Rect> {
 }
 
 fn stroke_path(img: &mut RgbaImage, path: &tiny_skia::Path, color: Rgba, width: f32) {
-    stroke_styled(img, path, color, width, false);
+    stroke_styled_xform(img, path, color, width, false, Transform::identity());
+}
+
+fn stroke_path_xform(img: &mut RgbaImage, path: &tiny_skia::Path, color: Rgba, width: f32, xform: Transform) {
+    stroke_styled_xform(img, path, color, width, false, xform);
 }
 
 /// Solid or dashed stroke. Strokes have butt caps, so the gaps stay sharp.
-fn stroke_styled(img: &mut RgbaImage, path: &tiny_skia::Path, color: Rgba, width: f32, dashed: bool) {
+fn stroke_styled_xform(
+    img: &mut RgbaImage,
+    path: &tiny_skia::Path,
+    color: Rgba,
+    width: f32,
+    dashed: bool,
+    xform: Transform,
+) {
     let dash_len = (width * 2.5).max(4.0);
     let stroke = Stroke {
         width,
@@ -926,21 +1287,33 @@ fn stroke_styled(img: &mut RgbaImage, path: &tiny_skia::Path, color: Rgba, width
         ..Default::default()
     };
     let paint = paint(color);
-    with_pixmap(img, |pm| pm.stroke_path(path, &paint, &stroke, Transform::identity(), None));
+    with_pixmap(img, |pm| pm.stroke_path(path, &paint, &stroke, xform, None));
 }
 
 /// Outline (solid or dashed) or filled shape, depending on `filled`.
-fn shape(img: &mut RgbaImage, path: &tiny_skia::Path, color: Rgba, width: f32, filled: bool, dashed: bool) {
+fn shape_xform(
+    img: &mut RgbaImage,
+    path: &tiny_skia::Path,
+    color: Rgba,
+    width: f32,
+    filled: bool,
+    dashed: bool,
+    xform: Transform,
+) {
     if filled {
-        fill(img, path, color);
+        fill_xform(img, path, color, xform);
     } else {
-        stroke_styled(img, path, color, width, dashed);
+        stroke_styled_xform(img, path, color, width, dashed, xform);
     }
 }
 
 fn fill(img: &mut RgbaImage, path: &tiny_skia::Path, color: Rgba) {
+    fill_xform(img, path, color, Transform::identity());
+}
+
+fn fill_xform(img: &mut RgbaImage, path: &tiny_skia::Path, color: Rgba, xform: Transform) {
     let paint = paint(color);
-    with_pixmap(img, |pm| pm.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None));
+    with_pixmap(img, |pm| pm.fill_path(path, &paint, FillRule::Winding, xform, None));
 }
 
 fn polygon(points: &[Point]) -> Option<tiny_skia::Path> {
@@ -954,71 +1327,83 @@ fn polygon(points: &[Point]) -> Option<tiny_skia::Path> {
     pb.finish()
 }
 
-/// Text centered on `center`, by cap height (digits and signs have that height).
-fn centered_text(img: &mut RgbaImage, center: Point, text: &str, size: f32, color: Rgba, font: &FontArc) {
+/// Text centered on `center`, by cap height (digits and signs have that height), optionally
+/// rotated around `pivot` by `angle` radians.
+#[allow(clippy::too_many_arguments)]
+fn centered_text_rotated(
+    img: &mut RgbaImage,
+    center: Point,
+    pivot: Point,
+    text: &str,
+    size: f32,
+    color: Rgba,
+    font: &FontArc,
+    angle: f32,
+) {
     let scaled = font.as_scaled(size);
     let cap_height = size * 0.68;
     let pos = (center.0 - text_width(text, size, font) / 2.0, center.1 + cap_height / 2.0 - scaled.ascent());
-    draw_text(img, pos, text, color, size, font);
+    draw_text_rotated(img, pos, pivot, text, color, size, font, angle);
 }
 
 /// Stamp drawings: simple shapes, made right here.
-fn stamp(img: &mut RgbaImage, kind: Stamp, c: Point, r: f32, color: Rgba, font: &FontArc) {
+fn stamp(img: &mut RgbaImage, kind: Stamp, c: Point, r: f32, color: Rgba, angle: f32, font: &FontArc) {
     let at = |x: f32, y: f32| (c.0 + x * r, c.1 + y * r);
     let ink = step_text_color(color);
+    let xform = rotation_transform(angle, c);
     let disc = |img: &mut RgbaImage| {
         if let Some(circle) = PathBuilder::from_circle(c.0, c.1, r) {
-            fill(img, &circle, color);
-            stroke_path(img, &circle, [255, 255, 255, 255], (r * 0.1).max(1.5));
+            fill_xform(img, &circle, color, xform);
+            stroke_path_xform(img, &circle, [255, 255, 255, 255], (r * 0.1).max(1.5), xform);
         }
     };
     match kind {
         Stamp::Check => {
             disc(img);
-            stroke_points(img, &[at(-0.45, 0.02), at(-0.12, 0.35), at(0.48, -0.32)], ink, r * 0.22, false);
+            stroke_points_xform(img, &[at(-0.45, 0.02), at(-0.12, 0.35), at(0.48, -0.32)], ink, r * 0.22, false, xform);
         }
         Stamp::Cross => {
             disc(img);
-            stroke_points(img, &[at(-0.36, -0.36), at(0.36, 0.36)], ink, r * 0.22, false);
-            stroke_points(img, &[at(0.36, -0.36), at(-0.36, 0.36)], ink, r * 0.22, false);
+            stroke_points_xform(img, &[at(-0.36, -0.36), at(0.36, 0.36)], ink, r * 0.22, false, xform);
+            stroke_points_xform(img, &[at(0.36, -0.36), at(-0.36, 0.36)], ink, r * 0.22, false, xform);
         }
         Stamp::Info => {
             disc(img);
-            centered_text(img, c, "i", r * 1.4, ink, font);
+            centered_text_rotated(img, c, c, "i", r * 1.4, ink, font, angle);
         }
         Stamp::Question => {
             disc(img);
-            centered_text(img, c, "?", r * 1.3, ink, font);
+            centered_text_rotated(img, c, c, "?", r * 1.3, ink, font, angle);
         }
         Stamp::Warning => {
             if let Some(triangle) = polygon(&[at(0.0, -0.85), at(0.9, 0.7), at(-0.9, 0.7)]) {
-                fill(img, &triangle, color);
+                fill_xform(img, &triangle, color, xform);
                 // A stroke of the same color rounds the triangle's corners.
-                stroke_path(img, &triangle, color, r * 0.2);
+                stroke_path_xform(img, &triangle, color, r * 0.2, xform);
             }
-            centered_text(img, at(0.0, 0.15), "!", r * 1.2, ink, font);
+            centered_text_rotated(img, at(0.0, 0.15), c, "!", r * 1.2, ink, font, angle);
         }
         Stamp::Star => {
             let points: Vec<Point> = (0..10)
                 .map(|i| {
-                    let angle = std::f32::consts::PI * (i as f32 / 5.0 - 0.5);
+                    let a = std::f32::consts::PI * (i as f32 / 5.0 - 0.5);
                     let len = if i % 2 == 0 { 1.0 } else { 0.45 };
-                    at(angle.cos() * len, angle.sin() * len)
+                    at(a.cos() * len, a.sin() * len)
                 })
                 .collect();
             if let Some(star) = polygon(&points) {
-                fill(img, &star, color);
-                stroke_path(img, &star, [255, 255, 255, 255], (r * 0.08).max(1.2));
+                fill_xform(img, &star, color, xform);
+                stroke_path_xform(img, &star, [255, 255, 255, 255], (r * 0.08).max(1.2), xform);
             }
         }
         Stamp::Plus => {
             disc(img);
-            stroke_points(img, &[at(-0.45, 0.0), at(0.45, 0.0)], ink, r * 0.22, false);
-            stroke_points(img, &[at(0.0, -0.45), at(0.0, 0.45)], ink, r * 0.22, false);
+            stroke_points_xform(img, &[at(-0.45, 0.0), at(0.45, 0.0)], ink, r * 0.22, false, xform);
+            stroke_points_xform(img, &[at(0.0, -0.45), at(0.0, 0.45)], ink, r * 0.22, false, xform);
         }
         Stamp::Minus => {
             disc(img);
-            stroke_points(img, &[at(-0.45, 0.0), at(0.45, 0.0)], ink, r * 0.22, false);
+            stroke_points_xform(img, &[at(-0.45, 0.0), at(0.45, 0.0)], ink, r * 0.22, false, xform);
         }
         Stamp::ArrowRight | Stamp::ArrowLeft | Stamp::ArrowUp | Stamp::ArrowDown => {
             disc(img);
@@ -1030,8 +1415,8 @@ fn stamp(img: &mut RgbaImage, kind: Stamp, c: Point, r: f32, color: Rgba, font: 
             };
             let tip = at(dx * 0.5, dy * 0.5);
             let wing = |side: f32| at(dx * 0.12 - dy * 0.36 * side, dy * 0.12 + dx * 0.36 * side);
-            stroke_points(img, &[at(-dx * 0.5, -dy * 0.5), tip], ink, r * 0.2, false);
-            stroke_points(img, &[wing(1.0), tip, wing(-1.0)], ink, r * 0.2, false);
+            stroke_points_xform(img, &[at(-dx * 0.5, -dy * 0.5), tip], ink, r * 0.2, false, xform);
+            stroke_points_xform(img, &[wing(1.0), tip, wing(-1.0)], ink, r * 0.2, false, xform);
         }
         Stamp::Heart => {
             let points: Vec<Point> = (0..48)
@@ -1043,25 +1428,25 @@ fn stamp(img: &mut RgbaImage, kind: Stamp, c: Point, r: f32, color: Rgba, font: 
                 })
                 .collect();
             if let Some(heart) = polygon(&points) {
-                fill(img, &heart, color);
-                stroke_path(img, &heart, [255, 255, 255, 255], (r * 0.08).max(1.2));
+                fill_xform(img, &heart, color, xform);
+                stroke_path_xform(img, &heart, [255, 255, 255, 255], (r * 0.08).max(1.2), xform);
             }
         }
         Stamp::Flag => {
             if let Some(pennant) = polygon(&[at(-0.5, -0.88), at(0.8, -0.45), at(-0.5, -0.02)]) {
-                fill(img, &pennant, color);
-                stroke_path(img, &pennant, color, r * 0.1);
+                fill_xform(img, &pennant, color, xform);
+                stroke_path_xform(img, &pennant, color, r * 0.1, xform);
             }
-            stroke_points(img, &[at(-0.5, -0.9), at(-0.5, 0.92)], [20, 20, 20, 255], r * 0.16, false);
+            stroke_points_xform(img, &[at(-0.5, -0.9), at(-0.5, 0.92)], [20, 20, 20, 255], r * 0.16, false, xform);
         }
         Stamp::Pin => {
             let head = at(0.0, -0.3);
             if let Some(pin) = polygon(&drop_points(head, r * 0.62, at(0.0, 0.95))) {
-                fill(img, &pin, color);
-                stroke_path(img, &pin, [255, 255, 255, 255], (r * 0.08).max(1.2));
+                fill_xform(img, &pin, color, xform);
+                stroke_path_xform(img, &pin, [255, 255, 255, 255], (r * 0.08).max(1.2), xform);
             }
             if let Some(hole) = PathBuilder::from_circle(head.0, head.1, r * 0.22) {
-                fill(img, &hole, [255, 255, 255, 255]);
+                fill_xform(img, &hole, [255, 255, 255, 255], xform);
             }
         }
         Stamp::Cursor => {
@@ -1070,14 +1455,18 @@ fn stamp(img: &mut RgbaImage, kind: Stamp, c: Point, r: f32, color: Rgba, font: 
             let shape = [(0.0, 0.0), (0.0, 17.0), (4.0, 13.2), (7.0, 20.0), (9.6, 18.8), (6.7, 12.2), (12.0, 12.0)];
             let points: Vec<Point> = shape.iter().map(|(x, y)| at((x - 6.0) * s, (y - 10.0) * s)).collect();
             if let Some(pointer) = polygon(&points) {
-                fill(img, &pointer, [255, 255, 255, 255]);
-                stroke_path(img, &pointer, [20, 20, 20, 255], (r * 0.1).max(1.2));
+                fill_xform(img, &pointer, [255, 255, 255, 255], xform);
+                stroke_path_xform(img, &pointer, [20, 20, 20, 255], (r * 0.1).max(1.2), xform);
             }
         }
     }
 }
 
-fn fill_rounded(img: &mut RgbaImage, (min, max): (Point, Point), radius: f32, color: Rgba) {
+fn fill_rounded(img: &mut RgbaImage, frame: (Point, Point), radius: f32, color: Rgba) {
+    fill_rounded_xform(img, frame, radius, color, Transform::identity());
+}
+
+fn fill_rounded_xform(img: &mut RgbaImage, (min, max): (Point, Point), radius: f32, color: Rgba, xform: Transform) {
     let r = radius.min((max.0 - min.0) / 2.0).min((max.1 - min.1) / 2.0).max(0.0);
     let mut pb = PathBuilder::new();
     pb.move_to(min.0 + r, min.1);
@@ -1092,7 +1481,7 @@ fn fill_rounded(img: &mut RgbaImage, (min, max): (Point, Point), radius: f32, co
     pb.close();
     if let Some(path) = pb.finish() {
         let fill = paint(color);
-        with_pixmap(img, |pm| pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None));
+        with_pixmap(img, |pm| pm.fill_path(&path, &fill, FillRule::Winding, xform, None));
     }
 }
 
@@ -1144,6 +1533,17 @@ fn callout(
 }
 
 fn stroke_points(img: &mut RgbaImage, points: &[Point], color: Rgba, width: f32, dashed: bool) {
+    stroke_points_xform(img, points, color, width, dashed, Transform::identity());
+}
+
+fn stroke_points_xform(
+    img: &mut RgbaImage,
+    points: &[Point],
+    color: Rgba,
+    width: f32,
+    dashed: bool,
+    xform: Transform,
+) {
     let Some((first, rest)) = points.split_first() else { return };
     let mut pb = PathBuilder::new();
     pb.move_to(first.0, first.1);
@@ -1151,7 +1551,7 @@ fn stroke_points(img: &mut RgbaImage, points: &[Point], color: Rgba, width: f32,
         pb.line_to(p.0, p.1);
     }
     if let Some(path) = pb.finish() {
-        stroke_styled(img, &path, color, width, dashed);
+        stroke_styled_xform(img, &path, color, width, dashed, xform);
     }
 }
 
@@ -1294,6 +1694,7 @@ fn step(
     radius: f32,
     shape: StepShape,
     glyph: StepGlyph,
+    angle: f32,
     font: &FontArc,
 ) {
     let at = |x: f32, y: f32| (center.0 + x * radius, center.1 + y * radius);
@@ -1304,8 +1705,8 @@ fn step(
         StepShape::Hexagon => {
             let points: Vec<Point> = (0..6)
                 .map(|i| {
-                    let angle = std::f32::consts::PI * (i as f32 / 3.0);
-                    at(angle.cos() * 1.1, angle.sin() * 1.1)
+                    let a = std::f32::consts::PI * (i as f32 / 3.0);
+                    at(a.cos() * 1.1, a.sin() * 1.1)
                 })
                 .collect();
             polygon(&points)
@@ -1313,11 +1714,92 @@ fn step(
         StepShape::Pin => polygon(&drop_points(center, radius, at(0.0, 1.55))),
     };
     let Some(path) = path else { return };
-    fill(img, &path, color);
+    let xform = rotation_transform(angle, center);
+    fill_xform(img, &path, color, xform);
     // A thin white ring sets the marker apart from any background.
-    stroke_path(img, &path, [255, 255, 255, 255], (radius * 0.12).max(1.5));
+    stroke_path_xform(img, &path, [255, 255, 255, 255], (radius * 0.12).max(1.5), xform);
     let label = step_label(number, glyph);
-    centered_text(img, center, &label, step_label_size(&label, radius), step_text_color(color), font);
+    centered_text_rotated(img, center, center, &label, step_label_size(&label, radius), step_text_color(color), font, angle);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_rotated(
+    img: &mut RgbaImage,
+    pos: Point,
+    pivot: Point,
+    text: &str,
+    color: Rgba,
+    size: f32,
+    font: &FontArc,
+    angle: f32,
+) {
+    if angle.abs() <= 1e-4 {
+        draw_text(img, pos, text, color, size, font);
+        return;
+    }
+    let (tw, th) = text_extent(text, size, font);
+    let margin = (size * 0.6).ceil().max(4.0);
+    let lw = (tw + margin * 2.0).ceil().clamp(1.0, 4096.0) as u32;
+    let lh = (th + margin * 2.0).ceil().clamp(1.0, 4096.0) as u32;
+    let mut local = RgbaImage::new(lw, lh);
+    draw_text(&mut local, (margin, margin), text, color, size, font);
+
+    let origin = (pos.0 - margin, pos.1 - margin);
+    let corners = [
+        rotate_point(origin, pivot, angle),
+        rotate_point((origin.0 + lw as f32, origin.1), pivot, angle),
+        rotate_point((origin.0 + lw as f32, origin.1 + lh as f32), pivot, angle),
+        rotate_point((origin.0, origin.1 + lh as f32), pivot, angle),
+    ];
+    let min_x = corners.iter().map(|p| p.0).fold(f32::INFINITY, f32::min).floor().max(0.0) as u32;
+    let min_y = corners.iter().map(|p| p.1).fold(f32::INFINITY, f32::min).floor().max(0.0) as u32;
+    let max_x = corners.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max).ceil().min(img.width() as f32) as u32;
+    let max_y = corners.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max).ceil().min(img.height() as f32) as u32;
+
+    let sample_premul = |sx: i32, sy: i32| -> [f32; 4] {
+        if sx < 0 || sy < 0 || sx >= lw as i32 || sy >= lh as i32 {
+            return [0.0; 4];
+        }
+        let p = local.get_pixel(sx as u32, sy as u32).0;
+        let a = p[3] as f32 / 255.0;
+        [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a, a]
+    };
+
+    for py in min_y..max_y {
+        for px in min_x..max_x {
+            let (ux, uy) = rotate_point((px as f32 + 0.5, py as f32 + 0.5), pivot, -angle);
+            let (sx, sy) = (ux - origin.0 - 0.5, uy - origin.1 - 0.5);
+            if sx < -1.0 || sy < -1.0 || sx > lw as f32 || sy > lh as f32 {
+                continue;
+            }
+            let (x0, y0) = (sx.floor() as i32, sy.floor() as i32);
+            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+            let p00 = sample_premul(x0, y0);
+            let p10 = sample_premul(x0 + 1, y0);
+            let p01 = sample_premul(x0, y0 + 1);
+            let p11 = sample_premul(x0 + 1, y0 + 1);
+            let mut pm = [0.0f32; 4];
+            for i in 0..4 {
+                let top = p00[i] * (1.0 - fx) + p10[i] * fx;
+                let bot = p01[i] * (1.0 - fx) + p11[i] * fx;
+                pm[i] = top * (1.0 - fy) + bot * fy;
+            }
+            let src_a = pm[3].clamp(0.0, 1.0);
+            if src_a <= 1e-4 {
+                continue;
+            }
+            let dst = img.get_pixel_mut(px, py);
+            let dst_a = dst.0[3] as f32 / 255.0;
+            let out_a = src_a + dst_a * (1.0 - src_a);
+            if out_a > 0.0 {
+                let keep = dst_a * (1.0 - src_a);
+                for (d, p) in dst.0[..3].iter_mut().zip(&pm[..3]) {
+                    *d = ((*p + *d as f32 * keep) / out_a).clamp(0.0, 255.0).round() as u8;
+                }
+                dst.0[3] = (out_a * 255.0).clamp(0.0, 255.0).round() as u8;
+            }
+        }
+    }
 }
 
 fn draw_text(img: &mut RgbaImage, pos: Point, text: &str, color: Rgba, size: f32, font: &FontArc) {
@@ -1401,7 +1883,7 @@ mod tests {
     fn highlight_keeps_dark_text_readable() {
         let mut img = white(50, 50);
         img.put_pixel(10, 10, image::Rgba([0, 0, 0, 255]));
-        let op = Op::Highlight { a: (0.0, 0.0), b: (50.0, 50.0), color: [255, 235, 60, 255] };
+        let op = Op::Highlight { a: (0.0, 0.0), b: (50.0, 50.0), color: [255, 235, 60, 255], angle: 0.0 };
         apply(&mut img, &op, &test_font());
         assert_eq!(img.get_pixel(10, 10).0, [0, 0, 0, 255], "preto continua preto");
         assert_eq!(img.get_pixel(30, 30).0, [255, 235, 60, 255], "white becomes the color");
@@ -1432,7 +1914,7 @@ mod tests {
     #[test]
     fn text_draws_pixels_and_stays_in_bounds() {
         let mut img = white(120, 40);
-        let op = Op::Text { pos: (100.0, 30.0), text: "Olá, ção".into(), color: RED, size: 24.0, boxed: false };
+        let op = Op::Text { pos: (100.0, 30.0), text: "Olá, ção".into(), color: RED, size: 24.0, boxed: false, angle: 0.0 };
         apply(&mut img, &op, &test_font());
         assert!(img.pixels().any(|p| p.0 != [255, 255, 255, 255]));
     }
@@ -1441,7 +1923,11 @@ mod tests {
     fn step_marker_is_a_filled_circle_with_a_centered_number() {
         let mut img = white(100, 100);
         let blue = [10, 60, 200, 255];
-        apply(&mut img, &Op::Step { center: (50.0, 50.0), number: 7, color: blue, radius: 20.0, shape: StepShape::Circle, glyph: StepGlyph::Number }, &test_font());
+        apply(
+            &mut img,
+            &Op::Step { center: (50.0, 50.0), number: 7, color: blue, radius: 20.0, shape: StepShape::Circle, glyph: StepGlyph::Number, angle: 0.0 },
+            &test_font(),
+        );
         assert_eq!(img.get_pixel(50, 34).0, blue, "inside the circle, above the number");
         assert_eq!(img.get_pixel(50, 5).0, [255, 255, 255, 255], "outside the circle");
         // The number is white and sits in the middle: there are white pixels on both sides of the
@@ -1465,16 +1951,16 @@ mod tests {
         assert!(line.hit((50.0, 12.0), 2.0, &f));
         assert!(!line.hit((50.0, 30.0), 2.0, &f));
 
-        let rect = Op::Rect { a: (10.0, 10.0), b: (90.0, 90.0), color: RED, width: 4.0, filled: false, dashed: false };
+        let rect = Op::Rect { a: (10.0, 10.0), b: (90.0, 90.0), color: RED, width: 4.0, filled: false, dashed: false, angle: 0.0 };
         assert!(rect.hit((10.0, 50.0), 2.0, &f), "outline");
         assert!(!rect.hit((50.0, 50.0), 2.0, &f), "the inside doesn't count as outline");
         assert!(rect.encloses((50.0, 50.0)));
 
-        let ellipse = Op::Ellipse { a: (10.0, 10.0), b: (90.0, 50.0), color: RED, width: 4.0, filled: false, dashed: false };
+        let ellipse = Op::Ellipse { a: (10.0, 10.0), b: (90.0, 50.0), color: RED, width: 4.0, filled: false, dashed: false, angle: 0.0 };
         assert!(ellipse.hit((50.0, 10.0), 2.0, &f));
         assert!(!ellipse.hit((12.0, 12.0), 2.0, &f), "box corner falls outside the ellipse");
 
-        let step = Op::Step { center: (50.0, 50.0), number: 1, color: RED, radius: 10.0, shape: StepShape::Circle, glyph: StepGlyph::Number };
+        let step = Op::Step { center: (50.0, 50.0), number: 1, color: RED, radius: 10.0, shape: StepShape::Circle, glyph: StepGlyph::Number, angle: 0.0 };
         assert!(step.hit((55.0, 55.0), 0.0, &f));
         assert!(!Op::Crop { a: (0.0, 0.0), b: (90.0, 90.0) }.hit((5.0, 5.0), 2.0, &f));
     }
@@ -1500,7 +1986,7 @@ mod tests {
         );
 
         // Dragging the top-left corner keeps the bottom-right one in place.
-        let rect = Op::Rect { a: (60.0, 60.0), b: (20.0, 20.0), color: RED, width: 4.0, filled: false, dashed: false };
+        let rect = Op::Rect { a: (60.0, 60.0), b: (20.0, 20.0), color: RED, width: 4.0, filled: false, dashed: false, angle: 0.0 };
         let resized = rect.with_handle(Handle::Corner(0), (5.0, 10.0), &f);
         assert_eq!(resized.bounds(&f), Some(((3.0, 8.0), (62.0, 62.0))));
 
@@ -1508,11 +1994,11 @@ mod tests {
         let Op::Pen { points, .. } = pen.with_handle(Handle::Corner(2), (20.0, 60.0), &f) else { panic!() };
         assert_eq!(points, vec![(0.0, 0.0), (20.0, 60.0)]);
 
-        let step = Op::Step { center: (50.0, 50.0), number: 1, color: RED, radius: 10.0, shape: StepShape::Circle, glyph: StepGlyph::Number };
+        let step = Op::Step { center: (50.0, 50.0), number: 1, color: RED, radius: 10.0, shape: StepShape::Circle, glyph: StepGlyph::Number, angle: 0.0 };
         let Op::Step { radius, .. } = step.with_handle(Handle::End, (80.0, 50.0), &f) else { panic!() };
         assert_eq!(radius, 30.0);
 
-        let text = Op::Text { pos: (10.0, 10.0), text: "abc".into(), color: RED, size: 20.0, boxed: false };
+        let text = Op::Text { pos: (10.0, 10.0), text: "abc".into(), color: RED, size: 20.0, boxed: false, angle: 0.0 };
         let (_, corner) = text.handles(&f)[0];
         let Op::Text { size, .. } = text.with_handle(Handle::Corner(2), (corner.0, 10.0 + (corner.1 - 10.0) * 2.0), &f)
         else {
@@ -1523,10 +2009,10 @@ mod tests {
 
     #[test]
     fn thickness_round_trips_through_the_slider_value() {
-        let mut text = Op::Text { pos: (0.0, 0.0), text: "a".into(), color: RED, size: 10.0, boxed: false };
+        let mut text = Op::Text { pos: (0.0, 0.0), text: "a".into(), color: RED, size: 10.0, boxed: false, angle: 0.0 };
         text.set_thickness(4.0);
         assert_eq!(text.thickness(), Some(4.0));
-        let mut step = Op::Step { center: (0.0, 0.0), number: 1, color: RED, radius: 1.0, shape: StepShape::Circle, glyph: StepGlyph::Number };
+        let mut step = Op::Step { center: (0.0, 0.0), number: 1, color: RED, radius: 1.0, shape: StepShape::Circle, glyph: StepGlyph::Number, angle: 0.0 };
         step.set_thickness(3.0);
         assert_eq!(step.thickness(), Some(3.0));
         assert_eq!(Op::Pixelate { a: (0.0, 0.0), b: (1.0, 1.0) }.thickness(), None);
@@ -1536,13 +2022,13 @@ mod tests {
     fn filled_shapes_paint_their_inside() {
         let f = test_font();
         let mut img = white(100, 100);
-        let rect = Op::Rect { a: (10.0, 10.0), b: (90.0, 90.0), color: RED, width: 2.0, filled: true, dashed: false };
+        let rect = Op::Rect { a: (10.0, 10.0), b: (90.0, 90.0), color: RED, width: 2.0, filled: true, dashed: false, angle: 0.0 };
         apply(&mut img, &rect, &f);
         assert_eq!(img.get_pixel(50, 50).0, RED);
         assert!(rect.hit((50.0, 50.0), 0.0, &f), "a filled shape is picked by its inside");
 
         let mut img = white(100, 100);
-        apply(&mut img, &Op::Ellipse { a: (10.0, 10.0), b: (90.0, 90.0), color: RED, width: 2.0, filled: true, dashed: false }, &f);
+        apply(&mut img, &Op::Ellipse { a: (10.0, 10.0), b: (90.0, 90.0), color: RED, width: 2.0, filled: true, dashed: false, angle: 0.0 }, &f);
         assert_eq!(img.get_pixel(50, 50).0, RED);
         assert_eq!(img.get_pixel(12, 12).0, [255, 255, 255, 255], "corner outside the ellipse");
     }
@@ -1585,7 +2071,7 @@ mod tests {
     #[test]
     fn boxed_text_gets_a_contrasting_background() {
         let mut img = RgbaImage::from_pixel(200, 60, image::Rgba([120, 120, 120, 255]));
-        let op = Op::Text { pos: (20.0, 15.0), text: "abc".into(), color: [255, 255, 255, 255], size: 24.0, boxed: true };
+        let op = Op::Text { pos: (20.0, 15.0), text: "abc".into(), color: [255, 255, 255, 255], size: 24.0, boxed: true, angle: 0.0 };
         apply(&mut img, &op, &test_font());
         assert_eq!(img.get_pixel(17, 30).0, [20, 20, 20, 255], "dark background for light text");
         assert_eq!(img.get_pixel(190, 30).0, [120, 120, 120, 255]);
@@ -1595,7 +2081,7 @@ mod tests {
     fn magnify_shows_an_enlarged_copy_somewhere_else() {
         let f = test_font();
         let mut img = white(300, 200);
-        apply(&mut img, &Op::Rect { a: (40.0, 40.0), b: (60.0, 60.0), color: RED, width: 1.0, filled: true, dashed: false }, &f);
+        apply(&mut img, &Op::Rect { a: (40.0, 40.0), b: (60.0, 60.0), color: RED, width: 1.0, filled: true, dashed: false, angle: 0.0 }, &f);
         // The 40×40 region around the square appears 2.5 times larger on the right.
         let op = Op::Magnify { src: ((30.0, 30.0), (70.0, 70.0)), a: (150.0, 50.0), b: (250.0, 150.0) };
         apply(&mut img, &op, &f);
@@ -1664,7 +2150,7 @@ mod tests {
         let f = test_font();
         for (kind, name, _) in Stamp::ALL {
             let mut img = white(100, 100);
-            let op = Op::Stamp { kind, center: (50.0, 50.0), radius: 20.0, color: RED };
+            let op = Op::Stamp { kind, center: (50.0, 50.0), radius: 20.0, color: RED, angle: 0.0 };
             apply(&mut img, &op, &f);
             let painted = img.enumerate_pixels().filter(|(_, _, p)| p.0 != [255, 255, 255, 255]);
             let far = painted.clone().filter(|(x, y, _)| distance((*x as f32, *y as f32), (50.0, 50.0)) > 26.0).count();
@@ -1674,7 +2160,7 @@ mod tests {
         }
         // Check is a disc in the chosen color with the light mark on top.
         let mut img = white(100, 100);
-        apply(&mut img, &Op::Stamp { kind: Stamp::Check, center: (50.0, 50.0), radius: 20.0, color: RED }, &f);
+        apply(&mut img, &Op::Stamp { kind: Stamp::Check, center: (50.0, 50.0), radius: 20.0, color: RED, angle: 0.0 }, &f);
         assert_eq!(img.get_pixel(50, 36).0, RED);
         assert_eq!(img.get_pixel(48, 57).0, [255, 255, 255, 255]);
     }
@@ -1684,7 +2170,7 @@ mod tests {
         let f = test_font();
         for (shape, name, _) in StepShape::ALL {
             let mut img = white(100, 100);
-            let op = Op::Step { center: (50.0, 50.0), number: 7, color: RED, radius: 20.0, shape, glyph: StepGlyph::Number };
+            let op = Op::Step { center: (50.0, 50.0), number: 7, color: RED, radius: 20.0, shape, glyph: StepGlyph::Number, angle: 0.0 };
             apply(&mut img, &op, &f);
             assert_eq!(img.get_pixel(50, 35).0, RED, "{name}: miolo na cor");
             assert_eq!(img.get_pixel(3, 3).0, [255, 255, 255, 255], "{name}: canto livre");
@@ -1692,7 +2178,7 @@ mod tests {
         // The drop has a point below the circle; the circle doesn't.
         let below = |shape| {
             let mut img = white(100, 100);
-            apply(&mut img, &Op::Step { center: (50.0, 50.0), number: 1, color: RED, radius: 20.0, shape, glyph: StepGlyph::Number }, &f);
+            apply(&mut img, &Op::Step { center: (50.0, 50.0), number: 1, color: RED, radius: 20.0, shape, glyph: StepGlyph::Number, angle: 0.0 }, &f);
             img.get_pixel(50, 76).0
         };
         assert_eq!(below(StepShape::Pin), RED);
@@ -1757,7 +2243,7 @@ mod tests {
         }
         let ops = vec![
             Op::Crop { a: (40.0, 0.0), b: (100.0, 60.0) },
-            Op::Rect { a: (0.0, 0.0), b: (60.0, 60.0), color: RED, width: 1.0, filled: true, dashed: false },
+            Op::Rect { a: (0.0, 0.0), b: (60.0, 60.0), color: RED, width: 1.0, filled: true, dashed: false, angle: 0.0 },
             Op::Erase { points: vec![(0.0, 30.0), (60.0, 30.0)], width: 10.0 },
         ];
         let out = render_all(&original, &ops, &f);
@@ -1829,7 +2315,7 @@ mod tests {
         original.put_pixel(0, 0, image::Rgba([0, 0, 255, 255]));
         let ops = vec![
             Op::Rotate { clockwise: true },
-            Op::Rect { a: (0.0, 0.0), b: (20.0, 40.0), color: RED, width: 1.0, filled: true, dashed: false },
+            Op::Rect { a: (0.0, 0.0), b: (20.0, 40.0), color: RED, width: 1.0, filled: true, dashed: false, angle: 0.0 },
             Op::Erase { points: vec![(15.0, 0.0), (19.5, 0.0)], width: 2.0 },
         ];
         let out = render_all(&original, &ops, &f);
@@ -1845,8 +2331,8 @@ mod tests {
         let p = (5.0, 5.0);
         for op in [
             Op::Arrow { from: p, to: p, color: RED, width: 3.0, dashed: false, double: false },
-            Op::Rect { a: p, b: p, color: RED, width: 3.0, filled: false, dashed: false },
-            Op::Ellipse { a: p, b: p, color: RED, width: 3.0, filled: false, dashed: false },
+            Op::Rect { a: p, b: p, color: RED, width: 3.0, filled: false, dashed: false, angle: 0.0 },
+            Op::Ellipse { a: p, b: p, color: RED, width: 3.0, filled: false, dashed: false, angle: 0.0 },
             Op::Pen { points: vec![], color: RED, width: 3.0 },
             Op::Pixelate { a: p, b: p },
             Op::Crop { a: p, b: p },
@@ -1861,11 +2347,11 @@ mod tests {
     fn text_and_highlight_keep_alpha_on_transparent_overlay() {
         let f = test_font();
         let mut clear = RgbaImage::new(120, 60);
-        apply(&mut clear, &Op::Text { pos: (10.0, 10.0), text: "Visível".into(), color: RED, size: 24.0, boxed: false }, &f);
+        apply(&mut clear, &Op::Text { pos: (10.0, 10.0), text: "Visível".into(), color: RED, size: 24.0, boxed: false, angle: 0.0 }, &f);
         assert!(clear.pixels().any(|p| p.0[0] == 255 && p.0[3] > 200), "unboxed text must have non-zero alpha on transparent canvas");
 
         let mut clear = RgbaImage::new(60, 60);
-        apply(&mut clear, &Op::Highlight { a: (10.0, 10.0), b: (50.0, 50.0), color: [255, 235, 60, 255] }, &f);
+        apply(&mut clear, &Op::Highlight { a: (10.0, 10.0), b: (50.0, 50.0), color: [255, 235, 60, 255], angle: 0.0 }, &f);
         let a = clear.get_pixel(30, 30).0[3];
         assert!(a > 0 && a < 200, "highlight on transparent canvas stays translucent: {a}");
     }
@@ -1873,7 +2359,7 @@ mod tests {
     #[test]
     fn wide_ellipse_outline_does_not_hit_inside_or_far_outside() {
         let f = test_font();
-        let ellipse = Op::Ellipse { a: (50.0, 90.0), b: (450.0, 110.0), color: RED, width: 4.0, filled: false, dashed: false };
+        let ellipse = Op::Ellipse { a: (50.0, 90.0), b: (450.0, 110.0), color: RED, width: 4.0, filled: false, dashed: false, angle: 0.0 };
         assert!(ellipse.hit((450.0, 100.0), 2.0, &f), "right tip of the outline");
         assert!(ellipse.hit((250.0, 90.0), 2.0, &f), "top of the outline");
         assert!(!ellipse.hit((100.0, 100.0), 2.0, &f), "well inside the unfilled ellipse");
@@ -1890,6 +2376,74 @@ mod tests {
         assert_eq!(points, vec![(10.0, 10.0), (90.0, 70.0)]);
     }
 
+    #[test]
+    fn object_rotation_handle_snaps_hits_and_renders() {
+        let f = test_font();
+        // Horizontal bar from (20, 45) to (80, 55), centered at (50, 50).
+        let rect = Op::Rect { a: (20.0, 45.0), b: (80.0, 55.0), color: RED, width: 2.0, filled: true, dashed: false, angle: 0.0 };
+        let (stem, knob) = rect.rotation_handle(&f).expect("rect has rotation handle");
+        assert_eq!(stem, (50.0, 45.0));
+        assert_eq!(knob, (50.0, 21.0));
+        assert!(rect.handles(&f).contains(&(Handle::Rotate, knob)));
+
+        // Dragging the rotation handle nearly to the right (90° + 0.02 rad) snaps to +FRAC_PI_2.
+        let near_90 = (50.0 + 30.0 * 0.02_f32.cos(), 50.0 + 30.0 * 0.02_f32.sin());
+        let rotated = rect.with_handle(Handle::Rotate, near_90, &f);
+        assert!((rotated.angle() - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+
+        // At 90°, the bar now spans vertically from y=20..80 along x=45..55.
+        assert!(rotated.hit((50.0, 25.0), 0.0, &f), "rotated top is now hit");
+        assert!(!rotated.hit((25.0, 50.0), 0.0, &f), "unrotated left is no longer hit");
+        assert!(rotated.encloses((50.0, 25.0)));
+        assert!(!rotated.encloses((25.0, 50.0)));
+
+        let mut img = white(100, 100);
+        apply(&mut img, &rotated, &f);
+        assert_eq!(img.get_pixel(50, 25).0, RED);
+        assert_eq!(img.get_pixel(25, 50).0, [255, 255, 255, 255]);
+
+        // Rotating an arrow by 90° clockwise turns a horizontal arrow into a vertical one.
+        let arrow = Op::Arrow { from: (20.0, 50.0), to: (80.0, 50.0), color: RED, width: 4.0, dashed: false, double: false };
+        let Op::Arrow { from, to, .. } = arrow.with_handle(Handle::Rotate, (90.0, 50.0), &f) else { panic!() };
+        assert!((from.0 - 50.0).abs() < 0.1 && (from.1 - 20.0).abs() < 0.1);
+        assert!((to.0 - 50.0).abs() < 0.1 && (to.1 - 80.0).abs() < 0.1);
+
+        // Rotated text and step markers render cleanly without panicking.
+        let mut img = white(120, 120);
+        apply(
+            &mut img,
+            &Op::Text { pos: (30.0, 40.0), text: "Girar".into(), color: RED, size: 22.0, boxed: true, angle: 0.7 },
+            &f,
+        );
+        apply(
+            &mut img,
+            &Op::Step { center: (60.0, 60.0), number: 3, color: RED, radius: 18.0, shape: StepShape::Pin, glyph: StepGlyph::Number, angle: 1.1 },
+            &f,
+        );
+        assert!(img.pixels().any(|p| p.0 == RED));
+    }
+
+    #[test]
+    fn beautify_adds_gradient_padding_rounded_corners_and_shadow() {
+        let f = test_font();
+        let base = white(60, 40);
+        let op = Op::Beautify { preset: 0, padding: 20, radius: 12, shadow: 16 };
+        assert!(!op.is_object());
+        let mut out = base.clone();
+        apply(&mut out, &op, &f);
+        assert_eq!((out.width(), out.height()), (100, 80));
+        // Center of the inner image remains white.
+        assert_eq!(out.get_pixel(50, 40).0, [255, 255, 255, 255]);
+        // Outer corner is painted with the Ocean gradient (not white).
+        assert_ne!(out.get_pixel(2, 2).0, [255, 255, 255, 255]);
+        // Because of the 12px rounded corner radius, pixel (20, 20) at the sharp corner of the
+        // inner rect shows the backdrop rather than pure white.
+        assert_ne!(out.get_pixel(20, 20).0, [255, 255, 255, 255]);
+        // Drop shadow darkens pixels just below the bottom edge compared to a shadowless render.
+        let no_shadow = beautify(&base, 0, 20, 12, 0);
+        assert!(out.get_pixel(50, 64).0[2] < no_shadow.get_pixel(50, 64).0[2]);
+    }
+
     /// Generates `target/demo.png` for visual inspection: `cargo test demo_png -- --ignored`.
     #[test]
     #[ignore]
@@ -1897,48 +2451,48 @@ mod tests {
         let mut img = white(640, 360);
         let f = test_font();
         let blue = [10, 132, 255, 255];
-        apply(&mut img, &Op::Text { pos: (30.0, 30.0), text: "Password: 1234-5678 (pixelated next to it)".into(), color: [20, 20, 20, 255], size: 22.0, boxed: false }, &f);
-        apply(&mut img, &Op::Text { pos: (30.0, 70.0), text: "Highlighted text: ação, coração".into(), color: [20, 20, 20, 255], size: 22.0, boxed: false }, &f);
+        apply(&mut img, &Op::Text { pos: (30.0, 30.0), text: "Password: 1234-5678 (pixelated next to it)".into(), color: [20, 20, 20, 255], size: 22.0, boxed: false, angle: 0.0 }, &f);
+        apply(&mut img, &Op::Text { pos: (30.0, 70.0), text: "Highlighted text: ação, coração".into(), color: [20, 20, 20, 255], size: 22.0, boxed: false, angle: 0.0 }, &f);
         for op in [
             Op::Pixelate { a: (105.0, 28.0), b: (270.0, 58.0) },
-            Op::Highlight { a: (25.0, 68.0), b: (420.0, 100.0), color: [255, 235, 60, 255] },
+            Op::Highlight { a: (25.0, 68.0), b: (420.0, 100.0), color: [255, 235, 60, 255], angle: 0.0 },
             Op::Arrow { from: (60.0, 300.0), to: (250.0, 170.0), color: RED, width: 5.0, dashed: false, double: false },
-            Op::Rect { a: (300.0, 140.0), b: (450.0, 230.0), color: blue, width: 4.0, filled: false, dashed: false },
-            Op::Ellipse { a: (470.0, 140.0), b: (610.0, 230.0), color: [52, 199, 89, 255], width: 4.0, filled: false, dashed: false },
+            Op::Rect { a: (300.0, 140.0), b: (450.0, 230.0), color: blue, width: 4.0, filled: false, dashed: false, angle: 0.0 },
+            Op::Ellipse { a: (470.0, 140.0), b: (610.0, 230.0), color: [52, 199, 89, 255], width: 4.0, filled: false, dashed: false, angle: 0.0 },
             Op::Line { from: (300.0, 260.0), to: (610.0, 260.0), color: [255, 138, 76, 255], width: 8.0, dashed: false },
             Op::Pen { points: (0..60).map(|i| (300.0 + i as f32 * 5.0, 310.0 + (i as f32 * 0.5).sin() * 18.0)).collect(), color: blue, width: 3.0 },
-            Op::Text { pos: (60.0, 310.0), text: "Hello!".into(), color: RED, size: 30.0, boxed: false },
-            Op::Rect { a: (20.0, 120.0), b: (90.0, 160.0), color: blue, width: 4.0, filled: true, dashed: false },
-            Op::Ellipse { a: (100.0, 120.0), b: (170.0, 160.0), color: [52, 199, 89, 255], width: 4.0, filled: true, dashed: false },
+            Op::Text { pos: (60.0, 310.0), text: "Hello!".into(), color: RED, size: 30.0, boxed: false, angle: 0.0 },
+            Op::Rect { a: (20.0, 120.0), b: (90.0, 160.0), color: blue, width: 4.0, filled: true, dashed: false, angle: 0.0 },
+            Op::Ellipse { a: (100.0, 120.0), b: (170.0, 160.0), color: [52, 199, 89, 255], width: 4.0, filled: true, dashed: false, angle: 0.0 },
             Op::Blur { a: (25.0, 25.0), b: (100.0, 60.0) },
-            Op::Text { pos: (30.0, 190.0), text: "Text with a background\nand two lines".into(), color: [255, 255, 255, 255], size: 18.0, boxed: true },
+            Op::Text { pos: (30.0, 190.0), text: "Text with a background\nand two lines".into(), color: [255, 255, 255, 255], size: 18.0, boxed: true, angle: 0.0 },
             Op::Callout { tip: (375.0, 185.0), pos: (180.0, 225.0), text: "A callout that\npoints".into(), color: [255, 138, 76, 255], size: 18.0, style: CalloutStyle::Rounded },
             Op::Magnify { src: ((55.0, 305.0), (115.0, 340.0)), a: (500.0, 280.0), b: (620.0, 350.0) },
             Op::Arrow { from: (200.0, 300.0), to: (290.0, 340.0), color: blue, width: 4.0, dashed: true, double: true },
-            Op::Rect { a: (455.0, 125.0), b: (625.0, 245.0), color: RED, width: 3.0, filled: false, dashed: true },
-            Op::Stamp { kind: Stamp::Check, center: (30.0, 255.0), radius: 14.0, color: [52, 199, 89, 255] },
-            Op::Stamp { kind: Stamp::Cross, center: (64.0, 255.0), radius: 14.0, color: RED },
-            Op::Stamp { kind: Stamp::Warning, center: (98.0, 255.0), radius: 14.0, color: [255, 214, 10, 255] },
-            Op::Stamp { kind: Stamp::Info, center: (132.0, 255.0), radius: 14.0, color: blue },
-            Op::Stamp { kind: Stamp::Question, center: (166.0, 255.0), radius: 14.0, color: [20, 20, 20, 255] },
-            Op::Stamp { kind: Stamp::Star, center: (30.0, 290.0), radius: 14.0, color: [255, 138, 76, 255] },
-            Op::Stamp { kind: Stamp::Cursor, center: (150.0, 300.0), radius: 14.0, color: RED },
-            Op::Stamp { kind: Stamp::Plus, center: (320.0, 30.0), radius: 12.0, color: [52, 199, 89, 255] },
-            Op::Stamp { kind: Stamp::Minus, center: (350.0, 30.0), radius: 12.0, color: RED },
-            Op::Stamp { kind: Stamp::ArrowRight, center: (380.0, 30.0), radius: 12.0, color: blue },
-            Op::Stamp { kind: Stamp::ArrowUp, center: (410.0, 30.0), radius: 12.0, color: blue },
-            Op::Stamp { kind: Stamp::Heart, center: (320.0, 62.0), radius: 12.0, color: RED },
-            Op::Stamp { kind: Stamp::Flag, center: (350.0, 62.0), radius: 12.0, color: RED },
-            Op::Stamp { kind: Stamp::Pin, center: (380.0, 62.0), radius: 12.0, color: RED },
-            Op::Step { center: (440.0, 110.0), number: 1, color: RED, radius: 13.0, shape: StepShape::Square, glyph: StepGlyph::Number },
-            Op::Step { center: (475.0, 110.0), number: 2, color: blue, radius: 13.0, shape: StepShape::Diamond, glyph: StepGlyph::Number },
-            Op::Step { center: (510.0, 110.0), number: 3, color: [52, 199, 89, 255], radius: 13.0, shape: StepShape::Hexagon, glyph: StepGlyph::Upper },
-            Op::Step { center: (545.0, 105.0), number: 4, color: [255, 138, 76, 255], radius: 13.0, shape: StepShape::Pin, glyph: StepGlyph::Lower },
+            Op::Rect { a: (455.0, 125.0), b: (625.0, 245.0), color: RED, width: 3.0, filled: false, dashed: true, angle: 0.0 },
+            Op::Stamp { kind: Stamp::Check, center: (30.0, 255.0), radius: 14.0, color: [52, 199, 89, 255], angle: 0.0 },
+            Op::Stamp { kind: Stamp::Cross, center: (64.0, 255.0), radius: 14.0, color: RED, angle: 0.0 },
+            Op::Stamp { kind: Stamp::Warning, center: (98.0, 255.0), radius: 14.0, color: [255, 214, 10, 255], angle: 0.0 },
+            Op::Stamp { kind: Stamp::Info, center: (132.0, 255.0), radius: 14.0, color: blue, angle: 0.0 },
+            Op::Stamp { kind: Stamp::Question, center: (166.0, 255.0), radius: 14.0, color: [20, 20, 20, 255], angle: 0.0 },
+            Op::Stamp { kind: Stamp::Star, center: (30.0, 290.0), radius: 14.0, color: [255, 138, 76, 255], angle: 0.0 },
+            Op::Stamp { kind: Stamp::Cursor, center: (150.0, 300.0), radius: 14.0, color: RED, angle: 0.0 },
+            Op::Stamp { kind: Stamp::Plus, center: (320.0, 30.0), radius: 12.0, color: [52, 199, 89, 255], angle: 0.0 },
+            Op::Stamp { kind: Stamp::Minus, center: (350.0, 30.0), radius: 12.0, color: RED, angle: 0.0 },
+            Op::Stamp { kind: Stamp::ArrowRight, center: (380.0, 30.0), radius: 12.0, color: blue, angle: 0.0 },
+            Op::Stamp { kind: Stamp::ArrowUp, center: (410.0, 30.0), radius: 12.0, color: blue, angle: 0.0 },
+            Op::Stamp { kind: Stamp::Heart, center: (320.0, 62.0), radius: 12.0, color: RED, angle: 0.0 },
+            Op::Stamp { kind: Stamp::Flag, center: (350.0, 62.0), radius: 12.0, color: RED, angle: 0.0 },
+            Op::Stamp { kind: Stamp::Pin, center: (380.0, 62.0), radius: 12.0, color: RED, angle: 0.0 },
+            Op::Step { center: (440.0, 110.0), number: 1, color: RED, radius: 13.0, shape: StepShape::Square, glyph: StepGlyph::Number, angle: 0.0 },
+            Op::Step { center: (475.0, 110.0), number: 2, color: blue, radius: 13.0, shape: StepShape::Diamond, glyph: StepGlyph::Number, angle: 0.0 },
+            Op::Step { center: (510.0, 110.0), number: 3, color: [52, 199, 89, 255], radius: 13.0, shape: StepShape::Hexagon, glyph: StepGlyph::Upper, angle: 0.0 },
+            Op::Step { center: (545.0, 105.0), number: 4, color: [255, 138, 76, 255], radius: 13.0, shape: StepShape::Pin, glyph: StepGlyph::Lower, angle: 0.0 },
             Op::Callout { tip: (300.0, 110.0), pos: (330.0, 85.0), text: "Contorno".into(), color: blue, size: 15.0, style: CalloutStyle::Outline },
-            Op::Step { center: (470.0, 60.0), number: 1, color: RED, radius: 20.0, shape: StepShape::Circle, glyph: StepGlyph::Number },
-            Op::Step { center: (525.0, 60.0), number: 12, color: blue, radius: 20.0, shape: StepShape::Circle, glyph: StepGlyph::Number },
-            Op::Step { center: (580.0, 60.0), number: 3, color: [255, 214, 10, 255], radius: 20.0, shape: StepShape::Circle, glyph: StepGlyph::Number },
-            Op::Step { center: (615.0, 100.0), number: 128, color: [20, 20, 20, 255], radius: 14.0, shape: StepShape::Circle, glyph: StepGlyph::Number },
+            Op::Step { center: (470.0, 60.0), number: 1, color: RED, radius: 20.0, shape: StepShape::Circle, glyph: StepGlyph::Number, angle: 0.0 },
+            Op::Step { center: (525.0, 60.0), number: 12, color: blue, radius: 20.0, shape: StepShape::Circle, glyph: StepGlyph::Number, angle: 0.0 },
+            Op::Step { center: (580.0, 60.0), number: 3, color: [255, 214, 10, 255], radius: 20.0, shape: StepShape::Circle, glyph: StepGlyph::Number, angle: 0.0 },
+            Op::Step { center: (615.0, 100.0), number: 128, color: [20, 20, 20, 255], radius: 14.0, shape: StepShape::Circle, glyph: StepGlyph::Number, angle: 0.0 },
         ] {
             apply(&mut img, &op, &f);
         }

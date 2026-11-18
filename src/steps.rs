@@ -169,6 +169,7 @@ pub fn compose(shots: &[Shot]) -> Option<(RgbaImage, Vec<Op>)> {
             color: CAPTION_COLOR,
             size: CAPTION_SIZE,
             boxed: false,
+            angle: 0.0,
         });
         let image_top = top + CAPTION_HEIGHT;
         image::imageops::replace(&mut guide, &shot.image, MARGIN as i64, image_top as i64);
@@ -184,6 +185,7 @@ pub fn compose(shots: &[Shot]) -> Option<(RgbaImage, Vec<Op>)> {
                 radius: MARKER_RADIUS,
                 shape: StepShape::Circle,
                 glyph: StepGlyph::Number,
+                angle: 0.0,
             });
         }
         top = image_top + shot.image.height() + GAP;
