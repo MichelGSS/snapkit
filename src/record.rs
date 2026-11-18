@@ -19,12 +19,26 @@ use crate::audio::AudioRecording;
 use crate::win::PxRect;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const FRAME_RATE: u32 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Options {
     pub system_audio: bool,
     pub microphone: bool,
+    pub fps: u32,
+    pub quality: crate::config::VideoQuality,
+    pub draw_mouse: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            system_audio: true,
+            microphone: false,
+            fps: 30,
+            quality: crate::config::VideoQuality::High,
+            draw_mouse: true,
+        }
+    }
 }
 
 /// Path of the bundled `ffmpeg.exe`, if it exists.
@@ -51,19 +65,22 @@ fn ffmpeg_command(ffmpeg: &Path) -> Command {
 }
 
 /// FFmpeg command line to record the image of `rect` to `out`.
-fn capture_args(rect: PxRect, out: &Path) -> Vec<String> {
+fn capture_args(rect: PxRect, options: Options, out: &Path) -> Vec<String> {
     // H.264 requires an even width and height.
     let (w, h) = ((rect.2 - rect.0) & !1, (rect.3 - rect.1) & !1);
-    // Bit rate proportional to the area: ~8 Mbit/s at 1920×1080.
-    let kbps = ((w as i64 * h as i64) / 260).clamp(1500, 20_000);
+    let fps = options.fps.clamp(10, 60);
+    // Bit rate proportional to the area (~8 Mbit/s at 1920×1080), scaled by quality preset.
+    let base_kbps = (w as i64 * h as i64) / 260;
+    let kbps = ((base_kbps as f64 * options.quality.bitrate_factor()).round() as i64).clamp(1000, 35_000);
+    let draw_mouse = if options.draw_mouse { "1" } else { "0" };
     let mut a: Vec<String> = [
-        "-y", "-hide_banner", "-loglevel", "error", "-f", "gdigrab", "-draw_mouse", "1",
+        "-y", "-hide_banner", "-loglevel", "error", "-f", "gdigrab", "-draw_mouse", draw_mouse,
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     let mut add = |key: &str, value: String| a.extend([key.to_owned(), value]);
-    add("-framerate", FRAME_RATE.to_string());
+    add("-framerate", fps.to_string());
     add("-offset_x", rect.0.to_string());
     add("-offset_y", rect.1.to_string());
     add("-video_size", format!("{w}x{h}"));
@@ -150,7 +167,7 @@ impl Recorder {
         };
 
         let child = ffmpeg_command(&ffmpeg)
-            .args(capture_args(rect, &video_part))
+            .args(capture_args(rect, options, &video_part))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -437,9 +454,223 @@ fn concat_list(parts: &[PathBuf]) -> String {
     parts.iter().map(|p| format!("file '{}'\n", p.to_string_lossy().replace('\'', r"'\''"))).collect()
 }
 
+/// Metadata probed from a video file via FFmpeg.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoInfo {
+    pub width: u32,
+    pub height: u32,
+    pub duration: f64,
+    pub fps: f64,
+    pub has_audio: bool,
+}
+
+fn parse_video_info(description: &str) -> Option<VideoInfo> {
+    let duration = parse_duration(description)?.as_secs_f64();
+    let video_line = description.lines().find(|l| l.contains("Video:"))?;
+    let mut dims = None;
+    for token in video_line.split([',', ' ', '[', ']', '(', ')']) {
+        if let Some((w_str, h_str)) = token.split_once('x')
+            && !w_str.is_empty()
+            && !h_str.is_empty()
+            && !w_str.starts_with('0')
+            && w_str.bytes().all(|b| b.is_ascii_digit())
+            && h_str.bytes().all(|b| b.is_ascii_digit())
+            && let (Ok(w), Ok(h)) = (w_str.parse::<u32>(), h_str.parse::<u32>())
+            && w > 0
+            && h > 0
+        {
+            dims = Some((w, h));
+            break;
+        }
+    }
+    let (width, height) = dims?;
+    let fps = video_line
+        .split(" fps")
+        .next()
+        .and_then(|before| before.rsplit(',').next())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(30.0);
+    let has_audio = description.lines().any(|l| l.contains("Audio:"));
+    Some(VideoInfo { width, height, duration, fps, has_audio })
+}
+
+/// Probes dimensions, duration, frame rate, and audio presence of a video file.
+pub fn probe(video: &Path) -> Option<VideoInfo> {
+    let ffmpeg = find_ffmpeg()?;
+    let output = ffmpeg_command(&ffmpeg).args(["-hide_banner", "-i"]).arg(video).output().ok()?;
+    parse_video_info(&String::from_utf8_lossy(&output.stderr))
+}
+
+fn extract_frame_with(
+    ffmpeg: &Path,
+    video: &Path,
+    at_secs: f64,
+    scale_height: Option<u32>,
+) -> Result<image::RgbaImage, String> {
+    let run = |secs: f64| -> std::io::Result<std::process::Output> {
+        let mut cmd = ffmpeg_command(ffmpeg);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{:.3}", secs.max(0.0)), "-i"])
+            .arg(video);
+        if let Some(h) = scale_height {
+            cmd.args(["-vf", &format!("scale=-2:{}", h.max(32))]);
+        }
+        cmd.args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+    };
+    let mut output = run(at_secs).map_err(|e| e.to_string())?;
+    if output.stdout.is_empty() && at_secs > 0.0 {
+        output = run(0.0).map_err(|e| e.to_string())?;
+    }
+    if output.stdout.is_empty() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    image::load_from_memory(&output.stdout).map(|img| img.to_rgba8()).map_err(|e| e.to_string())
+}
+
+/// Extracts a single RGBA frame from `video` at `at_secs`.
+pub fn extract_frame(video: &Path, at_secs: f64) -> Result<image::RgbaImage, String> {
+    let ffmpeg = find_ffmpeg().ok_or(t!("o FFmpeg não foi encontrado (pasta ffmpeg)", "FFmpeg was not found (ffmpeg folder)"))?;
+    extract_frame_with(&ffmpeg, video, at_secs, None)
+}
+
+/// Extracts `count` evenly spaced thumbnail frames scaled to `thumb_height` pixels tall.
+pub fn extract_filmstrip(video: &Path, count: usize, thumb_height: u32) -> Vec<image::RgbaImage> {
+    let Some(ffmpeg) = find_ffmpeg() else { return Vec::new() };
+    let duration = probe(video).map(|i| i.duration).unwrap_or(0.0);
+    let n = count.max(1);
+    let h = thumb_height.max(32);
+    let mut frames = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = if duration <= 0.0 || n == 1 {
+            0.0
+        } else {
+            ((i as f64 + 0.5) / n as f64 * duration).min((duration - 0.05).max(0.0))
+        };
+        if let Ok(frame) = extract_frame_with(&ffmpeg, video, t, Some(h)) {
+            frames.push(frame);
+        }
+    }
+    frames
+}
+
 /// Length of a video already recorded.
 pub fn video_duration(video: &Path) -> Option<Duration> {
     media_duration(&find_ffmpeg()?, video)
+}
+
+/// Options for editing/exporting a video (trim, speed, mute, crop, resize).
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoEditOptions {
+    pub start: f64,
+    pub end: Option<f64>,
+    pub speed: f64,
+    pub mute: bool,
+    /// Optional crop `(x, y, width, height)` in video pixels.
+    pub crop: Option<(u32, u32, u32, u32)>,
+    /// Maximum output width (`0` keeps original/cropped width).
+    pub max_width: u32,
+}
+
+impl Default for VideoEditOptions {
+    fn default() -> Self {
+        Self { start: 0.0, end: None, speed: 1.0, mute: false, crop: None, max_width: 0 }
+    }
+}
+
+fn atempo_filter(speed: f64) -> String {
+    let mut remaining = speed.clamp(0.25, 4.0);
+    let mut stages = Vec::new();
+    while remaining > 2.0 + 1e-4 {
+        stages.push("atempo=2.0".to_owned());
+        remaining /= 2.0;
+    }
+    while remaining < 0.5 - 1e-4 {
+        stages.push("atempo=0.5".to_owned());
+        remaining /= 0.5;
+    }
+    if (remaining - 1.0).abs() > 0.01 || stages.is_empty() {
+        stages.push(format!("atempo={remaining:.3}"));
+    }
+    stages.join(",")
+}
+
+fn edit_video_args(video: &Path, opts: &VideoEditOptions, out: &Path) -> Vec<String> {
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let mut a: Vec<String> = ["-y", "-hide_banner", "-loglevel", "error", "-i"].iter().map(|s| s.to_string()).collect();
+    a.push(path(video));
+    if opts.start > 0.0 {
+        a.extend(["-ss".to_owned(), format!("{:.3}", opts.start)]);
+    }
+    if let Some(end) = opts.end {
+        a.extend(["-to".to_owned(), format!("{end:.3}")]);
+    }
+
+    let speed = opts.speed.clamp(0.25, 4.0);
+    let mut vf_parts = Vec::new();
+    if let Some((x, y, w, h)) = opts.crop {
+        let cw = (w & !1).max(2);
+        let ch = (h & !1).max(2);
+        vf_parts.push(format!("crop={cw}:{ch}:{x}:{y}"));
+    }
+    if opts.max_width > 0 {
+        let mw = (opts.max_width & !1).max(2);
+        vf_parts.push(format!("scale='min({mw},iw)':-2"));
+    }
+    if (speed - 1.0).abs() > 0.01 {
+        vf_parts.push(format!("setpts={:.4}*PTS", 1.0 / speed));
+    }
+    if !vf_parts.is_empty() {
+        a.extend(["-vf".to_owned(), vf_parts.join(",")]);
+    }
+
+    for s in ["-c:v", "libopenh264", "-b:v", "8000k", "-pix_fmt", "yuv420p"] {
+        a.push(s.to_owned());
+    }
+    if opts.mute {
+        a.push("-an".to_owned());
+    } else {
+        if (speed - 1.0).abs() > 0.01 {
+            a.extend(["-af".to_owned(), atempo_filter(speed)]);
+        }
+        for s in ["-c:a", "aac", "-b:a", "160k"] {
+            a.push(s.to_owned());
+        }
+    }
+    a.extend(["-movflags".to_owned(), "+faststart".to_owned(), path(out)]);
+    a
+}
+
+/// Applies trim, crop, resize, speed, and mute options to `video` and writes the result to `out`.
+/// Uses a temporary `.tmp.mp4` file and renames atomically so `out == video` is safe.
+pub fn edit_video(video: &Path, opts: &VideoEditOptions, out: &Path) -> Result<PathBuf, String> {
+    let ffmpeg = find_ffmpeg().ok_or(t!("o FFmpeg não foi encontrado (pasta ffmpeg)", "FFmpeg was not found (ffmpeg folder)"))?;
+    if let Some(end) = opts.end
+        && end - opts.start < 0.1
+    {
+        return Err(t!("trecho curto demais", "clip too short").to_owned());
+    }
+    let has_audio = probe(video).is_none_or(|i| i.has_audio);
+    let mut effective = opts.clone();
+    if !has_audio {
+        effective.mute = true;
+    }
+    let tmp = out.with_extension("tmp.mp4");
+    let output = ffmpeg_command(&ffmpeg)
+        .args(edit_video_args(video, &effective, &tmp))
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() && tmp.is_file() {
+        std::fs::rename(&tmp, out).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })?;
+        Ok(out.to_path_buf())
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
 }
 
 fn trim_args(video: &Path, start: f64, end: f64, out: &Path) -> Vec<String> {
@@ -509,17 +740,21 @@ fn gif_args(video: &Path, options: &GifOptions, gif: &Path) -> Vec<String> {
     a
 }
 
-/// Converts a video to a GIF, next to the original.
-pub fn to_gif(video: &Path, options: &GifOptions) -> Result<PathBuf, String> {
+/// Converts a video to a GIF at `out_gif`.
+pub fn to_gif_at(video: &Path, options: &GifOptions, out_gif: &Path) -> Result<PathBuf, String> {
     let ffmpeg = find_ffmpeg().ok_or(t!("o FFmpeg não foi encontrado (pasta ffmpeg)", "FFmpeg was not found (ffmpeg folder)"))?;
-    let gif = video.with_extension("gif");
-    let output = ffmpeg_command(&ffmpeg).args(gif_args(video, options, &gif)).output().map_err(|e| e.to_string())?;
-    if output.status.success() && gif.is_file() {
-        Ok(gif)
+    let output = ffmpeg_command(&ffmpeg).args(gif_args(video, options, out_gif)).output().map_err(|e| e.to_string())?;
+    if output.status.success() && out_gif.is_file() {
+        Ok(out_gif.to_path_buf())
     } else {
-        let _ = std::fs::remove_file(&gif);
+        let _ = std::fs::remove_file(out_gif);
         Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
     }
+}
+
+/// Converts a video to a GIF, next to the original.
+pub fn to_gif(video: &Path, options: &GifOptions) -> Result<PathBuf, String> {
+    to_gif_at(video, options, &video.with_extension("gif"))
 }
 
 #[cfg(test)]
@@ -529,22 +764,30 @@ mod tests {
     #[test]
     fn capture_uses_even_size_and_screen_offsets() {
         // Monitor to the left of the primary one: negative coordinates; an odd size becomes even.
-        let a = capture_args((-1920, 191, -1119, 792), Path::new("saida.mp4")).join(" ");
+        let a = capture_args((-1920, 191, -1119, 792), Options::default(), Path::new("saida.mp4")).join(" ");
         assert!(a.contains("-offset_x -1920 -offset_y 191 -video_size 800x600 -i desktop"), "{a}");
         assert!(a.contains("-framerate 30") && a.contains("-c:v libopenh264"), "{a}");
+        assert!(a.contains("-draw_mouse 1"), "{a}");
         assert!(a.ends_with("-movflags +faststart saida.mp4"), "{a}");
+
+        let no_mouse = Options { fps: 60, draw_mouse: false, ..Options::default() };
+        let b = capture_args((0, 0, 800, 600), no_mouse, Path::new("b.mp4")).join(" ");
+        assert!(b.contains("-draw_mouse 0") && b.contains("-framerate 60"), "{b}");
     }
 
     #[test]
     fn bitrate_scales_with_area_within_limits() {
-        let kbps = |rect| {
-            let a = capture_args(rect, Path::new("s.mp4"));
+        let kbps = |rect, quality| {
+            let opts = Options { quality, ..Options::default() };
+            let a = capture_args(rect, opts, Path::new("s.mp4"));
             let i = a.iter().position(|x| x == "-b:v").unwrap();
             a[i + 1].clone()
         };
-        assert_eq!(kbps((0, 0, 1920, 1080)), "7975k");
-        assert_eq!(kbps((0, 0, 100, 100)), "1500k");
-        assert_eq!(kbps((0, 0, 7680, 4320)), "20000k");
+        assert_eq!(kbps((0, 0, 1920, 1080), crate::config::VideoQuality::High), "7975k");
+        assert_eq!(kbps((0, 0, 1920, 1080), crate::config::VideoQuality::Standard), "5184k");
+        assert_eq!(kbps((0, 0, 1920, 1080), crate::config::VideoQuality::Ultra), "12760k");
+        assert_eq!(kbps((0, 0, 100, 100), crate::config::VideoQuality::Standard), "1000k");
+        assert_eq!(kbps((0, 0, 7680, 4320), crate::config::VideoQuality::Ultra), "35000k");
     }
 
     #[test]
@@ -562,6 +805,55 @@ mod tests {
         assert_eq!(parse_duration(text), Some(Duration::from_millis(62_500)));
         assert_eq!(parse_duration("  Duration: N/A, start: 1.0"), None);
         assert_eq!(parse_duration("nothing here"), None);
+    }
+
+    #[test]
+    fn probe_parses_ffmpeg_description() {
+        let sample = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
+  Duration: 00:00:12.40, start: 0.000000, bitrate: 4120 kb/s
+  Stream #0:0[0x1](und): Video: h264 (Constrained Baseline) (avc1 / 0x31637661), yuv420p(progressive), 1920x1080, 3955 kb/s, 29.97 fps, 30 tbr, 15360 tbn (default)
+  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706d), 48000 Hz, stereo, fltp, 160 kb/s (default)
+";
+        let info = parse_video_info(sample).unwrap();
+        assert_eq!(info.width, 1920);
+        assert_eq!(info.height, 1080);
+        assert!((info.duration - 12.40).abs() < 1e-4);
+        assert!((info.fps - 29.97).abs() < 1e-4);
+        assert!(info.has_audio);
+
+        let silent = "\
+Input #0, mov,mp4, from 'silent.mp4':
+  Duration: 00:01:05.00, start: 0.000000, bitrate: 2000 kb/s
+  Stream #0:0(und): Video: h264 (avc1 / 0x31637661), yuv420p, 1280x720 [SAR 1:1 DAR 16:9], 60 fps, 60 tbr
+";
+        let info2 = parse_video_info(silent).unwrap();
+        assert_eq!(info2.width, 1280);
+        assert_eq!(info2.height, 720);
+        assert!((info2.duration - 65.0).abs() < 1e-4);
+        assert!((info2.fps - 60.0).abs() < 1e-4);
+        assert!(!info2.has_audio);
+    }
+
+    #[test]
+    fn edit_video_args_builds_filters_and_audio_options() {
+        let opts = VideoEditOptions {
+            start: 1.25,
+            end: Some(8.5),
+            speed: 2.0,
+            mute: false,
+            crop: Some((10, 20, 641, 481)),
+            max_width: 1280,
+        };
+        let args = edit_video_args(Path::new("in.mp4"), &opts, Path::new("out.mp4")).join(" ");
+        assert!(args.contains("-ss 1.250 -to 8.500"), "{args}");
+        assert!(args.contains("crop=640:480:10:20,scale='min(1280,iw)':-2,setpts=0.5000*PTS"), "{args}");
+        assert!(args.contains("-af atempo=2.000"), "{args}");
+        assert!(args.contains("-c:v libopenh264") && args.contains("-pix_fmt yuv420p"), "{args}");
+
+        let muted = VideoEditOptions { mute: true, ..VideoEditOptions::default() };
+        let args_m = edit_video_args(Path::new("in.mp4"), &muted, Path::new("out.mp4")).join(" ");
+        assert!(args_m.contains("-an") && !args_m.contains("-c:a"), "{args_m}");
     }
 
     /// FFmpeg's description of the file (streams, length, frames per second).
@@ -592,7 +884,7 @@ mod tests {
             return;
         }
         let dir = std::env::temp_dir().join(format!("snapkit-test-video-{}", std::process::id()));
-        let options = Options { system_audio: true, microphone: true };
+        let options = Options { system_audio: true, microphone: true, ..Options::default() };
         let mut rec = Recorder::start((0, 0, 320, 240), options, &dir, "test").unwrap();
         let had_audio = rec.audio.is_some();
         std::thread::sleep(Duration::from_secs(3));
@@ -647,7 +939,7 @@ mod tests {
             return;
         }
         let dir = std::env::temp_dir().join(format!("snapkit-test-pause-{}", std::process::id()));
-        let options = Options { system_audio: false, microphone: false };
+        let options = Options { system_audio: false, microphone: false, ..Options::default() };
         let mut session = Session::start((0, 0, 240, 160), options, &dir, "pause").unwrap();
         std::thread::sleep(Duration::from_millis(1500));
         session.pause().unwrap();
@@ -678,7 +970,7 @@ mod tests {
             return;
         }
         let dir = std::env::temp_dir().join(format!("snapkit-test-mute-{}", std::process::id()));
-        let options = Options { system_audio: false, microphone: false };
+        let options = Options { system_audio: false, microphone: false, ..Options::default() };
         let rec = Recorder::start((0, 0, 200, 160), options, &dir, "mute").unwrap();
         std::thread::sleep(Duration::from_millis(1500));
         let video = rec.stop().unwrap();

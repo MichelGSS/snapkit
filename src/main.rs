@@ -18,6 +18,7 @@ mod steps;
 mod theme;
 mod tray;
 mod update;
+mod video_editor;
 mod win;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -301,6 +302,7 @@ struct App {
     cfg: Config,
     selecting: Option<Selecting>,
     editor: Option<editor::Editor>,
+    video_editor: Option<video_editor::VideoEditor>,
     status: String,
     hotkeys: Option<GlobalHotKeyManager>,
     /// Hotkeys currently registered with the system.
@@ -322,17 +324,16 @@ struct App {
     thumbs: HashMap<String, TextureHandle>,
     show_library: bool,
     search: String,
+    library_filter: library::MediaFilter,
     /// Panoramic capture being prepared or in progress.
     pano: Option<PanoUi>,
     /// Video recording being prepared or in progress.
     video: Option<VideoUi>,
     /// Step-by-step capture being prepared or in progress.
     steps: Option<StepsUi>,
-    /// Last finished recording, shown in a window until the user closes it.
-    video_done: Option<VideoDone>,
-    /// Result of the GIF conversion, delivered by the thread that does it.
-    gif_pending: Arc<Mutex<Option<Result<std::path::PathBuf, String>>>>,
-    gif_running: bool,
+    /// Result of a background video/GIF export or edit job, delivered by the worker thread.
+    video_job_pending: Arc<Mutex<Option<Result<VideoJobDone, String>>>>,
+    video_job_running: bool,
     /// Result of the OCR in progress, delivered by the recognition thread.
     ocr_pending: Arc<Mutex<Option<OcrResult>>>,
     ocr_running: bool,
@@ -385,31 +386,26 @@ struct StepsUi {
     setup_frames: u8,
 }
 
-/// A video just recorded, with the choices from the Recording saved window.
-struct VideoDone {
-    path: std::path::PathBuf,
-    /// Length in seconds (0 if unknown).
-    length: f64,
-    /// Chosen clip, in seconds.
-    start: f64,
-    end: f64,
-    /// GIF options.
-    fps: u32,
-    width: u32,
-}
-
-impl VideoDone {
-    fn new(path: std::path::PathBuf) -> Self {
-        let length = record::video_duration(&path).map_or(0.0, |d| d.as_secs_f64());
-        Self { path, length, start: 0.0, end: length, fps: 12, width: 720 }
-    }
+/// Result of a background video or GIF processing task.
+enum VideoJobDone {
+    /// New MP4 clip saved to the library.
+    SavedClip { title: String, path: std::path::PathBuf },
+    /// Existing MP4 in the library overwritten in-place.
+    Overwritten { file: String, path: std::path::PathBuf },
+    /// Animated GIF created in the library.
+    SavedGif { file: String, title: String, path: std::path::PathBuf },
+    /// MP4 exported to an external destination chosen by the user.
+    ExportedExternal { path: std::path::PathBuf },
 }
 
 struct VideoUi {
     rect: win::PxRect,
+    title: String,
     recorder: Option<record::Session>,
     /// A recording that becomes a GIF when it stops.
     as_gif: bool,
+    /// Active countdown deadline before recording starts automatically.
+    countdown_until: Option<Instant>,
     /// Frame around the area, visible while the panel exists.
     _frame: Option<win::RegionFrame>,
     setup_frames: u8,
@@ -417,7 +413,7 @@ struct VideoUi {
 
 const PANO_HUD_SIZE: egui::Vec2 = egui::vec2(460.0, 84.0);
 const STEPS_HUD_SIZE: egui::Vec2 = egui::vec2(620.0, 84.0);
-const VIDEO_HUD_SIZE: egui::Vec2 = egui::vec2(560.0, 84.0);
+const VIDEO_HUD_SIZE: egui::Vec2 = egui::vec2(680.0, 84.0);
 
 /// Turns the window into a small panel, always on top and excluded from captures, and places it
 /// next to the area `rect`. Called every frame until `setup_frames` reaches zero: the window is
@@ -519,6 +515,7 @@ impl App {
             cfg,
             selecting: None,
             editor: None,
+            video_editor: None,
             status: String::new(),
             hotkeys,
             active_hotkeys: Vec::new(),
@@ -532,12 +529,12 @@ impl App {
             thumbs: HashMap::new(),
             show_library: true,
             search: String::new(),
+            library_filter: library::MediaFilter::All,
             pano: None,
             video: None,
             steps: None,
-            video_done: None,
-            gif_pending: Arc::new(Mutex::new(None)),
-            gif_running: false,
+            video_job_pending: Arc::new(Mutex::new(None)),
+            video_job_running: false,
             ocr_pending: Arc::new(Mutex::new(None)),
             ocr_running: false,
             ocr_text: None,
@@ -945,6 +942,9 @@ impl App {
                     if let Some(editor) = &mut self.editor {
                         editor.set_accent(accent);
                     }
+                    if let Some(ve) = &mut self.video_editor {
+                        ve.set_accent(accent);
+                    }
                     self.save_cfg();
                 }
                 ui.separator();
@@ -1146,9 +1146,43 @@ impl App {
         self.writer.wait_idle(Duration::from_secs(10));
     }
 
-    /// Opens a capture kept in the library in the editor.
+    /// Opens a capture or video kept in the library in the appropriate editor.
     fn open_from_library(&mut self, ctx: &egui::Context, file: &str) {
         self.flush_autosave(ctx);
+        let is_video = std::path::Path::new(file)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("mp4"));
+        if is_video {
+            let path = self.library.path(file);
+            if !path.is_file() {
+                self.status = tf!(
+                    "Não foi possível abrir {file}: arquivo não encontrado.",
+                    "Could not open {file}: file not found."
+                );
+                return;
+            }
+            let initial_thumb = image::open(self.library.thumb_path(file))
+                .map(|i| i.to_rgba8())
+                .ok()
+                .or_else(|| {
+                    let frame = record::extract_frame(&path, 0.0).ok()?;
+                    self.library.save_thumb(file, &frame);
+                    Some(frame)
+                });
+            let mut ve = video_editor::VideoEditor::new(ctx, path, initial_thumb, self.accent());
+            ve.set_busy(self.video_job_running);
+            let info = ve.info();
+            if info.width > 0 && info.height > 0 {
+                self.library
+                    .update_media(file, info.width, info.height, info.duration as f32);
+            }
+            self.editor = None;
+            self.video_editor = Some(ve);
+            self.current_file = Some(file.to_owned());
+            self.status = tf!("Vídeo aberto: {file}", "Video opened: {file}");
+            return;
+        }
+
         let loaded = if let Some((base, ops)) = self.library.load_layers(file) {
             Ok(editor::Editor::from_parts(ctx, base, ops, self.accent()))
         } else {
@@ -1157,6 +1191,7 @@ impl App {
         match loaded {
             Ok(editor) => {
                 self.saved_revision = editor.revision();
+                self.video_editor = None;
                 self.editor = Some(editor);
                 self.current_file = Some(file.to_owned());
                 self.status = tf!("Aberto: {file}", "Opened: {file}");
@@ -1176,6 +1211,7 @@ impl App {
                 if self.current_file.as_deref() == Some(file) {
                     self.current_file = None;
                     self.editor = None;
+                    self.video_editor = None;
                 }
                 self.status = tf!("{file} foi para a Lixeira.", "{file} was moved to the Recycle Bin.");
             }
@@ -1187,11 +1223,20 @@ impl App {
         if let Some(t) = self.thumbs.get(file) {
             return Some(t.clone());
         }
+        let is_video = std::path::Path::new(file)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("mp4"));
         // Missing thumbnail (old library or deleted file): rebuilds it from the original.
-        let thumb = image::open(self.library.thumb_path(file))
-            .map(|i| i.to_rgba8())
-            .or_else(|_| image::open(self.library.path(file)).map(|i| library::make_thumb(&i.to_rgba8())))
-            .ok()?;
+        let thumb = if let Ok(img) = image::open(self.library.thumb_path(file)) {
+            img.to_rgba8()
+        } else if is_video {
+            let frame = record::extract_frame(&self.library.path(file), 0.0).ok()?;
+            self.library.save_thumb(file, &frame);
+            library::make_thumb(&frame)
+        } else {
+            let img = image::open(self.library.path(file)).ok()?.to_rgba8();
+            library::make_thumb(&img)
+        };
         let texture = ctx.load_texture("thumbnail", editor::texture_image(&thumb, ctx.input(|i| i.max_texture_side)), TextureOptions::LINEAR);
         self.thumbs.insert(file.to_owned(), texture.clone());
         Some(texture)
@@ -1205,9 +1250,32 @@ impl App {
                 .hint_text(t!("Buscar por janela ou data", "Search by window or date"))
                 .desired_width(f32::INFINITY),
         );
-        let entries: Vec<library::Entry> = self.library.search(&self.search).into_iter().cloned().collect();
+        ui.add_space(4.0);
+        let (total_count, img_count, vid_count) = self.library.counts();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (filter, label) in [
+                (library::MediaFilter::All, tf!("Todas ({total_count})", "All ({total_count})")),
+                (library::MediaFilter::Images, tf!("Imagens ({img_count})", "Images ({img_count})")),
+                (library::MediaFilter::Videos, tf!("Vídeos ({vid_count})", "Videos ({vid_count})")),
+            ] {
+                if ui
+                    .selectable_label(self.library_filter == filter, label)
+                    .clicked()
+                {
+                    self.library_filter = filter;
+                }
+            }
+        });
+        let entries: Vec<library::Entry> = match self.library_filter {
+            library::MediaFilter::All => self.library.search(&self.search),
+            filter => self.library.search_filtered(&self.search, filter),
+        }
+        .into_iter()
+        .cloned()
+        .collect();
         ui.horizontal(|ui| {
-            ui.label(tf!("{} de {} capturas", "{} of {} captures", entries.len(), self.library.len()));
+            ui.label(tf!("{} de {} itens", "{} of {} items", entries.len(), self.library.len()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button(t!("Abrir pasta", "Open folder")).clicked() {
                     let _ = std::fs::create_dir_all(self.library.dir());
@@ -1221,33 +1289,89 @@ impl App {
         let mut to_delete = None;
         let thumb_h = 96.0;
         let row_h = thumb_h + 44.0;
+        let accent = self.accent();
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, entries.len(), |ui, rows| {
             for entry in &entries[rows] {
                 let selected = self.current_file.as_deref() == Some(entry.file.as_str());
                 let (rect, response) =
                     ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
                 if selected || response.hovered() {
-                    let fill = if selected { self.accent().gamma_multiply(0.25) } else { ui.visuals().widgets.hovered.weak_bg_fill };
+                    let fill = if selected { accent.gamma_multiply(0.25) } else { ui.visuals().widgets.hovered.weak_bg_fill };
                     ui.painter().rect_filled(rect, 6.0, fill);
                 }
                 let inner = rect.shrink(6.0);
+                let mut thumb_rect = Rect::from_min_size(inner.min, egui::vec2(inner.width(), thumb_h));
                 if let Some(tex) = self.thumb_texture(&ctx, &entry.file) {
                     let size = tex.size_vec2();
                     let scale = (inner.width() / size.x).min(thumb_h / size.y).min(1.0);
                     let img_rect = Rect::from_min_size(inner.min, size * scale);
+                    thumb_rect = img_rect;
                     let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
                     ui.painter().image(tex.id(), img_rect, uv, Color32::WHITE);
                 }
+                let painter = ui.painter_at(inner);
+                // Overlay media type badge (MP4 / GIF) and duration pill over thumbnail
+                if entry.is_video() || entry.is_gif() {
+                    let badge_text = if entry.is_video() { "MP4" } else { "GIF" };
+                    let badge_bg = if entry.is_video() {
+                        accent
+                    } else {
+                        Color32::from_rgb(138, 86, 226)
+                    };
+                    let badge_fg = if entry.is_video() {
+                        theme::text_on(accent)
+                    } else {
+                        Color32::WHITE
+                    };
+                    let b_galley = painter.layout_no_wrap(
+                        badge_text.to_owned(),
+                        egui::FontId::proportional(10.0),
+                        badge_fg,
+                    );
+                    let b_pos = thumb_rect.min + egui::vec2(5.0, 5.0);
+                    let b_rect = Rect::from_min_size(b_pos, b_galley.size() + egui::vec2(8.0, 3.0));
+                    painter.rect_filled(b_rect, 3.0, badge_bg);
+                    painter.galley(b_pos + egui::vec2(4.0, 1.5), b_galley, badge_fg);
+
+                    if entry.duration_secs > 0.0 {
+                        let dur_str = format!("▶ {}", format_duration_short(entry.duration_secs));
+                        let d_galley = painter.layout_no_wrap(
+                            dur_str,
+                            egui::FontId::proportional(10.5),
+                            Color32::WHITE,
+                        );
+                        let d_size = d_galley.size() + egui::vec2(10.0, 4.0);
+                        let d_pos = Pos2::new(
+                            (thumb_rect.max.x - d_size.x - 5.0).max(thumb_rect.min.x + 4.0),
+                            (thumb_rect.max.y - d_size.y - 5.0).max(thumb_rect.min.y + 4.0),
+                        );
+                        let d_rect = Rect::from_min_size(d_pos, d_size);
+                        painter.rect_filled(d_rect, 4.0, Color32::from_black_alpha(185));
+                        painter.galley(d_pos + egui::vec2(5.0, 2.0), d_galley, Color32::WHITE);
+                    }
+                }
                 let text_top = inner.min + egui::vec2(0.0, thumb_h + 2.0);
                 let title = if entry.title.is_empty() { t!("(sem título)", "(untitled)") } else { &entry.title };
-                let painter = ui.painter_at(inner);
                 // Theme colors: a fixed white disappeared on the light theme's background.
                 let (title_color, detail_color) = (ui.visuals().strong_text_color(), ui.visuals().weak_text_color());
                 painter.text(text_top, egui::Align2::LEFT_TOP, title, egui::FontId::proportional(12.5), title_color);
+                let detail = if entry.duration_secs > 0.0 && entry.width > 0 && entry.height > 0 {
+                    format!(
+                        "{}  •  {}×{}  •  {}",
+                        entry.when,
+                        entry.width,
+                        entry.height,
+                        format_duration_short(entry.duration_secs)
+                    )
+                } else if entry.width > 0 && entry.height > 0 {
+                    format!("{}  •  {}×{}", entry.when, entry.width, entry.height)
+                } else {
+                    entry.when.clone()
+                };
                 painter.text(
                     text_top + egui::vec2(0.0, 16.0),
                     egui::Align2::LEFT_TOP,
-                    format!("{}  •  {}×{}", entry.when, entry.width, entry.height),
+                    detail,
                     egui::FontId::proportional(11.0),
                     detail_color,
                 );
@@ -1257,6 +1381,14 @@ impl App {
                 response.context_menu(|ui| {
                     if ui.button(t!("Abrir", "Open")).clicked() {
                         to_open = Some(entry.file.clone());
+                        ui.close();
+                    }
+                    if entry.is_video()
+                        && ui.button(t!("▶ Abrir no player", "▶ Open in player")).clicked()
+                    {
+                        let _ = std::process::Command::new("explorer")
+                            .arg(self.library.path(&entry.file))
+                            .spawn();
                         ui.close();
                     }
                     if ui.button(t!("Mostrar na pasta", "Show in folder")).clicked() {
@@ -1317,6 +1449,7 @@ impl App {
         self.current_file = Some(file.clone());
         // The image saved below already includes what has been annotated so far.
         self.saved_revision = editor.revision();
+        self.video_editor = None;
         self.editor = Some(editor);
         self.save_editor_to_library(ctx, &file, true);
         self.status = match copy_to_clipboard(&image) {
@@ -1328,6 +1461,99 @@ impl App {
             ),
             Err(e) => tf!("Captura feita, mas não foi possível copiar: {e}", "Captured, but could not copy: {e}"),
         };
+    }
+
+    /// Registers a newly recorded or exported MP4 inside the library folder, generates its
+    /// thumbnail, and opens it directly in the integrated `VideoEditor`.
+    fn adopt_video(&mut self, ctx: &egui::Context, path: std::path::PathBuf, title: String) {
+        self.flush_autosave(ctx);
+        let Some(file) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            return;
+        };
+        let info = record::probe(&path);
+        let thumb = record::extract_frame(&path, 0.0).ok();
+        let (width, height, duration_secs) = match (&info, &thumb) {
+            (Some(i), _) => (i.width, i.height, i.duration as f32),
+            (None, Some(img)) => (img.width(), img.height(), 0.0),
+            (None, None) => (0, 0, 0.0),
+        };
+        if let Some(ref img) = thumb {
+            self.library.save_thumb(&file, img);
+            let small = library::make_thumb(img);
+            let texture = ctx.load_texture(
+                "thumbnail",
+                editor::texture_image(&small, ctx.input(|i| i.max_texture_side)),
+                TextureOptions::LINEAR,
+            );
+            self.thumbs.insert(file.clone(), texture);
+        }
+        self.library.register_existing_file(
+            file.clone(),
+            win::local_time(),
+            title,
+            width,
+            height,
+            duration_secs,
+        );
+        self.current_file = Some(file.clone());
+        self.editor = None;
+        let mut ve = video_editor::VideoEditor::new(ctx, path, thumb, self.accent());
+        ve.set_busy(self.video_job_running);
+        self.video_editor = Some(ve);
+        self.status = tf!(
+            "Vídeo salvo na biblioteca ({file}, {:.1} s).",
+            "Video saved to the library ({file}, {:.1} s).",
+            duration_secs
+        );
+    }
+
+    /// Registers a newly created GIF inside the library folder, saves its thumbnail, and opens it.
+    fn adopt_gif(
+        &mut self,
+        ctx: &egui::Context,
+        file: String,
+        path: std::path::PathBuf,
+        title: String,
+    ) {
+        self.flush_autosave(ctx);
+        let duration_secs = record::video_duration(&path).map_or(0.0, |d| d.as_secs_f32());
+        let first_frame = image::open(&path)
+            .map(|i| i.to_rgba8())
+            .ok()
+            .or_else(|| record::extract_frame(&path, 0.0).ok());
+        let (width, height) = first_frame
+            .as_ref()
+            .map(|img| (img.width(), img.height()))
+            .unwrap_or((0, 0));
+        if let Some(ref img) = first_frame {
+            self.library.save_thumb(&file, img);
+            let small = library::make_thumb(img);
+            let texture = ctx.load_texture(
+                "thumbnail",
+                editor::texture_image(&small, ctx.input(|i| i.max_texture_side)),
+                TextureOptions::LINEAR,
+            );
+            self.thumbs.insert(file.clone(), texture);
+        }
+        self.library.register_existing_file(
+            file.clone(),
+            win::local_time(),
+            title,
+            width,
+            height,
+            duration_secs,
+        );
+        if let Some(img) = first_frame {
+            let ed = editor::Editor::new(ctx, img, self.accent());
+            self.saved_revision = ed.revision();
+            self.video_editor = None;
+            self.editor = Some(ed);
+            self.current_file = Some(file.clone());
+        }
+        self.status = tf!(
+            "GIF salvo na biblioteca ({file}).",
+            "GIF saved to the library ({file})."
+        );
     }
 
     /// Hides the window and scrolls the chosen area in the background; the result arrives through
@@ -1384,47 +1610,167 @@ impl App {
     }
 
     /// Turns the window into a small panel to control the video recording.
-    fn start_video(&mut self, rect: win::PxRect, as_gif: bool) {
+    fn start_video(&mut self, rect: win::PxRect, as_gif: bool, title: String) {
         self.shared.busy.store(true, Ordering::SeqCst);
         let frame = win::RegionFrame::show(rect);
-        self.video = Some(VideoUi { rect, recorder: None, as_gif, _frame: frame, setup_frames: 6 });
+        self.video = Some(VideoUi {
+            rect,
+            title,
+            recorder: None,
+            as_gif,
+            countdown_until: None,
+            _frame: frame,
+            setup_frames: 6,
+        });
     }
 
     fn video_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let hwnd = self.shared.hwnd;
         let Some(video) = &mut self.video else { return };
-        ctx.request_repaint_after(Duration::from_millis(200));
+        ctx.request_repaint_after(Duration::from_millis(100));
         hud_setup(&ctx, hwnd, video.rect, VIDEO_HUD_SIZE, &mut video.setup_frames);
 
         // FFmpeg only exits on its own when something went wrong.
         let crashed = video.recorder.as_mut().is_some_and(|r| r.has_exited());
-        let (mut start, mut stop, mut cancel, mut toggle_pause) = (false, crashed, false, false);
-        let (mut system_audio, mut microphone) = (self.cfg.record_system_audio, self.cfg.record_microphone);
+        let (mut arm_record, mut start_now, mut stop, mut cancel, mut toggle_pause) =
+            (false, false, crashed, false, false);
+        let (mut system_audio, mut microphone) =
+            (self.cfg.record_system_audio, self.cfg.record_microphone);
+        let (mut fps, mut quality, mut cursor, mut countdown) = (
+            self.cfg.video_fps,
+            self.cfg.video_quality,
+            self.cfg.video_cursor,
+            self.cfg.video_countdown,
+        );
         let as_gif = video.as_gif;
+
+        if video.recorder.is_none()
+            && let Some(deadline) = video.countdown_until
+            && Instant::now() >= deadline
+        {
+            video.countdown_until = None;
+            start_now = true;
+        }
+        let countdown_deadline = video.countdown_until;
+
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal_centered(|ui| match &video.recorder {
                 None => {
-                    start = ui.button(if as_gif { t!("● Gravar GIF", "● Record GIF") } else { t!("● Gravar", "● Record") }).clicked();
-                    cancel = ui.button(t!("Cancelar", "Cancel")).clicked();
-                    ui.separator();
-                    if as_gif {
-                        ui.weak(t!("Sem som; vira GIF ao parar.", "No sound; becomes a GIF when stopped."));
+                    if let Some(deadline) = countdown_deadline {
+                        let rem = deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_secs_f32()
+                            .ceil()
+                            .max(1.0) as u32;
+                        ui.colored_label(Color32::from_rgb(235, 64, 52), "●");
+                        ui.strong(tf!(
+                            "Gravando em {rem} s…",
+                            "Recording in {rem} s…"
+                        ));
+                        ui.separator();
+                        start_now |= ui
+                            .button(t!("▶ Começar agora", "▶ Start now"))
+                            .clicked();
+                        cancel = ui.button(t!("Cancelar", "Cancel")).clicked();
                     } else {
-                        ui.checkbox(&mut system_audio, t!("Som do sistema", "System sound"));
-                        ui.checkbox(&mut microphone, t!("Microfone", "Microphone"));
+                        arm_record = ui
+                            .button(if as_gif {
+                                t!("● Gravar GIF", "● Record GIF")
+                            } else {
+                                t!("● Gravar", "● Record")
+                            })
+                            .clicked();
+                        cancel = ui.button(t!("Cancelar", "Cancel")).clicked();
+                        ui.separator();
+
+                        // FPS selector
+                        egui::ComboBox::from_id_salt("hud_video_fps")
+                            .width(62.0)
+                            .selected_text(format!("{fps} fps"))
+                            .show_ui(ui, |ui| {
+                                for f in [15u32, 24, 30, 60] {
+                                    ui.selectable_value(&mut fps, f, format!("{f} fps"));
+                                }
+                            });
+
+                        // Quality selector
+                        let q_label = |q: config::VideoQuality| match q {
+                            config::VideoQuality::Standard => t!("Normal", "Standard"),
+                            config::VideoQuality::High => t!("Alta", "High"),
+                            config::VideoQuality::Ultra => t!("Ultra", "Ultra"),
+                        };
+                        egui::ComboBox::from_id_salt("hud_video_quality")
+                            .width(66.0)
+                            .selected_text(q_label(quality))
+                            .show_ui(ui, |ui| {
+                                for q in [
+                                    config::VideoQuality::Standard,
+                                    config::VideoQuality::High,
+                                    config::VideoQuality::Ultra,
+                                ] {
+                                    ui.selectable_value(&mut quality, q, q_label(q));
+                                }
+                            });
+
+                        // Countdown selector
+                        let cd_label = |c: u32| {
+                            if c == 0 {
+                                t!("0s", "0s").to_owned()
+                            } else {
+                                format!("⏱ {c}s")
+                            }
+                        };
+                        egui::ComboBox::from_id_salt("hud_video_countdown")
+                            .width(58.0)
+                            .selected_text(cd_label(countdown))
+                            .show_ui(ui, |ui| {
+                                for c in [0u32, 3, 5] {
+                                    ui.selectable_value(
+                                        &mut countdown,
+                                        c,
+                                        if c == 0 {
+                                            t!("Sem contagem (0s)", "No countdown (0s)").to_owned()
+                                        } else {
+                                            tf!("Contagem {c}s", "Countdown {c}s")
+                                        },
+                                    );
+                                }
+                            });
+
+                        ui.checkbox(&mut cursor, t!("Cursor", "Cursor"));
+                        if !as_gif {
+                            ui.checkbox(&mut system_audio, t!("Som do sistema", "System sound"));
+                            ui.checkbox(&mut microphone, t!("Microfone", "Microphone"));
+                        }
                     }
                 }
                 Some(session) => {
                     stop |= ui.button(t!("■ Parar", "■ Stop")).clicked();
                     let paused = session.is_paused();
-                    toggle_pause = ui.button(if paused { t!("Continuar", "Resume") } else { t!("Pausar", "Pause") }).clicked();
+                    toggle_pause = ui
+                        .button(if paused {
+                            t!("Continuar", "Resume")
+                        } else {
+                            t!("Pausar", "Pause")
+                        })
+                        .clicked();
                     let secs = session.elapsed().as_secs();
                     if paused {
-                        ui.label(tf!("Em pausa  {:02}:{:02}", "Paused  {:02}:{:02}", secs / 60, secs % 60));
+                        ui.label(tf!(
+                            "Em pausa  {:02}:{:02}",
+                            "Paused  {:02}:{:02}",
+                            secs / 60,
+                            secs % 60
+                        ));
                     } else {
                         ui.colored_label(Color32::from_rgb(235, 64, 52), "●");
-                        ui.label(tf!("Gravando  {:02}:{:02}", "Recording  {:02}:{:02}", secs / 60, secs % 60));
+                        ui.label(tf!(
+                            "Gravando  {:02}:{:02}",
+                            "Recording  {:02}:{:02}",
+                            secs / 60,
+                            secs % 60
+                        ));
                     }
                     if let Some(warning) = session.warnings.first() {
                         ui.colored_label(Color32::from_rgb(255, 200, 80), warning);
@@ -1432,24 +1778,56 @@ impl App {
                 }
             });
         });
+
         let (rect, idle) = (video.rect, video.recorder.is_none());
-        if !as_gif && (system_audio, microphone) != (self.cfg.record_system_audio, self.cfg.record_microphone) {
-            self.cfg.record_system_audio = system_audio;
-            self.cfg.record_microphone = microphone;
+        let prefs_changed = (!as_gif
+            && (system_audio, microphone)
+                != (self.cfg.record_system_audio, self.cfg.record_microphone))
+            || (fps, quality, cursor, countdown)
+                != (
+                    self.cfg.video_fps,
+                    self.cfg.video_quality,
+                    self.cfg.video_cursor,
+                    self.cfg.video_countdown,
+                );
+        if prefs_changed {
+            if !as_gif {
+                self.cfg.record_system_audio = system_audio;
+                self.cfg.record_microphone = microphone;
+            }
+            self.cfg.video_fps = fps;
+            self.cfg.video_quality = quality;
+            self.cfg.video_cursor = cursor;
+            self.cfg.video_countdown = countdown;
             self.save_cfg();
         }
 
-        if start {
-            let (y, mo, d, h, mi, s) = win::local_time();
-            let name = format!("{y:04}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}");
-            let options = if as_gif {
-                record::Options { system_audio: false, microphone: false }
+        if arm_record {
+            if countdown > 0 {
+                if let Some(video) = &mut self.video {
+                    video.countdown_until =
+                        Some(Instant::now() + Duration::from_secs(countdown as u64));
+                }
             } else {
-                record::Options { system_audio, microphone }
+                start_now = true;
+            }
+        }
+
+        if start_now {
+            let now = win::local_time();
+            let file = self.library.reserve_name(now, "mp4");
+            let stem = file.strip_suffix(".mp4").unwrap_or(&file);
+            let options = record::Options {
+                system_audio: !as_gif && system_audio,
+                microphone: !as_gif && microphone,
+                fps: self.cfg.video_fps,
+                quality: self.cfg.video_quality,
+                draw_mouse: self.cfg.video_cursor,
             };
-            match record::Session::start(rect, options, &record::videos_dir(), &name) {
+            match record::Session::start(rect, options, self.library.dir(), stem) {
                 Ok(session) => {
                     if let Some(video) = &mut self.video {
+                        video.countdown_until = None;
                         video.recorder = Some(session);
                     }
                 }
@@ -1459,32 +1837,57 @@ impl App {
                 }
             }
         } else if stop {
-            let session = self.video.take().and_then(|v| v.recorder);
+            let Some(VideoUi {
+                title,
+                recorder,
+                as_gif,
+                ..
+            }) = self.video.take()
+            else {
+                return;
+            };
             self.leave_pano_hud(&ctx);
-            match session.map(record::Session::stop) {
+            match recorder.map(record::Session::stop) {
                 Some(Ok(path)) if as_gif => {
-                    // GIF mode: converts directly and doesn't leave the intermediate video behind.
-                    self.start_export(&ctx, t!("Criando o GIF", "Creating the GIF"), move || {
-                        let gif = record::to_gif(&path, &record::GifOptions::default());
-                        if gif.is_ok() {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                        gif
+                    // GIF mode: converts directly into the library and removes the intermediate MP4.
+                    self.start_video_job(&ctx, t!("Criando o GIF", "Creating the GIF"), move || {
+                        let res = record::to_gif(&path, &record::GifOptions::default());
+                        let _ = std::fs::remove_file(&path);
+                        res.map(|p| {
+                            let gif_file = p
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("captura.gif")
+                                .to_owned();
+                            VideoJobDone::SavedGif {
+                                file: gif_file,
+                                title,
+                                path: p,
+                            }
+                        })
                     });
                 }
                 Some(Ok(path)) => {
-                    self.status = tf!("Vídeo salvo em {}", "Video saved to {}", path.display());
-                    self.video_done = Some(VideoDone::new(path));
+                    self.adopt_video(&ctx, path, title);
                 }
-                Some(Err(e)) => self.status = tf!("A gravação falhou: {e}", "The recording failed: {e}"),
+                Some(Err(e)) => {
+                    self.status = tf!("A gravação falhou: {e}", "The recording failed: {e}");
+                }
                 None => {}
             }
         } else if toggle_pause
             && let Some(session) = self.video.as_mut().and_then(|v| v.recorder.as_mut())
         {
-            let result = if session.is_paused() { session.resume() } else { session.pause() };
+            let result = if session.is_paused() {
+                session.resume()
+            } else {
+                session.pause()
+            };
             if let Err(e) = result {
-                self.status = tf!("Não foi possível pausar ou continuar: {e}", "Could not pause or resume: {e}");
+                self.status = tf!(
+                    "Não foi possível pausar ou continuar: {e}",
+                    "Could not pause or resume: {e}"
+                );
             }
         } else if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) && idle {
             self.leave_pano_hud(&ctx);
@@ -1492,115 +1895,211 @@ impl App {
         }
     }
 
-    /// Runs a job that produces a file (GIF or video clip) in the background.
-    fn start_export(
+    /// Runs a background video/GIF export or edit job and updates `self.video_editor` busy state.
+    fn start_video_job(
         &mut self,
         ctx: &egui::Context,
         label: &str,
-        job: impl FnOnce() -> Result<std::path::PathBuf, String> + Send + 'static,
+        job: impl FnOnce() -> Result<VideoJobDone, String> + Send + 'static,
     ) {
-        if self.gif_running {
+        if self.video_job_running {
             return;
         }
-        self.gif_running = true;
+        self.video_job_running = true;
+        if let Some(ve) = &mut self.video_editor {
+            ve.set_busy(true);
+        }
         self.status = format!("{label}…");
-        let (pending, ctx) = (self.gif_pending.clone(), ctx.clone());
+        let (pending, ctx) = (self.video_job_pending.clone(), ctx.clone());
         std::thread::spawn(move || {
             *pending.lock().unwrap() = Some(guarded(job));
             ctx.request_repaint();
         });
     }
 
-    /// Window with the video just recorded: open it, trim a clip or create a GIF.
-    fn video_done_ui(&mut self, ctx: &egui::Context) {
-        if let Some(result) = self.gif_pending.lock().unwrap().take() {
-            self.gif_running = false;
-            self.status = match result {
-                Ok(file) => {
-                    let _ = std::process::Command::new("explorer").arg("/select,").arg(&file).spawn();
-                    tf!("Arquivo salvo em {}", "File saved to {}", file.display())
-                }
-                Err(e) => tf!("Não foi possível gerar o arquivo: {e}", "Could not create the file: {e}"),
-            };
-        }
-        let busy = self.gif_running;
-        let Some(done) = &mut self.video_done else { return };
-        let (mut open, mut make_gif, mut save_cut) = (true, false, false);
-        egui::Window::new(t!("Gravação salva", "Recording saved")).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            let name = done.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            ui.label(format!("{name}  •  {:.1} s", done.length));
-            ui.horizontal(|ui| {
-                if ui.button(t!("▶ Abrir", "▶ Open")).clicked() {
-                    let _ = std::process::Command::new("explorer").arg(&done.path).spawn();
-                }
-                if ui.button(t!("Mostrar na pasta", "Show in folder")).clicked() {
-                    let _ = std::process::Command::new("explorer").arg("/select,").arg(&done.path).spawn();
-                }
-            });
-            // Without a known length there's no way to choose a clip.
-            if done.length > 0.2 {
-                ui.separator();
-                ui.strong(t!("Trecho", "Clip"));
-                let (length, gap) = (done.length, 0.1);
-                ui.horizontal(|ui| {
-                    ui.label(t!("Início", "Start"));
-                    ui.add(egui::Slider::new(&mut done.start, 0.0..=length - gap).fixed_decimals(1).suffix(" s"));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(t!("Fim    ", "End    "));
-                    ui.add(egui::Slider::new(&mut done.end, gap..=length).fixed_decimals(1).suffix(" s"));
-                });
-                done.end = done.end.max(done.start + gap).min(length);
-                done.start = done.start.min(done.end - gap).max(0.0);
-                let whole = done.start <= 0.0 && done.end >= length;
-                save_cut = ui
-                    .add_enabled(!busy && !whole, egui::Button::new(t!("Salvar só esse trecho", "Save only this clip")))
-                    .on_hover_text(t!(
-                        "Cria um vídeo novo ao lado do original, que não é alterado.",
-                        "Creates a new video next to the original, which is left unchanged."
-                    ))
-                    .clicked();
-            }
-            ui.separator();
-            ui.strong("GIF");
-            ui.horizontal(|ui| {
-                ui.label(t!("Quadros por segundo", "Frames per second"));
-                egui::ComboBox::from_id_salt("gif_fps").width(60.0).selected_text(done.fps.to_string()).show_ui(ui, |ui| {
-                    for fps in [8, 12, 15, 24] {
-                        ui.selectable_value(&mut done.fps, fps, fps.to_string());
-                    }
-                });
-                ui.label(t!("Largura", "Width"));
-                let label = |w: u32| if w == 0 { t!("Original", "Original").to_owned() } else { format!("{w} px") };
-                egui::ComboBox::from_id_salt("gif_width").width(90.0).selected_text(label(done.width)).show_ui(ui, |ui| {
-                    for width in [320, 480, 720, 960, 0] {
-                        ui.selectable_value(&mut done.width, width, label(width));
-                    }
-                });
-            });
-            let label = if busy { t!("Trabalhando…", "Working…") } else { t!("Criar GIF", "Create GIF") };
-            make_gif = ui
-                .add_enabled(!busy, egui::Button::new(label))
-                .on_hover_text(t!(
-                    "Usa o trecho escolhido acima. Mais quadros e mais largura deixam o arquivo maior.",
-                    "Uses the clip chosen above. More frames and more width make the file bigger."
-                ))
-                .clicked();
-        });
-        let (path, start, end, length) = (done.path.clone(), done.start, done.end, done.length);
-        let options = record::GifOptions {
-            fps: done.fps,
-            width: done.width,
-            start,
-            end: (length > 0.2 && end < length).then_some(end),
+    /// Polls finished background video/GIF jobs and updates the library and active editor.
+    fn poll_video_jobs(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.video_job_pending.lock().unwrap().take() else {
+            return;
         };
-        if !open {
-            self.video_done = None;
+        self.video_job_running = false;
+        if let Some(ve) = &mut self.video_editor {
+            ve.set_busy(false);
         }
-        if make_gif {
-            self.start_export(ctx, t!("Criando o GIF", "Creating the GIF"), move || record::to_gif(&path, &options));
-        } else if save_cut {
-            self.start_export(ctx, t!("Salvando o trecho", "Saving the clip"), move || record::trim(&path, start, end));
+        match result {
+            Ok(VideoJobDone::SavedClip { title, path }) => {
+                self.adopt_video(ctx, path, title);
+            }
+            Ok(VideoJobDone::Overwritten { file, path }) => {
+                let info = record::probe(&path);
+                let thumb = record::extract_frame(&path, 0.0).ok();
+                if let Some(ref img) = thumb {
+                    self.library.save_thumb(&file, img);
+                    let small = library::make_thumb(img);
+                    let texture = ctx.load_texture(
+                        "thumbnail",
+                        editor::texture_image(&small, ctx.input(|i| i.max_texture_side)),
+                        TextureOptions::LINEAR,
+                    );
+                    self.thumbs.insert(file.clone(), texture);
+                }
+                if let Some(i) = info {
+                    self.library
+                        .update_media(&file, i.width, i.height, i.duration as f32);
+                }
+                if let Some(ve) = &mut self.video_editor {
+                    ve.reload_after_overwrite(ctx);
+                }
+                self.status = tf!(
+                    "Edições aplicadas em {file}.",
+                    "Edits applied to {file}."
+                );
+            }
+            Ok(VideoJobDone::SavedGif { file, title, path }) => {
+                self.adopt_gif(ctx, file, path, title);
+            }
+            Ok(VideoJobDone::ExportedExternal { path }) => {
+                let _ = std::process::Command::new("explorer")
+                    .arg("/select,")
+                    .arg(&path)
+                    .spawn();
+                self.status = tf!(
+                    "Vídeo exportado em {}",
+                    "Video exported to {}",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                self.status = tf!(
+                    "Não foi possível processar o vídeo: {e}",
+                    "Could not process the video: {e}"
+                );
+            }
+        }
+    }
+
+    /// Handles an action triggered from the integrated `VideoEditor`.
+    fn handle_video_action(&mut self, ctx: &egui::Context, action: video_editor::VideoAction) {
+        let base_title = self
+            .current_file
+            .as_deref()
+            .and_then(|f| self.library.get(f))
+            .map(|e| e.title.clone())
+            .unwrap_or_default();
+
+        match action {
+            video_editor::VideoAction::CaptureFrame { image } => {
+                let title = if base_title.is_empty() {
+                    t!("Quadro de vídeo", "Video frame").to_owned()
+                } else {
+                    base_title
+                };
+                self.set_captured(ctx, image, title);
+            }
+            video_editor::VideoAction::SaveClipToLibrary { opts } => {
+                let Some(ve) = &self.video_editor else { return };
+                let src = ve.path().to_path_buf();
+                let file = self.library.reserve_name(win::local_time(), "mp4");
+                let out = self.library.path(&file);
+                let title = if base_title.is_empty() {
+                    t!("Trecho de vídeo", "Video clip").to_owned()
+                } else {
+                    base_title
+                };
+                self.start_video_job(
+                    ctx,
+                    t!("Salvando trecho na biblioteca", "Saving clip to library"),
+                    move || {
+                        let pure_trim = (opts.speed - 1.0).abs() < 0.01
+                            && !opts.mute
+                            && opts.crop.is_none()
+                            && opts.max_width == 0
+                            && opts.end.is_some();
+                        let res = if pure_trim {
+                            record::trim(&src, opts.start, opts.end.unwrap_or(0.0)).and_then(
+                                |clip_path| {
+                                    std::fs::rename(&clip_path, &out)
+                                        .map(|()| out)
+                                        .map_err(|e| e.to_string())
+                                },
+                            )
+                        } else {
+                            record::edit_video(&src, &opts, &out)
+                        };
+                        res.map(|p| VideoJobDone::SavedClip { title, path: p })
+                    },
+                );
+            }
+            video_editor::VideoAction::OverwriteInLibrary { opts } => {
+                let Some(ve) = &self.video_editor else { return };
+                let src = ve.path().to_path_buf();
+                let file = self
+                    .current_file
+                    .clone()
+                    .or_else(|| {
+                        src.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default();
+                self.start_video_job(
+                    ctx,
+                    t!("Aplicando edições no vídeo", "Applying edits to video"),
+                    move || {
+                        record::edit_video(&src, &opts, &src)
+                            .map(|p| VideoJobDone::Overwritten { file, path: p })
+                    },
+                );
+            }
+            video_editor::VideoAction::ExportGifToLibrary { opts } => {
+                let Some(ve) = &self.video_editor else { return };
+                let src = ve.path().to_path_buf();
+                let file = self.library.reserve_name(win::local_time(), "gif");
+                let out = self.library.path(&file);
+                let title = if base_title.is_empty() {
+                    "GIF".to_owned()
+                } else {
+                    base_title
+                };
+                self.start_video_job(
+                    ctx,
+                    t!("Criando GIF na biblioteca", "Creating GIF in library"),
+                    move || {
+                        record::to_gif_at(&src, &opts, &out).map(|p| VideoJobDone::SavedGif {
+                            file,
+                            title,
+                            path: p,
+                        })
+                    },
+                );
+            }
+            video_editor::VideoAction::ExportMp4As { opts } => {
+                let Some(ve) = &self.video_editor else { return };
+                let src = ve.path().to_path_buf();
+                let default_name = src
+                    .file_stem()
+                    .map(|s| format!("{}-editado.mp4", s.to_string_lossy()))
+                    .unwrap_or_else(|| t!("video.mp4", "video.mp4").to_owned());
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter(t!("Vídeo MP4", "MP4 video"), &["mp4"])
+                    .set_file_name(&default_name);
+                let vids = record::videos_dir();
+                if vids.is_dir() {
+                    dialog = dialog.set_directory(vids);
+                }
+                let Some(dest) = dialog.save_file() else {
+                    self.status = t!("Exportação cancelada.", "Export canceled.").to_owned();
+                    return;
+                };
+                self.start_video_job(
+                    ctx,
+                    t!("Exportando vídeo MP4", "Exporting MP4 video"),
+                    move || {
+                        record::edit_video(&src, &opts, &dest)
+                            .map(|p| VideoJobDone::ExportedExternal { path: p })
+                    },
+                );
+            }
         }
     }
 
@@ -2541,7 +3040,7 @@ impl App {
                 }
                 Some(r) if matches!(kind, CaptureKind::Video | CaptureKind::Gif) => {
                     self.end_selection(&ctx);
-                    self.start_video(r, kind == CaptureKind::Gif);
+                    self.start_video(r, kind == CaptureKind::Gif, title);
                 }
                 Some(r) if delay == 0 => {
                     // Takes the shot right away: our layer still covers the screen, but doesn't
@@ -2577,9 +3076,17 @@ impl App {
         }
     }
 
+    fn button_with_shortcut(&self, base: &str, mode: config::CaptureShortcutMode) -> String {
+        match self.cfg.mode_hotkeys.get(mode) {
+            Some(hk) => format!("{base} ({})", hk.label()),
+            None => base.to_owned(),
+        }
+    }
+
     fn home_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let mut styles_changed = false;
+        let mut video_action = None;
         egui::Panel::top("bar").show(ui, |ui| {
             ui.add_space(6.0);
             // Program row: on the left what captures, on the right what you do with the capture.
@@ -2588,23 +3095,36 @@ impl App {
                 if ui.button(tf!("✂ Região ({})", "✂ Region ({})", self.cfg.hotkey.label())).clicked() {
                     start_capture(CaptureKind::Region, self.shared.clone(), ctx.clone());
                 }
+                let fs_label = self.button_with_shortcut(
+                    t!("⛶ Tela cheia", "⛶ Full screen"),
+                    config::CaptureShortcutMode::FullScreen,
+                );
                 if ui
-                    .button(t!("⛶ Tela cheia", "⛶ Full screen"))
+                    .button(fs_label)
                     .on_hover_text(t!("O monitor onde está o cursor.", "The monitor the cursor is on."))
                     .clicked()
                 {
                     start_capture(CaptureKind::FullScreen, self.shared.clone(), ctx.clone());
                 }
-                if win::monitor_count() > 1
-                    && ui
-                        .button(t!("▣ Todas as telas", "▣ All screens"))
+                if win::monitor_count() > 1 {
+                    let all_label = self.button_with_shortcut(
+                        t!("▣ Todas as telas", "▣ All screens"),
+                        config::CaptureShortcutMode::AllScreens,
+                    );
+                    if ui
+                        .button(all_label)
                         .on_hover_text(t!("Todos os monitores em uma imagem só.", "Every monitor in a single image."))
                         .clicked()
-                {
-                    start_capture(CaptureKind::AllScreens, self.shared.clone(), ctx.clone());
+                    {
+                        start_capture(CaptureKind::AllScreens, self.shared.clone(), ctx.clone());
+                    }
                 }
+                let scroll_label = self.button_with_shortcut(
+                    t!("⇵ Rolagem", "⇵ Scrolling"),
+                    config::CaptureShortcutMode::Scrolling,
+                );
                 if ui
-                    .button(t!("⇵ Rolagem", "⇵ Scrolling"))
+                    .button(scroll_label)
                     .on_hover_text(t!(
                         "Escolha a área que rola; o SnapKit desce a página e junta tudo em uma imagem.",
                         "Pick the area that scrolls; SnapKit scrolls the page and joins it all into one image."
@@ -2613,8 +3133,12 @@ impl App {
                 {
                     start_capture(CaptureKind::Scroll, self.shared.clone(), ctx.clone());
                 }
+                let pano_label = self.button_with_shortcut(
+                    t!("▭ Panorâmica", "▭ Panoramic"),
+                    config::CaptureShortcutMode::Panoramic,
+                );
                 if ui
-                    .button(t!("▭ Panorâmica", "▭ Panoramic"))
+                    .button(pano_label)
                     .on_hover_text(t!(
                         "Escolha uma área e role você mesmo, em qualquer direção; o SnapKit monta a imagem.",
                         "Pick an area and scroll it yourself, in any direction; SnapKit builds the image."
@@ -2623,8 +3147,12 @@ impl App {
                 {
                     start_capture(CaptureKind::Panoramic, self.shared.clone(), ctx.clone());
                 }
+                let video_label = self.button_with_shortcut(
+                    t!("● Vídeo", "● Video"),
+                    config::CaptureShortcutMode::Video,
+                );
                 if ui
-                    .button(t!("● Vídeo", "● Video"))
+                    .button(video_label)
                     .on_hover_text(t!(
                         "Escolha uma área e grave a tela em MP4, com som do sistema e microfone.",
                         "Pick an area and record the screen as MP4, with system sound and microphone."
@@ -2643,8 +3171,12 @@ impl App {
                 {
                     start_capture(CaptureKind::Gif, self.shared.clone(), ctx.clone());
                 }
+                let steps_label = self.button_with_shortcut(
+                    t!("Passo a passo", "Step by step"),
+                    config::CaptureShortcutMode::Steps,
+                );
                 if ui
-                    .button(t!("Passo a passo", "Step by step"))
+                    .button(steps_label)
                     .on_hover_text(t!(
                         "Escolha uma área e faça a tarefa: cada clique vira uma foto numerada de um guia.",
                         "Pick an area and do the task: each click becomes a numbered shot of a guide."
@@ -2700,43 +3232,81 @@ impl App {
                     }
                     ui.toggle_value(&mut self.show_library, t!("Biblioteca", "Library"));
                     ui.separator();
-                    let has_capture = self.editor.is_some();
-                    let can_read = has_capture && !self.ocr_running;
-                    if ui
-                        .add_enabled(can_read, egui::Button::new(t!("🔤 Ler texto", "🔤 Read text")))
-                        .on_hover_text(t!(
-                            "Reconhece todo o texto da imagem e copia. Para uma área só, use a ferramenta Extrair texto.",
-                            "Recognizes all the text in the image and copies it. For a single area, use the Grab text tool."
-                        ))
-                        .clicked()
-                        && let Some(e) = &mut self.editor
+                    if let Some(ve) = &self.video_editor
+                        && self.editor.is_none()
                     {
-                        e.commit_pending_text();
-                        let image = e.image().clone();
-                        self.start_ocr(&ctx, image, ocr::Mode::Printed);
-                    }
-                    if ui.add_enabled(has_capture, egui::Button::new(t!("💾 Salvar PNG", "💾 Save PNG"))).clicked()
-                        && let Some(e) = &mut self.editor
-                    {
-                        e.commit_pending_text();
-                        self.status = save_png(e.image());
-                    }
-                    if ui.add_enabled(has_capture, egui::Button::new(t!("📋 Copiar", "📋 Copy"))).clicked()
-                        && let Some(e) = &mut self.editor
-                    {
-                        e.commit_pending_text();
-                        self.status = match copy_to_clipboard(e.image()) {
-                            Ok(()) => t!("Copiado para a área de transferência.", "Copied to the clipboard.").to_owned(),
-                            Err(e) => tf!("Não foi possível copiar: {e}", "Could not copy: {e}"),
-                        };
+                        if ui
+                            .button(t!("▶ Player", "▶ Player"))
+                            .on_hover_text(t!(
+                                "Abre o vídeo no reprodutor padrão do Windows.",
+                                "Opens the video in the default Windows media player."
+                            ))
+                            .clicked()
+                        {
+                            let _ = std::process::Command::new("explorer")
+                                .arg(ve.path())
+                                .spawn();
+                        }
+                        let can_grab = !self.video_job_running && ve.current_frame().is_some();
+                        if ui
+                            .add_enabled(
+                                can_grab,
+                                egui::Button::new(t!("📸 Quadro → Editor", "📸 Frame → Editor")),
+                            )
+                            .on_hover_text(t!(
+                                "Envia o quadro atual do vídeo direto para o editor de anotações.",
+                                "Sends the current video frame straight to the annotation editor."
+                            ))
+                            .clicked()
+                            && let Some(frame) = ve.current_frame().cloned()
+                        {
+                            video_action = Some(video_editor::VideoAction::CaptureFrame { image: frame });
+                        }
+                    } else {
+                        let has_capture = self.editor.is_some();
+                        let can_read = has_capture && !self.ocr_running;
+                        if ui
+                            .add_enabled(can_read, egui::Button::new(t!("🔤 Ler texto", "🔤 Read text")))
+                            .on_hover_text(t!(
+                                "Reconhece todo o texto da imagem e copia. Para uma área só, use a ferramenta Extrair texto.",
+                                "Recognizes all the text in the image and copies it. For a single area, use the Grab text tool."
+                            ))
+                            .clicked()
+                            && let Some(e) = &mut self.editor
+                        {
+                            e.commit_pending_text();
+                            let image = e.image().clone();
+                            self.start_ocr(&ctx, image, ocr::Mode::Printed);
+                        }
+                        if ui.add_enabled(has_capture, egui::Button::new(t!("💾 Salvar PNG", "💾 Save PNG"))).clicked()
+                            && let Some(e) = &mut self.editor
+                        {
+                            e.commit_pending_text();
+                            self.status = save_png(e.image());
+                        }
+                        if ui.add_enabled(has_capture, egui::Button::new(t!("📋 Copiar", "📋 Copy"))).clicked()
+                            && let Some(e) = &mut self.editor
+                        {
+                            e.commit_pending_text();
+                            self.status = match copy_to_clipboard(e.image()) {
+                                Ok(()) => t!("Copiado para a área de transferência.", "Copied to the clipboard.").to_owned(),
+                                Err(e) => tf!("Não foi possível copiar: {e}", "Could not copy: {e}"),
+                            };
+                        }
                     }
                 });
             });
             ui.add_space(4.0);
-            // Editor row: options of the active tool or the selected object.
+            // Second row: options of the active image tool or the video editor toolbar.
             if let Some(editor) = &mut self.editor {
                 ui.separator();
                 styles_changed = editor.options_ui(ui, &mut self.cfg.styles);
+                ui.add_space(6.0);
+            } else if let Some(ve) = &mut self.video_editor {
+                ui.separator();
+                if let Some(act) = ve.options_ui(ui) {
+                    video_action = Some(act);
+                }
                 ui.add_space(6.0);
             }
         });
@@ -2748,6 +3318,17 @@ impl App {
                 ui.label(&self.status);
                 if let Some(editor) = &mut self.editor {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| editor.zoom_ui(ui));
+                } else if let Some(ve) = &self.video_editor {
+                    let info = ve.info();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak(tf!(
+                            "{}×{} px  •  {:.1} s  •  Espaço reproduz, [ e ] marcam corte",
+                            "{}×{} px  •  {:.1} s  •  Space plays, [ and ] mark trim",
+                            info.width,
+                            info.height,
+                            info.duration
+                        ));
+                    });
                 }
             });
         });
@@ -2766,22 +3347,159 @@ impl App {
             self.start_ocr(&ctx, area, ocr::Mode::Printed);
         }
         self.ocr_ui(&ctx);
-        self.video_done_ui(&ctx);
-        egui::CentralPanel::default().show(ui, |ui| match &mut self.editor {
-            Some(editor) => editor.canvas_ui(ui),
-            None => {
-                ui.centered_and_justified(|ui| {
-                    ui.label(tf!(
-                        "Nenhuma captura ainda.\nUse os botões acima ou {}.",
-                        "No capture yet.\nUse the buttons above or {}.",
-                        self.cfg.hotkey.label()
-                    ));
-                });
+        self.poll_video_jobs(&ctx);
+        egui::CentralPanel::default().show(ui, |ui| {
+            if let Some(editor) = &mut self.editor {
+                editor.canvas_ui(ui);
+            } else if let Some(ve) = &mut self.video_editor {
+                if let Some(act) = ve.canvas_ui(ui) {
+                    video_action = Some(act);
+                }
+            } else {
+                self.empty_state_ui(ui, &ctx);
             }
         });
+        if let Some(action) = video_action {
+            self.handle_video_action(&ctx, action);
+        }
         if self.show_prefs {
             self.prefs_ui(&ctx);
         }
+    }
+
+    /// Quick-start empty state shown when no capture or video is currently open in the workspace.
+    fn empty_state_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let avail = ui.available_size();
+        let accent = self.accent();
+        ui.vertical_centered(|ui| {
+            let top_pad = ((avail.y - 260.0) * 0.42).max(16.0);
+            ui.add_space(top_pad);
+            ui.label(
+                egui::RichText::new(t!(
+                    "Pronto para capturar ou gravar",
+                    "Ready to capture or record"
+                ))
+                .size(18.0)
+                .strong(),
+            );
+            ui.add_space(4.0);
+            ui.weak(tf!(
+                "Escolha um modo abaixo, use a barra superior ou pressione {}.",
+                "Pick a mode below, use the top bar, or press {}.",
+                self.cfg.hotkey.label()
+            ));
+            ui.add_space(18.0);
+
+            let cards: [(CaptureKind, &str, &str); 6] = [
+                (
+                    CaptureKind::Region,
+                    t!("✂ Região", "✂ Region"),
+                    t!(
+                        "Selecione uma área ou janela e anote na hora",
+                        "Select an area or window and annotate right away"
+                    ),
+                ),
+                (
+                    CaptureKind::FullScreen,
+                    t!("⛶ Tela cheia", "⛶ Full screen"),
+                    t!(
+                        "Captura imediata do monitor atual",
+                        "Instant capture of the current monitor"
+                    ),
+                ),
+                (
+                    CaptureKind::Scroll,
+                    t!("⇵ Rolagem", "⇵ Scrolling"),
+                    t!(
+                        "Página inteira costurada automaticamente",
+                        "Full scrolling page stitched automatically"
+                    ),
+                ),
+                (
+                    CaptureKind::Video,
+                    t!("● Vídeo MP4", "● MP4 Video"),
+                    t!(
+                        "Grave com som, corte na linha do tempo e recorte",
+                        "Record with sound, trim on the timeline, and crop"
+                    ),
+                ),
+                (
+                    CaptureKind::Gif,
+                    t!("🎞 GIF", "🎞 GIF"),
+                    t!(
+                        "Animação leve pronta para compartilhar",
+                        "Lightweight animation ready to share"
+                    ),
+                ),
+                (
+                    CaptureKind::Steps,
+                    t!("① Passo a passo", "① Step by step"),
+                    t!(
+                        "Cada clique vira um passo numerado no guia",
+                        "Each click becomes a numbered step in a guide"
+                    ),
+                ),
+            ];
+
+            let card_w = 185.0;
+            let card_h = 74.0;
+            let gap = 10.0;
+            for row in cards.chunks(3) {
+                let row_w = row.len() as f32 * card_w + (row.len().saturating_sub(1)) as f32 * gap;
+                ui.horizontal(|ui| {
+                    let left_pad = ((ui.available_width() - row_w) * 0.5).max(0.0);
+                    ui.add_space(left_pad);
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for &(kind, title, subtitle) in row {
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(card_w, card_h),
+                            Sense::click(),
+                        );
+                        if resp.hovered() {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        let bg = if resp.hovered() {
+                            accent.gamma_multiply(0.16)
+                        } else {
+                            ui.visuals().widgets.noninteractive.bg_fill
+                        };
+                        let border = if resp.hovered() {
+                            Stroke::new(1.5, accent)
+                        } else {
+                            ui.visuals().widgets.noninteractive.bg_stroke
+                        };
+                        let painter = ui.painter_at(rect);
+                        painter.rect_filled(rect, 8.0, bg);
+                        painter.rect_stroke(rect, 8.0, border, StrokeKind::Inside);
+
+                        let inner = rect.shrink2(egui::vec2(12.0, 10.0));
+                        painter.text(
+                            inner.left_top(),
+                            egui::Align2::LEFT_TOP,
+                            title,
+                            egui::FontId::proportional(13.5),
+                            ui.visuals().strong_text_color(),
+                        );
+                        let sub_galley = painter.layout(
+                            subtitle.to_owned(),
+                            egui::FontId::proportional(11.0),
+                            ui.visuals().weak_text_color(),
+                            inner.width(),
+                        );
+                        painter.galley(
+                            inner.left_top() + egui::vec2(0.0, 22.0),
+                            sub_galley,
+                            ui.visuals().weak_text_color(),
+                        );
+
+                        if resp.clicked() {
+                            start_capture(kind, self.shared.clone(), ctx.clone());
+                        }
+                    }
+                });
+                ui.add_space(gap);
+            }
+        });
     }
 }
 
@@ -2869,10 +3587,19 @@ impl eframe::App for App {
                 self.dismiss_selection(&ctx);
             } else if self.pano.is_some() || self.video.is_some() || self.steps.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                if let Some(session) = self.video.take().and_then(|v| v.recorder)
+                if let Some(VideoUi {
+                    title,
+                    recorder: Some(session),
+                    as_gif,
+                    ..
+                }) = self.video.take()
                     && let Ok(path) = session.stop()
                 {
-                    self.video_done = Some(VideoDone::new(path));
+                    if as_gif {
+                        let _ = std::fs::remove_file(&path);
+                    } else {
+                        self.adopt_video(&ctx, path, title);
+                    }
                 }
                 self.leave_pano_hud(&ctx);
             } else if self.cfg.close_to_tray && self.tray.is_some() && self.shared.hwnd != 0 {
@@ -3036,6 +3763,11 @@ pub fn in_ci() -> bool {
 
 fn delay_label(secs: u32) -> String {
     if secs == 0 { t!("Sem atraso", "No delay").to_owned() } else { tf!("Atraso {secs} s", "Delay {secs} s") }
+}
+
+fn format_duration_short(secs: f32) -> String {
+    let total = secs.max(0.0).round() as u32;
+    format!("{:02}:{:02}", total / 60, total % 60)
 }
 
 fn copy_to_clipboard(img: &RgbaImage) -> Result<(), String> {

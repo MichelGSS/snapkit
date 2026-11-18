@@ -19,9 +19,9 @@ SnapKit is a screen capture and annotation tool for Windows, written in Rust wit
 | Editor | 19 tools, editable objects, styles, image menu, zoom, undo and redo |
 | Quick annotation | In-place annotation, move and resize with live preview |
 | OCR | Tesseract (English and Portuguese) and a neural engine for handwriting |
-| Video | MP4 with system sound and microphone, pause, trimming, GIF export |
-| Library | Automatic saving, thumbnails, search, Recycle Bin, editable annotation layers |
-| Interface | English and Portuguese, nine themes, tray, start with Windows |
+| Video | MP4 with system sound and microphone, configurable FPS (15–60), quality presets, cursor toggle, countdown, pause, integrated visual filmstrip editor (trim, area crop, speed 0.5×–2×, mute, resolution scaling, frame-to-editor capture), GIF export |
+| Library | Unified image, video (MP4) and GIF library with automatic saving, thumbnails, media filters, duration badges, search, Recycle Bin, editable annotation layers |
+| Interface | English and Portuguese, nine themes, quick-start workspace cards, tray, start with Windows |
 | Distribution | Installer, portable zip, opt-in SHA-256 verified updates, MIT license, third-party notices, CI |
 
 ## Next

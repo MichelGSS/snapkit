@@ -37,9 +37,17 @@ struct LayersFile {
 /// Local date and time, already split (year, month, day, hour, minute, second).
 pub type LocalTime = (u16, u16, u16, u16, u16, u16);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MediaFilter {
+    #[default]
+    All,
+    Images,
+    Videos,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
-    /// Name of the PNG file inside the library folder.
+    /// Name of the media file (`.png`, `.mp4`, or `.gif`) inside the library folder.
     pub file: String,
     /// Date to show and search, such as "10/11/2026 02:45".
     pub when: String,
@@ -48,9 +56,24 @@ pub struct Entry {
     pub title: String,
     pub width: u32,
     pub height: u32,
+    /// Duration in seconds (`0.0` for static images, `> 0.0` for videos/GIFs).
+    #[serde(default)]
+    pub duration_secs: f32,
 }
 
 impl Entry {
+    pub fn is_video(&self) -> bool {
+        Path::new(&self.file).extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+    }
+
+    pub fn is_gif(&self) -> bool {
+        Path::new(&self.file).extension().is_some_and(|e| e.eq_ignore_ascii_case("gif"))
+    }
+
+    pub fn is_image(&self) -> bool {
+        !self.is_video()
+    }
+
     fn matches(&self, query_lower: &str) -> bool {
         self.title.to_lowercase().contains(query_lower)
             || self.when.contains(query_lower)
@@ -111,9 +134,25 @@ impl Library {
             .filter(|name| !is_sidecar_name(name) && capture_time(name).is_some() && !self.entries.iter().any(|e| &e.file == name))
             .filter_map(|file| {
                 let (y, mo, d, h, mi) = capture_time(&file)?;
-                let (width, height) = image::image_dimensions(self.dir.join(&file)).ok()?;
+                let full_path = self.dir.join(&file);
+                if !full_path.is_file() {
+                    return None;
+                }
+                let is_mp4 = Path::new(&file).extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4"));
+                let (width, height) = if is_mp4 {
+                    (0, 0)
+                } else {
+                    image::image_dimensions(&full_path).ok()?
+                };
                 let when = format!("{d}/{mo}/{y} {h}:{mi}");
-                Some(Entry { file, when, title: String::new(), width, height })
+                Some(Entry {
+                    file,
+                    when,
+                    title: String::new(),
+                    width,
+                    height,
+                    duration_secs: 0.0,
+                })
             })
             .collect();
         if lost.is_empty() {
@@ -134,7 +173,12 @@ impl Library {
     }
 
     pub fn thumb_path(&self, file: &str) -> PathBuf {
-        self.dir.join(THUMB_DIR).join(file)
+        let stem = Path::new(file).file_stem().and_then(|s| s.to_str()).unwrap_or(file);
+        self.dir.join(THUMB_DIR).join(format!("{stem}.png"))
+    }
+
+    pub fn save_thumb(&self, file: &str, thumb: &RgbaImage) {
+        let _ = save_png_atomic(&make_thumb(thumb), &self.thumb_path(file));
     }
 
     pub fn layers_path(&self, file: &str) -> PathBuf {
@@ -168,30 +212,120 @@ impl Library {
 
     /// Entries that contain the search text (case-insensitive), newest first.
     pub fn search(&self, query: &str) -> Vec<&Entry> {
+        self.search_filtered(query, MediaFilter::All)
+    }
+
+    /// Entries matching the search text and media filter, newest first.
+    pub fn search_filtered(&self, query: &str, filter: MediaFilter) -> Vec<&Entry> {
         let q = query.trim().to_lowercase();
-        self.entries.iter().filter(|e| q.is_empty() || e.matches(&q)).collect()
+        self.entries
+            .iter()
+            .filter(|e| match filter {
+                MediaFilter::All => true,
+                MediaFilter::Images => e.is_image(),
+                MediaFilter::Videos => e.is_video(),
+            })
+            .filter(|e| q.is_empty() || e.matches(&q))
+            .collect()
+    }
+
+    /// Returns `(total_count, images_count, videos_count)`.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let total = self.entries.len();
+        let videos = self.entries.iter().filter(|e| e.is_video()).count();
+        let images = total.saturating_sub(videos);
+        (total, images, videos)
+    }
+
+    pub fn get(&self, file: &str) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.file == file)
     }
 
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Reserves a unique `<YYYY-MM-DD_HH-MM-SS>.<ext>` name without modifying the index.
+    pub fn reserve_name(&self, now: LocalTime, ext: &str) -> String {
+        let ext = ext.trim_start_matches('.');
+        let (y, mo, d, h, mi, s) = now;
+        let base = format!("{y:04}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}");
+        let mut file = format!("{base}.{ext}");
+        let mut n = 2;
+        while self.entries.iter().any(|e| e.file == file) || self.path(&file).exists() {
+            file = format!("{base}_{n}.{ext}");
+            n += 1;
+        }
+        file
+    }
+
     /// Registers a new capture and returns the file name reserved for it. The PNG itself is written
     /// later, by [`Writer`].
     pub fn add(&mut self, now: LocalTime, title: String, width: u32, height: u32) -> String {
-        let (y, mo, d, h, mi, s) = now;
-        let base = format!("{y:04}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}");
-        let mut file = format!("{base}.png");
-        let mut n = 2;
-        // Two captures in the same second get a suffix.
-        while self.entries.iter().any(|e| e.file == file) || self.path(&file).exists() {
-            file = format!("{base}_{n}.png");
-            n += 1;
-        }
+        self.add_media(now, "png", title, width, height, 0.0)
+    }
+
+    /// Registers a new capture or video/GIF with extension `ext` and returns the reserved file name.
+    pub fn add_media(
+        &mut self,
+        now: LocalTime,
+        ext: &str,
+        title: String,
+        width: u32,
+        height: u32,
+        duration_secs: f32,
+    ) -> String {
+        let file = self.reserve_name(now, ext);
+        let (_, mo, d, h, mi, _) = now;
+        let y = now.0;
         let when = format!("{d:02}/{mo:02}/{y:04} {h:02}:{mi:02}");
-        self.entries.insert(0, Entry { file: file.clone(), when, title, width, height });
+        self.entries.insert(
+            0,
+            Entry {
+                file: file.clone(),
+                when,
+                title,
+                width,
+                height,
+                duration_secs,
+            },
+        );
         self.save_index();
         file
+    }
+
+    /// Inserts or updates an entry for a file that has already been written inside the library folder.
+    pub fn register_existing_file(
+        &mut self,
+        file: String,
+        now: LocalTime,
+        title: String,
+        width: u32,
+        height: u32,
+        duration_secs: f32,
+    ) {
+        let (y, mo, d, h, mi, _) = now;
+        let when = format!("{d:02}/{mo:02}/{y:04} {h:02}:{mi:02}");
+        if let Some(e) = self.entries.iter_mut().find(|e| e.file == file) {
+            e.when = when;
+            e.title = title;
+            e.width = width;
+            e.height = height;
+            e.duration_secs = duration_secs;
+        } else {
+            self.entries.insert(
+                0,
+                Entry {
+                    file,
+                    when,
+                    title,
+                    width,
+                    height,
+                    duration_secs,
+                },
+            );
+        }
+        self.save_index();
     }
 
     /// Updates the recorded size after an edit (a crop, for example).
@@ -200,6 +334,18 @@ impl Library {
             && (e.width, e.height) != (width, height)
         {
             (e.width, e.height) = (width, height);
+            self.save_index();
+        }
+    }
+
+    /// Updates dimensions and duration after a video or GIF is edited in-place.
+    pub fn update_media(&mut self, file: &str, width: u32, height: u32, duration_secs: f32) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.file == file)
+            && ((e.width, e.height) != (width, height) || (e.duration_secs - duration_secs).abs() > f32::EPSILON)
+        {
+            e.width = width;
+            e.height = height;
+            e.duration_secs = duration_secs;
             self.save_index();
         }
     }
@@ -218,10 +364,19 @@ impl Library {
     }
 }
 
-/// Date and time in the name of a capture file (`2026-11-10_02-45-12.png`, or with `_2` for a
-/// second one in the same second), as text: year, month, day, hour, minute.
+fn strip_media_ext(name: &str) -> Option<&str> {
+    for ext in [".png", ".mp4", ".gif", ".PNG", ".MP4", ".GIF"] {
+        if let Some(stem) = name.strip_suffix(ext) {
+            return Some(stem);
+        }
+    }
+    None
+}
+
+/// Date and time in the name of a capture file (`2026-11-10_02-45-12.png`/`.mp4`/`.gif`, or with `_2`
+/// for a second one in the same second), as text: year, month, day, hour, minute.
 fn capture_time(name: &str) -> Option<(&str, &str, &str, &str, &str)> {
-    let stem = name.strip_suffix(".png")?;
+    let stem = strip_media_ext(name)?;
     let (stamp, suffix) = stem.split_at_checked(19)?;
     let b = stamp.as_bytes();
     let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
@@ -233,7 +388,7 @@ fn capture_time(name: &str) -> Option<(&str, &str, &str, &str, &str)> {
 
 /// Chronological key `(timestamp, sequence_within_second)` so `..._10.png` sorts after `..._2.png`.
 fn capture_sort_key(name: &str) -> (&str, u64) {
-    if let Some(stem) = name.strip_suffix(".png")
+    if let Some(stem) = strip_media_ext(name)
         && let Some((stamp, suffix)) = stem.split_at_checked(19)
     {
         let seq = if suffix.is_empty() {
@@ -248,17 +403,39 @@ fn capture_sort_key(name: &str) -> (&str, u64) {
 
 fn is_sidecar_name(file: &str) -> bool {
     let lower = file.to_ascii_lowercase();
-    lower.ends_with(".base.png") || lower.ends_with(".tmp.png") || lower.ends_with(".snap.json")
+    if lower.ends_with(".base.png")
+        || lower.ends_with(".tmp.png")
+        || lower.ends_with(".snap.json")
+        || lower.ends_with(".video.mp4")
+        || lower.ends_with(".tmp.mp4")
+        || lower.ends_with(".tmp.gif")
+        || lower.ends_with(".audio.wav")
+        || lower.ends_with(".parts.txt")
+    {
+        return true;
+    }
+    if let Some(stem) = lower.strip_suffix(".mp4")
+        && let Some((_, after_part)) = stem.rsplit_once(".part")
+        && !after_part.is_empty()
+        && after_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    false
 }
 
-/// A tampered index must not point outside the library folder or at non-PNG files (like `index.json`).
+/// A tampered index must not point outside the library folder or at non-media files (like `index.json`).
 fn is_plain_file_name(file: &str) -> bool {
     !file.is_empty()
         && !file.contains(['/', '\\', ':'])
         && file != "."
         && file != ".."
         && !is_sidecar_name(file)
-        && Path::new(file).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        && Path::new(file).extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("png")
+                || ext.eq_ignore_ascii_case("mp4")
+                || ext.eq_ignore_ascii_case("gif")
+        })
 }
 
 /// What gets selected after `file` leaves the list: the next item or, at the end, the previous one.
@@ -625,6 +802,70 @@ mod tests {
         let lib = Library::open(dir.clone());
         let files: Vec<&str> = lib.search("").iter().map(|e| e.file.as_str()).collect();
         assert_eq!(files, ["2026-11-10_02-45-12.png"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_entries_filter_counts_and_thumb_paths() {
+        let dir = temp_dir("media-filter");
+        let mut lib = Library::open(dir.clone());
+        let img = lib.add(T1, "Screenshot".into(), 1920, 1080);
+        touch(&lib, &img);
+        let vid = lib.add_media((2026, 11, 10, 2, 46, 0), "mp4", "Demo recording".into(), 1280, 720, 12.5);
+        touch(&lib, &vid);
+        let gif = lib.add_media((2026, 11, 10, 2, 47, 0), "gif", "Clip animation".into(), 640, 360, 4.0);
+        touch(&lib, &gif);
+
+        assert_eq!(vid, "2026-11-10_02-46-00.mp4");
+        assert_eq!(gif, "2026-11-10_02-47-00.gif");
+        assert_eq!(
+            lib.thumb_path(&vid),
+            lib.dir().join(THUMB_DIR).join("2026-11-10_02-46-00.png")
+        );
+        assert_eq!(
+            lib.thumb_path(&gif),
+            lib.dir().join(THUMB_DIR).join("2026-11-10_02-47-00.png")
+        );
+
+        assert_eq!(lib.counts(), (3, 2, 1));
+        assert_eq!(lib.search_filtered("", MediaFilter::All).len(), 3);
+        assert_eq!(lib.search_filtered("", MediaFilter::Videos).len(), 1);
+        assert_eq!(lib.search_filtered("", MediaFilter::Videos)[0].file, vid);
+        assert_eq!(lib.search_filtered("", MediaFilter::Images).len(), 2);
+
+        lib.update_media(&vid, 800, 600, 8.25);
+        let updated = lib.get(&vid).unwrap();
+        assert_eq!((updated.width, updated.height, updated.duration_secs), (800, 600, 8.25));
+        assert!(updated.is_video());
+        assert!(!updated.is_image());
+        assert!(lib.get(&gif).unwrap().is_gif());
+        assert!(lib.get(&gif).unwrap().is_image());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_lost_files_recovers_mp4_and_ignores_temp_recording_files() {
+        let dir = temp_dir("recover-mp4");
+        RgbaImage::new(30, 20).save(dir.join("2026-11-10_02-45-12.png")).unwrap();
+        std::fs::write(dir.join("2026-11-10_02-46-00.mp4"), b"fake-mp4").unwrap();
+        std::fs::write(dir.join("2026-11-10_02-46-00.video.mp4"), b"temp-video").unwrap();
+        std::fs::write(dir.join("2026-11-10_02-46-00.tmp.mp4"), b"temp-mp4").unwrap();
+        std::fs::write(dir.join("2026-11-10_02-46-00.part1.mp4"), b"part1").unwrap();
+        std::fs::write(dir.join("2026-11-10_02-46-00.audio.wav"), b"wav").unwrap();
+        std::fs::write(dir.join("2026-11-10_02-46-00.parts.txt"), b"parts").unwrap();
+
+        assert!(is_plain_file_name("2026-11-10_02-46-00.mp4"));
+        assert!(is_plain_file_name("2026-11-10_02-46-00.gif"));
+        assert!(!is_plain_file_name("2026-11-10_02-46-00.video.mp4"));
+        assert!(!is_plain_file_name("2026-11-10_02-46-00.tmp.mp4"));
+        assert!(!is_plain_file_name("2026-11-10_02-46-00.part1.mp4"));
+        assert!(!is_plain_file_name("2026-11-10_02-46-00.audio.wav"));
+        assert!(!is_plain_file_name("2026-11-10_02-46-00.parts.txt"));
+
+        let lib = Library::open(dir.clone());
+        let files: Vec<&str> = lib.search("").iter().map(|e| e.file.as_str()).collect();
+        assert_eq!(files, ["2026-11-10_02-46-00.mp4", "2026-11-10_02-45-12.png"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

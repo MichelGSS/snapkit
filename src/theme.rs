@@ -64,13 +64,39 @@ pub fn text_on(fill: Color32) -> Color32 {
 
 /// Applies the theme to the egui context.
 pub fn apply(ctx: &egui::Context, theme: &Theme) {
+    let mut style = (*ctx.global_style()).clone();
+    style.spacing.button_padding = egui::vec2(9.0, 5.0);
+    style.spacing.item_spacing = egui::vec2(7.0, 5.0);
+    style.spacing.slider_width = 120.0;
+
     let mut visuals = if theme.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     visuals.panel_fill = theme.panel_fill;
     visuals.selection.bg_fill = theme.accent;
     // The selected item's text sits on the accent color: dark on light accents.
     visuals.selection.stroke = egui::Stroke::new(1.0, text_on(theme.accent));
     visuals.hyperlink_color = theme.accent;
-    ctx.set_visuals(visuals);
+    visuals.window_corner_radius = egui::CornerRadius::same(8);
+    visuals.menu_corner_radius = egui::CornerRadius::same(6);
+
+    let radius = egui::CornerRadius::same(6);
+    visuals.widgets.noninteractive.corner_radius = radius;
+    visuals.widgets.inactive.corner_radius = radius;
+    visuals.widgets.hovered.corner_radius = radius;
+    visuals.widgets.active.corner_radius = radius;
+    visuals.widgets.open.corner_radius = radius;
+
+    let subtle_border = if theme.dark {
+        Color32::from_white_alpha(28)
+    } else {
+        Color32::from_black_alpha(32)
+    };
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, subtle_border);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme.accent.gamma_multiply(0.75));
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5, theme.accent);
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, theme.accent.gamma_multiply(0.85));
+
+    style.visuals = visuals;
+    ctx.set_global_style(style);
 }
 
 #[cfg(test)]

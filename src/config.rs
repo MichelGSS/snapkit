@@ -140,6 +140,25 @@ fn key_code(key: &str) -> Option<Code> {
     KEYS.iter().position(|k| *k == key).map(|i| CODES[i])
 }
 
+/// Video encoding quality preset for screen recordings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoQuality {
+    Standard,
+    #[default]
+    High,
+    Ultra,
+}
+
+impl VideoQuality {
+    pub fn bitrate_factor(self) -> f64 {
+        match self {
+            Self::Standard => 0.65,
+            Self::High => 1.0,
+            Self::Ultra => 1.6,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -153,6 +172,14 @@ pub struct Config {
     /// Audio sources checked in the last video recording.
     pub record_system_audio: bool,
     pub record_microphone: bool,
+    /// Video recording frame rate (`15`, `24`, `30`, or `60`).
+    pub video_fps: u32,
+    /// Video recording bitrate quality preset.
+    pub video_quality: VideoQuality,
+    /// Whether the mouse cursor is drawn in video recordings.
+    pub video_cursor: bool,
+    /// Countdown in seconds before video recording begins (`0`, `3`, or `5`).
+    pub video_countdown: u32,
     /// After choosing the region, annotate right there, on the screen, instead of opening the
     /// editor.
     pub quick_annotate: bool,
@@ -179,6 +206,10 @@ impl Default for Config {
             close_to_tray: true,
             record_system_audio: true,
             record_microphone: false,
+            video_fps: 30,
+            video_quality: VideoQuality::High,
+            video_cursor: true,
+            video_countdown: 3,
             quick_annotate: true,
             styles: Vec::new(),
             theme: "Padrão".to_owned(),
@@ -391,5 +422,27 @@ mod tests {
         assert!(!base.conflicts_with(&diff_key));
         assert!(!base.conflicts_with(&diff_shift));
         assert!(!base.conflicts_with(&diff_win));
+    }
+
+    #[test]
+    fn video_preferences_default_and_round_trip() {
+        let def = Config::parse("{}");
+        assert_eq!(def.video_fps, 30);
+        assert_eq!(def.video_quality, VideoQuality::High);
+        assert!(def.video_cursor);
+        assert_eq!(def.video_countdown, 3);
+        assert_eq!(VideoQuality::Standard.bitrate_factor(), 0.65);
+        assert_eq!(VideoQuality::High.bitrate_factor(), 1.0);
+        assert_eq!(VideoQuality::Ultra.bitrate_factor(), 1.6);
+
+        let custom = Config {
+            video_fps: 60,
+            video_quality: VideoQuality::Ultra,
+            video_cursor: false,
+            video_countdown: 5,
+            ..Config::default()
+        };
+        let text = serde_json::to_string(&custom).unwrap();
+        assert_eq!(Config::parse(&text), custom);
     }
 }
