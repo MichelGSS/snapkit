@@ -9,7 +9,9 @@ use std::ffi::c_void;
 use image::RgbaImage;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_CLOAKED,
+    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleDC, GetDC, ReleaseDC, SRCCOPY, CreateDIBSection, DIB_RGB_COLORS,
@@ -349,6 +351,43 @@ pub fn cloak(hwnd: isize, on: bool) {
     // SAFETY: handle of our main window; the value is a 4-byte BOOL, as the API expects.
     unsafe {
         DwmSetWindowAttribute(hwnd as HWND, DWMWA_CLOAK as u32, (&raw const value).cast(), 4);
+    }
+}
+
+/// Syncs the native Windows title bar and border colors with the active SnapKit theme.
+pub fn apply_titlebar_theme(hwnd: isize, dark: bool, bg: [u8; 3], fg: [u8; 3]) {
+    if hwnd == 0 {
+        return;
+    }
+    let dark_flag: i32 = i32::from(dark);
+    let caption_color: u32 = (bg[0] as u32) | ((bg[1] as u32) << 8) | ((bg[2] as u32) << 16);
+    let text_color: u32 = (fg[0] as u32) | ((fg[1] as u32) << 8) | ((fg[2] as u32) << 16);
+    // SAFETY: handle of our main window; each value is a 4-byte BOOL or COLORREF.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd as HWND,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            (&raw const dark_flag).cast(),
+            4,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd as HWND,
+            DWMWA_CAPTION_COLOR as u32,
+            (&raw const caption_color).cast(),
+            4,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd as HWND,
+            DWMWA_TEXT_COLOR as u32,
+            (&raw const text_color).cast(),
+            4,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd as HWND,
+            DWMWA_BORDER_COLOR as u32,
+            (&raw const caption_color).cast(),
+            4,
+        );
     }
 }
 

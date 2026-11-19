@@ -4,8 +4,52 @@
 //! the captured area and the control points in the editor). The chosen name is saved in the
 //! preferences, in `%APPDATA%\SnapKit\config.json`.
 
+use std::sync::Arc;
+
 use eframe::egui;
-use egui::Color32;
+use egui::{Color32, FontFamily, FontId, Margin, Stroke, TextStyle};
+
+pub const SEMIBOLD_FAMILY: &str = "semibold";
+
+const INTER_REGULAR_TTF: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
+const INTER_SEMIBOLD_TTF: &[u8] = include_bytes!("../assets/fonts/Inter-SemiBold.ttf");
+
+pub fn semibold_family() -> FontFamily {
+    FontFamily::Name(SEMIBOLD_FAMILY.into())
+}
+
+/// Installs the embedded Inter Regular and SemiBold fonts while keeping egui's monospace and
+/// symbol/emoji fallbacks intact.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "inter_regular".to_owned(),
+        Arc::new(egui::FontData::from_static(INTER_REGULAR_TTF)),
+    );
+    fonts.font_data.insert(
+        "inter_semibold".to_owned(),
+        Arc::new(egui::FontData::from_static(INTER_SEMIBOLD_TTF)),
+    );
+
+    let prop_fallbacks = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut regular_chain = Vec::with_capacity(1 + prop_fallbacks.len());
+    regular_chain.push("inter_regular".to_owned());
+    regular_chain.extend(prop_fallbacks.iter().cloned());
+    fonts.families.insert(FontFamily::Proportional, regular_chain);
+
+    let mut semibold_chain = Vec::with_capacity(2 + prop_fallbacks.len());
+    semibold_chain.push("inter_semibold".to_owned());
+    semibold_chain.push("inter_regular".to_owned());
+    semibold_chain.extend(prop_fallbacks);
+    fonts.families.insert(semibold_family(), semibold_chain);
+
+    ctx.set_fonts(fonts);
+}
 
 #[derive(Debug, PartialEq)]
 pub struct Theme {
@@ -15,6 +59,82 @@ pub struct Theme {
     pub panel_fill: Color32,
     /// Accent color: selection, hyperlinks, capture frame.
     pub accent: Color32,
+}
+
+/// Derived 4-surface design palette for the active theme.
+#[derive(Clone, Copy, Debug)]
+pub struct Palette {
+    pub dark: bool,
+    pub accent: Color32,
+    pub on_accent: Color32,
+    pub bg_canvas: Color32,
+    pub bg_chrome: Color32,
+    pub bg_surface: Color32,
+    pub bg_elevated: Color32,
+    pub border_subtle: Color32,
+    pub border_strong: Color32,
+    pub text_primary: Color32,
+    pub text_secondary: Color32,
+    pub text_muted: Color32,
+    pub danger: Color32,
+    pub success: Color32,
+    pub warning: Color32,
+    pub shadow_color: Color32,
+}
+
+fn shift_rgb(c: Color32, delta: i16) -> Color32 {
+    let clamp = |v: u8| (v as i16 + delta).clamp(0, 255) as u8;
+    Color32::from_rgb(clamp(c.r()), clamp(c.g()), clamp(c.b()))
+}
+
+/// Computes the 4-layer surface palette for `theme`.
+pub fn palette(theme: &Theme) -> Palette {
+    let on_accent = text_on(theme.accent);
+    if theme.dark {
+        Palette {
+            dark: true,
+            accent: theme.accent,
+            on_accent,
+            bg_canvas: shift_rgb(theme.panel_fill, -8),
+            bg_chrome: theme.panel_fill,
+            bg_surface: shift_rgb(theme.panel_fill, 9),
+            bg_elevated: shift_rgb(theme.panel_fill, 18),
+            border_subtle: Color32::from_white_alpha(18),
+            border_strong: Color32::from_white_alpha(38),
+            text_primary: Color32::from_rgb(236, 239, 244),
+            text_secondary: Color32::from_rgb(168, 176, 190),
+            text_muted: Color32::from_rgb(118, 126, 140),
+            danger: Color32::from_rgb(235, 87, 87),
+            success: Color32::from_rgb(63, 185, 80),
+            warning: Color32::from_rgb(235, 179, 54),
+            shadow_color: Color32::from_black_alpha(120),
+        }
+    } else {
+        Palette {
+            dark: false,
+            accent: theme.accent,
+            on_accent,
+            bg_canvas: shift_rgb(theme.panel_fill, -14),
+            bg_chrome: theme.panel_fill,
+            bg_surface: shift_rgb(theme.panel_fill, -7),
+            bg_elevated: shift_rgb(theme.panel_fill, -16),
+            border_subtle: Color32::from_black_alpha(26),
+            border_strong: Color32::from_black_alpha(52),
+            text_primary: Color32::from_rgb(28, 34, 42),
+            text_secondary: Color32::from_rgb(86, 98, 108),
+            text_muted: Color32::from_rgb(128, 138, 146),
+            danger: Color32::from_rgb(214, 65, 65),
+            success: Color32::from_rgb(38, 150, 62),
+            warning: Color32::from_rgb(196, 134, 18),
+            shadow_color: Color32::from_black_alpha(45),
+        }
+    }
+}
+
+/// Returns the active `Palette` stored in `ctx`, falling back to the default theme's palette.
+pub fn current_palette(ctx: &egui::Context) -> Palette {
+    ctx.data(|d| d.get_temp::<Palette>(egui::Id::unique("snapkit_palette")))
+        .unwrap_or_else(|| palette(&THEMES[0]))
 }
 
 /// The accent color of the original theme, also the default.
@@ -64,36 +184,88 @@ pub fn text_on(fill: Color32) -> Color32 {
 
 /// Applies the theme to the egui context.
 pub fn apply(ctx: &egui::Context, theme: &Theme) {
+    let pal = palette(theme);
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("snapkit_palette"), pal));
+
     let mut style = (*ctx.global_style()).clone();
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(18.0, semibold_family())),
+        (TextStyle::Body, FontId::proportional(13.0)),
+        (TextStyle::Button, FontId::proportional(12.5)),
+        (TextStyle::Small, FontId::proportional(11.0)),
+        (TextStyle::Monospace, FontId::monospace(12.0)),
+    ]
+    .into();
+
     style.spacing.button_padding = egui::vec2(9.0, 5.0);
-    style.spacing.item_spacing = egui::vec2(7.0, 5.0);
-    style.spacing.slider_width = 120.0;
+    style.spacing.item_spacing = egui::vec2(6.0, 5.0);
+    style.spacing.window_margin = Margin::same(14);
+    style.spacing.menu_margin = Margin::same(6);
+    style.spacing.slider_width = 112.0;
+    style.spacing.interact_size = egui::vec2(30.0, 26.0);
 
     let mut visuals = if theme.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
-    visuals.panel_fill = theme.panel_fill;
-    visuals.selection.bg_fill = theme.accent;
+    visuals.panel_fill = pal.bg_chrome;
+    visuals.window_fill = pal.bg_surface;
+    visuals.faint_bg_color = pal.bg_surface;
+    visuals.extreme_bg_color = pal.bg_canvas;
+    visuals.code_bg_color = pal.bg_canvas;
+    visuals.window_stroke = Stroke::new(1.0, pal.border_subtle);
+    visuals.window_corner_radius = egui::CornerRadius::same(10);
+    visuals.menu_corner_radius = egui::CornerRadius::same(8);
+    visuals.window_shadow = egui::Shadow {
+        offset: [0, 8],
+        blur: 24,
+        spread: 0,
+        color: pal.shadow_color,
+    };
+    visuals.popup_shadow = egui::Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: pal.shadow_color,
+    };
+    visuals.selection.bg_fill = pal.accent;
     // The selected item's text sits on the accent color: dark on light accents.
-    visuals.selection.stroke = egui::Stroke::new(1.0, text_on(theme.accent));
-    visuals.hyperlink_color = theme.accent;
-    visuals.window_corner_radius = egui::CornerRadius::same(8);
-    visuals.menu_corner_radius = egui::CornerRadius::same(6);
+    visuals.selection.stroke = Stroke::new(1.0, pal.on_accent);
+    visuals.hyperlink_color = pal.accent;
 
     let radius = egui::CornerRadius::same(6);
-    visuals.widgets.noninteractive.corner_radius = radius;
-    visuals.widgets.inactive.corner_radius = radius;
-    visuals.widgets.hovered.corner_radius = radius;
-    visuals.widgets.active.corner_radius = radius;
-    visuals.widgets.open.corner_radius = radius;
+    for w in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        w.corner_radius = radius;
+        w.expansion = 0.0;
+    }
 
-    let subtle_border = if theme.dark {
-        Color32::from_white_alpha(28)
-    } else {
-        Color32::from_black_alpha(32)
-    };
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, subtle_border);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme.accent.gamma_multiply(0.75));
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5, theme.accent);
-    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, theme.accent.gamma_multiply(0.85));
+    visuals.widgets.noninteractive.bg_fill = pal.bg_surface;
+    visuals.widgets.noninteractive.weak_bg_fill = pal.bg_surface;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.border_subtle);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, pal.text_primary);
+
+    visuals.widgets.inactive.bg_fill = pal.bg_surface;
+    visuals.widgets.inactive.weak_bg_fill = pal.bg_surface;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.border_subtle);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, pal.text_primary);
+
+    visuals.widgets.hovered.bg_fill = pal.bg_elevated;
+    visuals.widgets.hovered.weak_bg_fill = pal.bg_elevated;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, pal.border_strong);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, pal.text_primary);
+
+    visuals.widgets.active.bg_fill = pal.accent.gamma_multiply(0.24);
+    visuals.widgets.active.weak_bg_fill = pal.accent.gamma_multiply(0.24);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, pal.accent);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, pal.text_primary);
+
+    visuals.widgets.open.bg_fill = pal.bg_elevated;
+    visuals.widgets.open.weak_bg_fill = pal.bg_elevated;
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, pal.accent.gamma_multiply(0.8));
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0, pal.text_primary);
 
     style.visuals = visuals;
     ctx.set_global_style(style);
@@ -134,6 +306,23 @@ mod tests {
         let ctx = egui::Context::default();
         for theme in &THEMES {
             apply(&ctx, theme);
+        }
+    }
+
+    #[test]
+    fn embedded_inter_fonts_are_valid_ttf() {
+        assert!(ab_glyph::FontArc::try_from_slice(INTER_REGULAR_TTF).is_ok());
+        assert!(ab_glyph::FontArc::try_from_slice(INTER_SEMIBOLD_TTF).is_ok());
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+    }
+
+    #[test]
+    fn palette_surfaces_distinct_for_every_theme() {
+        for theme in &THEMES {
+            let pal = palette(theme);
+            assert_ne!(pal.bg_canvas, pal.bg_chrome, "{}", theme.name);
+            assert_ne!(pal.bg_surface, pal.bg_chrome, "{}", theme.name);
         }
     }
 }

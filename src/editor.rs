@@ -5,7 +5,9 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
 use image::RgbaImage;
 
+use crate::icons::{self, Icon};
 use crate::render::{self, CalloutStyle, Handle, Op, Point, Rgba, Stamp, StepGlyph, StepShape};
+use crate::{theme, ui as kit};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Tool {
@@ -997,45 +999,160 @@ impl Editor {
         render::text_size_for(self.width)
     }
 
-    /// Tool column, grouped by what the tools do.
-    pub fn tools_ui(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                for (pt, en, tools) in TOOL_GROUPS {
-                    ui.add_space(6.0);
-                    ui.weak(pick(pt, en));
-                    for tool in tools {
-                        let clicked =
-                            ui.selectable_label(self.tool == *tool, tool_label(*tool)).on_hover_text(tool_hint(*tool)).clicked();
-                        if clicked {
-                            self.commit_pending_text();
-                            self.tool = *tool;
-                            self.clear_selection();
+    /// Tool column, rendered as a compact icon rail (default) or expanded icon + label list.
+    pub fn tools_ui(&mut self, ui: &mut egui::Ui, expanded: &mut bool) {
+        let pal = theme::current_palette(ui.ctx());
+        let total = ui.available_rect_before_wrap();
+        let footer_h = 34.0;
+        let scroll_rect = Rect::from_min_max(
+            total.min,
+            Pos2::new(total.max.x, (total.max.y - footer_h).max(total.min.y + 40.0)),
+        );
+        let footer_rect = Rect::from_min_max(
+            Pos2::new(total.min.x, scroll_rect.max.y),
+            total.max,
+        );
+
+        ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("tools_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    for (idx, (pt, en, tools)) in TOOL_GROUPS.iter().enumerate() {
+                        if *expanded {
+                            if idx > 0 {
+                                ui.add_space(6.0);
+                            }
+                            ui.label(
+                                kit::semibold(pick(pt, en).to_uppercase())
+                                    .size(10.0)
+                                    .color(pal.text_muted),
+                            );
+                        } else if idx > 0 {
+                            let (div_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(38.0, 8.0), Sense::hover());
+                            let y = div_rect.center().y;
+                            ui.painter().line_segment(
+                                [
+                                    Pos2::new(div_rect.center().x - 10.0, y),
+                                    Pos2::new(div_rect.center().x + 10.0, y),
+                                ],
+                                Stroke::new(1.0, pal.border_subtle),
+                            );
+                        }
+                        for tool in *tools {
+                            let resp = kit::rail_tool_button(
+                                ui,
+                                icons::for_tool(*tool),
+                                tool_label(*tool),
+                                tool_hint(*tool),
+                                self.tool == *tool,
+                                *expanded,
+                            );
+                            if resp.clicked() {
+                                self.commit_pending_text();
+                                self.tool = *tool;
+                                self.clear_selection();
+                            }
                         }
                     }
+                });
+        });
+
+        ui.scope_builder(egui::UiBuilder::new().max_rect(footer_rect), |ui| {
+            ui.painter().line_segment(
+                [
+                    Pos2::new(footer_rect.min.x, footer_rect.min.y),
+                    Pos2::new(footer_rect.max.x, footer_rect.min.y),
+                ],
+                Stroke::new(1.0, pal.border_subtle),
+            );
+            ui.add_space(4.0);
+            if *expanded {
+                if kit::ghost_button(
+                    ui,
+                    Some(Icon::PanelLeft),
+                    t!("Recolher", "Collapse"),
+                    false,
+                )
+                .on_hover_text(t!(
+                    "Mostrar só os ícones das ferramentas",
+                    "Show only tool icons"
+                ))
+                .clicked()
+                {
+                    *expanded = false;
                 }
-            });
+            } else {
+                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                    if kit::icon_button(ui, Icon::PanelLeft, false, 28.0)
+                        .on_hover_text(t!(
+                            "Expandir nomes das ferramentas",
+                            "Expand tool names"
+                        ))
+                        .clicked()
+                    {
+                        *expanded = true;
+                    }
+                });
+            }
         });
     }
 
     /// Zoom controls, for the bottom bar. The caller uses a right-to-left layout.
     pub fn zoom_ui(&mut self, ui: &mut egui::Ui) {
-        if ui.button("100%").on_hover_text(t!("Tamanho real (Ctrl 1)", "Actual size (Ctrl 1)")).clicked() {
-            self.set_zoom(1.0);
-        }
-        if ui.button(t!("Ajustar", "Fit")).on_hover_text(t!("Imagem inteira na janela (Ctrl 0)", "Whole image in the window (Ctrl 0)")).clicked() {
-            self.zoom_to_fit();
-        }
-        if ui.button("+").on_hover_text(t!("Aumentar (Ctrl + ou Ctrl e a roda do mouse)", "Zoom in (Ctrl + or Ctrl and the mouse wheel)")).clicked() {
-            self.set_zoom(self.view_scale * ZOOM_STEP);
-        }
-        ui.label(format!("{:.0}%", self.view_scale * 100.0));
-        if ui.button("-").on_hover_text(t!("Diminuir (Ctrl -)", "Zoom out (Ctrl -)")).clicked() {
-            self.set_zoom(self.view_scale / ZOOM_STEP);
-        }
-        ui.separator();
+        let pal = theme::current_palette(ui.ctx());
+        egui::Frame::NONE
+            .fill(pal.bg_surface)
+            .stroke(Stroke::new(1.0, pal.border_subtle))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(4, 1))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if kit::small_ghost_button(ui, None, "100%", false)
+                    .on_hover_text(t!("Tamanho real (Ctrl 1)", "Actual size (Ctrl 1)"))
+                    .clicked()
+                {
+                    self.set_zoom(1.0);
+                }
+                if kit::small_ghost_button(ui, None, t!("Ajustar", "Fit"), self.zoom.is_none())
+                    .on_hover_text(t!(
+                        "Imagem inteira na janela (Ctrl 0)",
+                        "Whole image in the window (Ctrl 0)"
+                    ))
+                    .clicked()
+                {
+                    self.zoom_to_fit();
+                }
+                if kit::small_ghost_button(ui, None, "+", false)
+                    .on_hover_text(t!(
+                        "Aumentar (Ctrl + ou Ctrl e a roda do mouse)",
+                        "Zoom in (Ctrl + or Ctrl and the mouse wheel)"
+                    ))
+                    .clicked()
+                {
+                    self.set_zoom(self.view_scale * ZOOM_STEP);
+                }
+                ui.label(
+                    egui::RichText::new(format!("{:.0}%", self.view_scale * 100.0))
+                        .size(11.5)
+                        .color(pal.text_primary),
+                );
+                if kit::small_ghost_button(ui, None, "−", false)
+                    .on_hover_text(t!("Diminuir (Ctrl -)", "Zoom out (Ctrl -)"))
+                    .clicked()
+                {
+                    self.set_zoom(self.view_scale / ZOOM_STEP);
+                }
+            });
+        ui.add_space(6.0);
         let img = self.history.image();
-        ui.weak(format!("{} × {} px", img.width(), img.height()));
+        ui.label(
+            egui::RichText::new(format!("{} × {} px", img.width(), img.height()))
+                .size(11.5)
+                .color(pal.text_muted),
+        );
     }
 
     /// Current tool and options as a style. With an object selected, its type applies.
@@ -1075,7 +1192,7 @@ impl Editor {
     /// Styles menu: apply, save the current one or delete. Returns `true` if the list changed.
     fn styles_menu(&mut self, ui: &mut egui::Ui, styles: &mut Vec<Style>) -> bool {
         let mut changed = false;
-        ui.menu_button(t!("Estilos", "Styles"), |ui| {
+        kit::ghost_menu_button(ui, Some(Icon::Styles), t!("Estilos", "Styles"), |ui| {
             ui.set_min_width(240.0);
             if styles.is_empty() {
                 ui.weak(t!("Nenhum estilo salvo ainda.", "No saved style yet."));
@@ -1085,7 +1202,7 @@ impl Editor {
                 ui.horizontal(|ui| {
                     let [r, g, b, a] = style.color;
                     let (swatch, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                    ui.painter().rect_filled(swatch, 3.0, Color32::from_rgba_unmultiplied(r, g, b, a));
+                    ui.painter().circle_filled(swatch.center(), 5.5, Color32::from_rgba_unmultiplied(r, g, b, a));
                     if ui.button(&style.name).on_hover_text(tool_label(style.tool)).clicked() {
                         apply = Some(i);
                     }
@@ -1133,10 +1250,10 @@ impl Editor {
         let mut op = None;
         let mut paste_clip = false;
         let mut auto_redact = false;
-        ui.menu_button(t!("Imagem", "Image"), |ui| {
+        kit::ghost_menu_button(ui, Some(Icon::ImageOps), t!("Imagem", "Image"), |ui| {
             ui.set_min_width(250.0);
             if ui
-                .button(t!("📋 Colar imagem como camada (Ctrl V)", "📋 Paste image as layer (Ctrl V)"))
+                .button(t!("Colar imagem como camada (Ctrl V)", "Paste image as layer (Ctrl V)"))
                 .on_hover_text(t!(
                     "Cola a imagem da área de transferência sobre o quadro atual como um objeto editável.",
                     "Pastes the clipboard image onto the canvas as an editable object."
@@ -1147,7 +1264,7 @@ impl Editor {
                 ui.close();
             }
             if ui
-                .button(t!("🔒 Ocultar dados sensíveis (OCR)", "🔒 Auto-redact sensitive data (OCR)"))
+                .button(t!("Ocultar dados sensíveis (OCR)", "Auto-redact sensitive data (OCR)"))
                 .on_hover_text(t!(
                     "Detecta e-mails, CPFs, cartões, telefones, IPs e chaves de API na imagem e aplica desfoque editável.",
                     "Detects emails, IDs, cards, phones, IPs, and API keys in the image and applies editable blur boxes."
@@ -1215,7 +1332,7 @@ impl Editor {
                 op = Some(Op::Shadow { size: 24 });
             }
             ui.separator();
-            ui.weak(t!("✨ Plano de fundo (Mockup)", "✨ Background mockup"));
+            ui.weak(t!("Plano de fundo (Mockup)", "Background mockup"));
             let preset_idx = (self.beautify_preset as usize).min(render::BEAUTIFY_PRESETS.len() - 1);
             let (_, _, pt_name, en_name) = render::BEAUTIFY_PRESETS[preset_idx];
             egui::ComboBox::from_id_salt("beautify_preset")
@@ -1244,7 +1361,7 @@ impl Editor {
                 ui.label(t!("Sombra", "Shadow"));
                 ui.add(egui::DragValue::new(&mut self.beautify_shadow).range(0..=64).suffix(" px"));
             });
-            if ui.button(t!("✨ Aplicar plano de fundo", "✨ Apply background")).clicked() {
+            if ui.button(t!("Aplicar plano de fundo", "Apply background")).clicked() {
                 op = Some(Op::Beautify {
                     preset: self.beautify_preset,
                     padding: self.beautify_padding,
@@ -1271,20 +1388,16 @@ impl Editor {
     }
 
     fn color_ui(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.x = 3.0;
         for c in PALETTE {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-            ui.painter().rect_filled(rect, 4.0, c);
-            if self.color == c {
-                ui.painter().rect_stroke(rect, 4.0, Stroke::new(2.0, ui.visuals().strong_text_color()), StrokeKind::Outside);
-            }
-            if resp.clicked() {
+            if kit::color_dot(ui, c, self.color == c, 17.0).clicked() {
                 self.color = c;
                 self.eyedropper = false;
             }
         }
+        ui.add_space(2.0);
         ui.color_edit_button_srgba(&mut self.color).on_hover_text(t!("Outra cor", "Other color"));
-        if ui
-            .add(egui::Button::new("💧").selected(self.eyedropper))
+        if kit::icon_button(ui, Icon::Eyedropper, self.eyedropper, 25.0)
             .on_hover_text(t!(
                 "Conta-gotas: clique em qualquer ponto da imagem para copiar a cor (I)",
                 "Eyedropper: click anywhere on the image to pick its color (I)"
@@ -1338,97 +1451,150 @@ impl Editor {
         let mut multi_dup = false;
         let mut multi_del = false;
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(self.history.can_undo(), egui::Button::new(t!("↶ Desfazer", "↶ Undo"))).on_hover_text("Ctrl Z").clicked() {
+            if ui
+                .add_enabled_ui(self.history.can_undo(), |ui| kit::icon_button(ui, Icon::Undo, false, 26.0))
+                .inner
+                .on_hover_text(t!("Desfazer (Ctrl Z)", "Undo (Ctrl Z)"))
+                .clicked()
+            {
                 self.undo();
             }
-            if ui.add_enabled(self.history.can_redo(), egui::Button::new(t!("↷ Refazer", "↷ Redo"))).on_hover_text("Ctrl Y").clicked() {
+            if ui
+                .add_enabled_ui(self.history.can_redo(), |ui| kit::icon_button(ui, Icon::Redo, false, 26.0))
+                .inner
+                .on_hover_text(t!("Refazer (Ctrl Y)", "Redo (Ctrl Y)"))
+                .clicked()
+            {
                 self.redo();
             }
             styles_changed = self.styles_menu(ui, styles);
             self.image_menu(ui);
-            ui.separator();
+            kit::divider_v(ui, 18.0);
+            let pal = theme::current_palette(ui.ctx());
             if multi_count >= 2 {
-                ui.strong(tf!("Selecionados: {multi_count}", "Selected: {multi_count}"));
+                egui::Frame::NONE
+                    .fill(pal.bg_elevated)
+                    .stroke(Stroke::new(1.0, pal.border_subtle))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.label(
+                            kit::semibold(tf!("Selecionados: {multi_count}", "Selected: {multi_count}"))
+                                .size(12.0)
+                                .color(pal.text_primary),
+                        );
+                    });
             } else {
-                match &selected_op {
-                    Some(Op::Sticker { .. }) => ui.strong(t!("Selecionado: Camada", "Selected: Layer")),
-                    Some(op) => ui.strong(tf!("Selecionado: {}", "Selected: {}", tool_label(tool_for(op)))),
-                    None => ui.strong(tool_label(self.tool)),
+                let (badge_icon, badge_text): (Icon, String) = match &selected_op {
+                    Some(Op::Sticker { .. }) => (Icon::ImageOps, t!("Selecionado: Camada", "Selected: Layer").to_owned()),
+                    Some(op) => (
+                        icons::for_tool(tool_for(op)),
+                        tf!("Selecionado: {}", "Selected: {}", tool_label(tool_for(op))),
+                    ),
+                    None => (icons::for_tool(self.tool), tool_label(self.tool).to_owned()),
                 };
+                egui::Frame::NONE
+                    .fill(pal.bg_elevated)
+                    .stroke(Stroke::new(1.0, pal.border_subtle))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(7, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            let (icon_slot, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                            icons::paint(ui.painter(), ui.ctx(), badge_icon, icon_slot.center(), 14.0, pal.accent);
+                            ui.label(kit::semibold(badge_text).size(12.0).color(pal.text_primary));
+                        });
+                    });
             }
             if show.color {
-                ui.separator();
+                kit::divider_v(ui, 18.0);
                 self.color_ui(ui);
             }
             if let Some(label) = show.thickness {
-                ui.separator();
-                ui.label(label);
+                kit::divider_v(ui, 18.0);
+                ui.label(egui::RichText::new(label).size(12.0).color(pal.text_secondary));
                 ui.add(egui::Slider::new(&mut self.width, 1.0..=24.0).fixed_decimals(0));
             }
-            if show.filled {
-                ui.checkbox(&mut self.filled, t!("Preencher", "Fill"))
-                    .on_hover_text(t!("Forma cheia em vez de só o contorno", "Solid shape instead of just the outline"));
+            if show.filled
+                && kit::pill_toggle(ui, None, t!("Preencher", "Fill"), self.filled)
+                    .on_hover_text(t!("Forma cheia em vez de só o contorno", "Solid shape instead of just the outline"))
+                    .clicked()
+            {
+                self.filled = !self.filled;
             }
-            if show.dashed {
-                ui.checkbox(&mut self.dashed, t!("Tracejado", "Dashed"));
+            if show.dashed
+                && kit::pill_toggle(ui, None, t!("Tracejado", "Dashed"), self.dashed).clicked()
+            {
+                self.dashed = !self.dashed;
             }
             if show.corner_radius {
-                ui.label(t!("Cantos", "Corners"));
+                ui.label(egui::RichText::new(t!("Cantos", "Corners")).size(12.0).color(pal.text_secondary));
                 ui.add(egui::DragValue::new(&mut self.rect_radius).range(0.0..=64.0).speed(0.5).suffix(" px"));
             }
-            if show.double {
-                ui.checkbox(&mut self.double, t!("Duas pontas", "Two heads"));
+            if show.double
+                && kit::pill_toggle(ui, None, t!("Duas pontas", "Two heads"), self.double).clicked()
+            {
+                self.double = !self.double;
             }
-            if show.boxed {
-                ui.checkbox(&mut self.boxed, t!("Fundo", "Background")).on_hover_text(t!("Caixa de fundo atrás do texto", "Box behind the text"));
+            if show.boxed
+                && kit::pill_toggle(ui, None, t!("Fundo", "Background"), self.boxed)
+                    .on_hover_text(t!("Caixa de fundo atrás do texto", "Box behind the text"))
+                    .clicked()
+            {
+                self.boxed = !self.boxed;
             }
             if show.step {
-                ui.label(t!("Formato", "Shape"));
+                ui.label(egui::RichText::new(t!("Formato", "Shape")).size(12.0).color(pal.text_secondary));
                 combo(ui, "step_shape", &mut self.step_shape, &StepShape::ALL);
                 combo(ui, "step_label", &mut self.step_glyph, &StepGlyph::ALL);
             }
             if show.callout {
-                ui.label(t!("Estilo", "Style"));
+                ui.label(egui::RichText::new(t!("Estilo", "Style")).size(12.0).color(pal.text_secondary));
                 combo(ui, "callout_style", &mut self.callout_style, &CalloutStyle::ALL);
             }
             if show.stamp {
-                ui.label(t!("Símbolo", "Symbol"));
+                ui.label(egui::RichText::new(t!("Símbolo", "Symbol")).size(12.0).color(pal.text_secondary));
                 combo(ui, "stamp", &mut self.stamp, &Stamp::ALL);
             }
-            ui.separator();
+            kit::divider_v(ui, 18.0);
             if multi_count >= 2 {
-                for (mode, sym, pt_tip, en_tip) in [
-                    (AlignMode::Left, "⫷", "Alinhar à esquerda", "Align left"),
-                    (AlignMode::CenterH, "⫿", "Centralizar na horizontal", "Align horizontal center"),
-                    (AlignMode::Right, "⫸", "Alinhar à direita", "Align right"),
-                    (AlignMode::Top, "⫯", "Alinhar ao topo", "Align top"),
-                    (AlignMode::CenterV, "⫰", "Centralizar na vertical", "Align vertical middle"),
-                    (AlignMode::Bottom, "⫱", "Alinhar à base", "Align bottom"),
+                for (mode, icon, pt_tip, en_tip) in [
+                    (AlignMode::Left, Icon::AlignLeft, "Alinhar à esquerda", "Align left"),
+                    (AlignMode::CenterH, Icon::AlignCenterH, "Centralizar na horizontal", "Align horizontal center"),
+                    (AlignMode::Right, Icon::AlignRight, "Alinhar à direita", "Align right"),
+                    (AlignMode::Top, Icon::AlignTop, "Alinhar ao topo", "Align top"),
+                    (AlignMode::CenterV, Icon::AlignCenterV, "Centralizar na vertical", "Align vertical middle"),
+                    (AlignMode::Bottom, Icon::AlignBottom, "Alinhar à base", "Align bottom"),
                 ] {
-                    if ui.button(sym).on_hover_text(pick(pt_tip, en_tip)).clicked() {
+                    if kit::icon_button(ui, icon, false, 25.0).on_hover_text(pick(pt_tip, en_tip)).clicked() {
                         align_req = Some(mode);
                     }
                 }
                 if multi_count >= 3 {
-                    if ui
-                        .button("↔")
+                    if kit::icon_button(ui, Icon::DistributeH, false, 25.0)
                         .on_hover_text(t!("Distribuir na horizontal", "Distribute horizontally"))
                         .clicked()
                     {
                         align_req = Some(AlignMode::DistributeH);
                     }
-                    if ui
-                        .button("↕")
+                    if kit::icon_button(ui, Icon::DistributeV, false, 25.0)
                         .on_hover_text(t!("Distribuir na vertical", "Distribute vertically"))
                         .clicked()
                     {
                         align_req = Some(AlignMode::DistributeV);
                     }
                 }
-                if ui.button(t!("⧉ Duplicar", "⧉ Duplicate")).on_hover_text("Ctrl D").clicked() {
+                if kit::small_ghost_button(ui, Some(Icon::Duplicate), t!("Duplicar", "Duplicate"), false)
+                    .on_hover_text("Ctrl D")
+                    .clicked()
+                {
                     multi_dup = true;
                 }
-                if ui.button(t!("Apagar", "Delete")).on_hover_text("Delete").clicked() {
+                if kit::small_ghost_button(ui, Some(Icon::Trash), t!("Apagar", "Delete"), false)
+                    .on_hover_text("Delete")
+                    .clicked()
+                {
                     multi_del = true;
                 }
             } else {
@@ -1448,8 +1614,7 @@ impl Editor {
                         let angle = self.history.ops()[i].angle();
                         if angle.abs() > 0.01 {
                             ui.label(format!("{:.0}°", angle.to_degrees()));
-                            if ui
-                                .button("0°")
+                            if kit::small_ghost_button(ui, None, "0°", false)
                                 .on_hover_text(t!("Redefinir rotação", "Reset rotation"))
                                 .clicked()
                             {
@@ -1460,44 +1625,50 @@ impl Editor {
                                 self.gesture_open = false;
                             }
                         }
-                        if ui
-                            .button("⬆")
+                        if kit::icon_button(ui, Icon::BringForward, false, 25.0)
                             .on_hover_text(t!("Trazer para a frente (])", "Bring forward (])"))
                             .clicked()
                         {
                             self.reorder(i, true, false);
                         }
-                        if ui
-                            .button("⬇")
+                        if kit::icon_button(ui, Icon::SendBackward, false, 25.0)
                             .on_hover_text(t!("Enviar para trás ([)", "Send backward ([)"))
                             .clicked()
                         {
                             self.reorder(i, false, false);
                         }
-                        if ui
-                            .button("⤒")
+                        if kit::icon_button(ui, Icon::BringToFront, false, 25.0)
                             .on_hover_text(t!("Trazer para o topo (Shift ])", "Bring to front (Shift ])"))
                             .clicked()
                         {
                             self.reorder(i, true, true);
                         }
-                        if ui
-                            .button("⤓")
+                        if kit::icon_button(ui, Icon::SendToBack, false, 25.0)
                             .on_hover_text(t!("Enviar para o fundo (Shift [)", "Send to back (Shift [)"))
                             .clicked()
                         {
                             self.reorder(i, false, true);
                         }
-                        if ui.button(t!("⧉ Duplicar", "⧉ Duplicate")).on_hover_text("Ctrl D").clicked() {
+                        if kit::small_ghost_button(ui, Some(Icon::Duplicate), t!("Duplicar", "Duplicate"), false)
+                            .on_hover_text("Ctrl D")
+                            .clicked()
+                        {
                             let ctx = ui.ctx().clone();
                             self.duplicate_selected(&ctx);
                         }
-                        if ui.button(t!("Apagar", "Delete")).on_hover_text("Delete").clicked() {
+                        if kit::small_ghost_button(ui, Some(Icon::Trash), t!("Apagar", "Delete"), false)
+                            .on_hover_text("Delete")
+                            .clicked()
+                        {
                             self.delete(i);
                         }
                     }
                     None => {
-                        ui.weak(tool_hint(self.tool));
+                        ui.label(
+                            egui::RichText::new(tool_hint(self.tool))
+                                .size(11.5)
+                                .color(pal.text_muted),
+                        );
                     }
                 }
             }
@@ -1612,28 +1783,30 @@ impl Editor {
     /// Compact quick annotation bar: the most used tools, colors and width.
     pub fn quick_toolbar_ui(&mut self, ui: &mut egui::Ui) {
         let before = (self.color, self.width);
+        ui.spacing_mut().item_spacing.x = 3.0;
         for tool in QUICK_TOOLS {
-            let clicked = ui.selectable_label(self.tool == tool, tool_label(tool)).on_hover_text(tool_hint(tool)).clicked();
-            if clicked {
+            let label = tool_label(tool);
+            let hint = tool_hint(tool);
+            if kit::icon_button(ui, icons::for_tool(tool), self.tool == tool, 26.0)
+                .on_hover_ui(|ui| {
+                    ui.label(kit::semibold(label));
+                    ui.weak(hint);
+                })
+                .clicked()
+            {
                 self.commit_pending_text();
                 self.tool = tool;
                 self.clear_selection();
             }
         }
-        ui.separator();
+        kit::divider_v(ui, 18.0);
         for c in PALETTE {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
-            ui.painter().rect_filled(rect, 3.0, c);
-            if self.color == c {
-                ui.painter().rect_stroke(rect, 3.0, Stroke::new(2.0, ui.visuals().strong_text_color()), StrokeKind::Outside);
-            }
-            if resp.clicked() {
+            if kit::color_dot(ui, c, self.color == c, 15.0).clicked() {
                 self.color = c;
                 self.eyedropper = false;
             }
         }
-        if ui
-            .add(egui::Button::new("💧").selected(self.eyedropper))
+        if kit::icon_button(ui, Icon::Eyedropper, self.eyedropper, 25.0)
             .on_hover_text(t!(
                 "Conta-gotas: clique em qualquer ponto da imagem para copiar a cor (I)",
                 "Eyedropper: click anywhere on the image to pick its color (I)"
@@ -1642,9 +1815,15 @@ impl Editor {
         {
             self.eyedropper = !self.eyedropper;
         }
-        ui.spacing_mut().slider_width = 70.0;
-        ui.add(egui::Slider::new(&mut self.width, 1.0..=24.0).show_value(false)).on_hover_text(t!("Espessura ou tamanho", "Thickness or size"));
-        if ui.add_enabled(self.history.can_undo(), egui::Button::new("↶")).on_hover_text(t!("Desfazer (Ctrl Z)", "Undo (Ctrl Z)")).clicked() {
+        ui.spacing_mut().slider_width = 68.0;
+        ui.add(egui::Slider::new(&mut self.width, 1.0..=24.0).show_value(false))
+            .on_hover_text(t!("Espessura ou tamanho", "Thickness or size"));
+        if ui
+            .add_enabled_ui(self.history.can_undo(), |ui| kit::icon_button(ui, Icon::Undo, false, 25.0))
+            .inner
+            .on_hover_text(t!("Desfazer (Ctrl Z)", "Undo (Ctrl Z)"))
+            .clicked()
+        {
             self.undo();
         }
         // Color and width changed while an object is selected apply to it.
@@ -1729,6 +1908,23 @@ impl Editor {
             }
         }
 
+        let panel_rect = ui.available_rect_before_wrap();
+        if self.fixed_rect.is_none() {
+            let pal = theme::current_palette(&ctx);
+            let dot_tex = canvas_dot_texture(&ctx);
+            let bg_painter = ui.painter_at(panel_rect);
+            let tile_uv = Rect::from_min_max(
+                Pos2::ZERO,
+                Pos2::new(panel_rect.width() / 20.0, panel_rect.height() / 20.0),
+            );
+            let dot_tint = if pal.dark {
+                Color32::from_white_alpha(14)
+            } else {
+                Color32::from_black_alpha(18)
+            };
+            bg_painter.image(dot_tex.id(), panel_rect, tile_uv, dot_tint);
+        }
+
         let img = self.history.image();
         let img_size = Vec2::new(img.width() as f32, img.height() as f32);
         let (avail, scale, img_rect) = match self.fixed_rect {
@@ -1783,8 +1979,26 @@ impl Editor {
     ) {
         let ctx = ctx.clone();
 
+        if self.fixed_rect.is_none() {
+            let pal = theme::current_palette(&ctx);
+            painter.add(
+                egui::Shadow {
+                    offset: [0, 8],
+                    blur: 26,
+                    spread: 0,
+                    color: pal.shadow_color,
+                }
+                .as_shape(img_rect, 2.0),
+            );
+        }
+
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         painter.image(self.texture.id(), img_rect, uv, Color32::WHITE);
+
+        if self.fixed_rect.is_none() {
+            let pal = theme::current_palette(&ctx);
+            painter.rect_stroke(img_rect, 0.0, Stroke::new(1.0, pal.border_subtle), StrokeKind::Outside);
+        }
 
         let to_img = |p: Pos2| -> Point {
             let v = (p - img_rect.min) / scale;
@@ -2852,6 +3066,24 @@ pub fn texture_image(img: &RgbaImage, max_side: usize) -> egui::ColorImage {
     let scale = max as f64 / w.max(h) as f64;
     let fit = |side: u32| ((side as f64 * scale).floor() as u32).clamp(1, max);
     to_color_image(&image::imageops::resize(img, fit(w), fit(h), image::imageops::FilterType::Triangle))
+}
+
+fn canvas_dot_texture(ctx: &egui::Context) -> TextureHandle {
+    let id = egui::Id::unique("snapkit_canvas_dot_tex");
+    if let Some(tex) = ctx.data(|d| d.get_temp::<TextureHandle>(id)) {
+        return tex;
+    }
+    const TILE: usize = 20;
+    let mut pixels = vec![Color32::TRANSPARENT; TILE * TILE];
+    pixels[10 * TILE + 10] = Color32::WHITE;
+    let img = egui::ColorImage {
+        size: [TILE, TILE],
+        source_size: Vec2::splat(TILE as f32),
+        pixels,
+    };
+    let tex = ctx.load_texture("canvas_dot_grid", img, TextureOptions::NEAREST_REPEAT);
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    tex
 }
 
 #[cfg(test)]

@@ -10,7 +10,8 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
 use image::RgbaImage;
 
-use crate::{editor, record, theme};
+use crate::icons::Icon;
+use crate::{editor, record, theme, ui as kit};
 
 const FILMSTRIP_COUNT: usize = 8;
 const FILMSTRIP_HEIGHT: u32 = 56;
@@ -523,10 +524,11 @@ impl VideoEditor {
     pub fn options_ui(&mut self, ui: &mut egui::Ui) -> Option<VideoAction> {
         let mut action = None;
         let busy = self.busy;
+        let pal = theme::current_palette(ui.ctx());
 
         ui.horizontal_wrapped(|ui| {
             // Speed selector
-            ui.label(t!("Velocidade:", "Speed:"));
+            ui.label(egui::RichText::new(t!("Velocidade:", "Speed:")).size(12.0).color(pal.text_secondary));
             let prev_speed = self.speed;
             let speed_label = format!("{}×", self.speed);
             egui::ComboBox::from_id_salt("video_speed_combo")
@@ -549,19 +551,19 @@ impl VideoEditor {
                 self.start_playback(&ctx);
             }
 
-            ui.separator();
+            kit::divider_v(ui, 18.0);
 
             // Audio mute toggle
-            let audio_label = if !self.info.has_audio || self.mute {
-                t!("🔇 Sem som", "🔇 Muted")
+            let (audio_icon, audio_label) = if !self.info.has_audio || self.mute {
+                (Icon::VolumeOff, t!("Sem som", "Muted"))
             } else {
-                t!("🔊 Som", "🔊 Sound")
+                (Icon::VolumeOn, t!("Som", "Sound"))
             };
             let audio_btn = ui
-                .add_enabled(
-                    self.info.has_audio && !busy,
-                    egui::Button::new(audio_label).selected(self.info.has_audio && !self.mute),
-                )
+                .add_enabled_ui(self.info.has_audio && !busy, |ui| {
+                    kit::pill_toggle(ui, Some(audio_icon), audio_label, self.info.has_audio && !self.mute)
+                })
+                .inner
                 .on_hover_text(if self.info.has_audio {
                     t!(
                         "Ativa ou remove a faixa de áudio na exportação.",
@@ -578,10 +580,10 @@ impl VideoEditor {
                 self.audio_muted.store(self.mute, Ordering::Relaxed);
             }
 
-            ui.separator();
+            kit::divider_v(ui, 18.0);
 
             // Resolution scale selector
-            ui.label(t!("Resolução:", "Resolution:"));
+            ui.label(egui::RichText::new(t!("Resolução:", "Resolution:")).size(12.0).color(pal.text_secondary));
             let res_label = |w: u32| match w {
                 0 => t!("Original", "Original").to_owned(),
                 1920 => "1080p (1920 px)".to_owned(),
@@ -605,15 +607,14 @@ impl VideoEditor {
                     }
                 });
 
-            ui.separator();
+            kit::divider_v(ui, 18.0);
 
             // Interactive Crop toggle
             let crop_btn = ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(t!("✂ Recortar área", "✂ Crop area"))
-                        .selected(self.crop_enabled),
-                )
+                .add_enabled_ui(!busy, |ui| {
+                    kit::pill_toggle(ui, Some(Icon::Crop), t!("Recortar área", "Crop area"), self.crop_enabled)
+                })
+                .inner
                 .on_hover_text(t!(
                     "Arraste o quadro sobre o vídeo para recortar uma região específica.",
                     "Drag the frame over the video to crop a specific region."
@@ -629,11 +630,10 @@ impl VideoEditor {
                 }
             }
             if self.crop_enabled {
-                if let Some(( _, _, cw, ch)) = self.crop_rect {
-                    ui.weak(format!("{cw}×{ch}"));
+                if let Some((_, _, cw, ch)) = self.crop_rect {
+                    ui.label(egui::RichText::new(format!("{cw}×{ch}")).size(11.5).color(pal.text_muted));
                 }
-                if ui
-                    .small_button(t!("Limpar recorte", "Clear crop"))
+                if kit::small_ghost_button(ui, Some(Icon::Close), t!("Limpar", "Clear"), false)
                     .on_hover_text(t!(
                         "Desativa o recorte e mantém o quadro inteiro.",
                         "Disables cropping and keeps the full frame."
@@ -646,12 +646,14 @@ impl VideoEditor {
                 }
             }
 
-            ui.separator();
+            kit::divider_v(ui, 18.0);
 
             // GIF settings + action
-            ui.menu_button(
-                format!(
-                    "🎞 GIF ({} fps, {})",
+            kit::ghost_menu_button(
+                ui,
+                Some(Icon::Gif),
+                &format!(
+                    "GIF ({} fps, {})",
                     self.gif_fps,
                     if self.gif_width == 0 {
                         t!("Orig.", "Orig.").to_owned()
@@ -696,8 +698,8 @@ impl VideoEditor {
                         .add_enabled(
                             !busy,
                             egui::Button::new(t!(
-                                "🎞 Criar GIF na biblioteca",
-                                "🎞 Create GIF in library"
+                                "Criar GIF na biblioteca",
+                                "Create GIF in library"
                             )),
                         )
                         .clicked()
@@ -709,17 +711,16 @@ impl VideoEditor {
                     }
                 },
             )
-            .response
             .on_hover_text(t!(
                 "Configura FPS e largura para exportar o trecho selecionado como GIF animado.",
                 "Configure FPS and width to export the selected clip as an animated GIF."
             ));
 
             if ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(t!("🎞 Criar GIF na biblioteca", "🎞 Create GIF in library")),
-                )
+                .add_enabled_ui(!busy, |ui| {
+                    kit::ghost_button(ui, Some(Icon::Gif), t!("Criar GIF", "Create GIF"), false)
+                })
+                .inner
                 .on_hover_text(t!(
                     "Converte o trecho selecionado em um GIF otimizado com paleta sob medida e adiciona à biblioteca.",
                     "Converts the selected clip into a palette-optimized GIF and adds it to the library."
@@ -731,17 +732,18 @@ impl VideoEditor {
                 });
             }
 
-            ui.separator();
+            kit::divider_v(ui, 18.0);
 
             // Save clip to library
             if ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(t!(
-                        "✂ Salvar trecho na biblioteca",
-                        "✂ Save clip to library"
-                    )),
-                )
+                .add_enabled_ui(!busy, |ui| {
+                    kit::primary_button(
+                        ui,
+                        Some(Icon::Save),
+                        t!("Salvar trecho na biblioteca", "Save clip to library"),
+                    )
+                })
+                .inner
                 .on_hover_text(t!(
                     "Salva um novo vídeo MP4 na biblioteca com o corte, recorte, velocidade e áudio escolhidos.",
                     "Saves a new MP4 video in the library with the chosen trim, crop, speed, and audio settings."
@@ -756,10 +758,15 @@ impl VideoEditor {
             // Overwrite in library
             let can_overwrite = !busy && self.has_edits();
             if ui
-                .add_enabled(
-                    can_overwrite,
-                    egui::Button::new(t!("💾 Aplicar neste vídeo", "💾 Apply to this video")),
-                )
+                .add_enabled_ui(can_overwrite, |ui| {
+                    kit::ghost_button(
+                        ui,
+                        Some(Icon::Edit),
+                        t!("Aplicar neste vídeo", "Apply to this video"),
+                        false,
+                    )
+                })
+                .inner
                 .on_hover_text(t!(
                     "Aplica as edições diretamente neste vídeo da biblioteca.",
                     "Applies the edits directly to this video in the library."
@@ -773,10 +780,15 @@ impl VideoEditor {
 
             // Export MP4 As...
             if ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(t!("📂 Exportar MP4…", "📂 Export MP4…")),
-                )
+                .add_enabled_ui(!busy, |ui| {
+                    kit::ghost_button(
+                        ui,
+                        Some(Icon::Folder),
+                        t!("Exportar MP4…", "Export MP4…"),
+                        false,
+                    )
+                })
+                .inner
                 .on_hover_text(t!(
                     "Escolhe onde salvar uma cópia MP4 editada.",
                     "Choose where to save an edited MP4 copy."
@@ -791,10 +803,15 @@ impl VideoEditor {
             // Capture current frame into Image Annotation Editor
             let has_frame = self.current_frame.is_some();
             if ui
-                .add_enabled(
-                    !busy && has_frame,
-                    egui::Button::new(t!("📸 Quadro → Editor", "📸 Frame → Editor")),
-                )
+                .add_enabled_ui(!busy && has_frame, |ui| {
+                    kit::ghost_button(
+                        ui,
+                        Some(Icon::CaptureFrame),
+                        t!("Quadro → Editor", "Frame → Editor"),
+                        false,
+                    )
+                })
+                .inner
                 .on_hover_text(t!(
                     "Captura o quadro exibido agora e abre no editor de anotações (setas, textos, destaque, OCR).",
                     "Captures the currently displayed frame and opens it in the annotation editor (arrows, text, highlight, OCR)."
@@ -854,12 +871,24 @@ impl VideoEditor {
         self.handle_keyboard_shortcuts(&ctx);
 
         let mut action = None;
+        let pal = theme::current_palette(&ctx);
 
         // Bottom timeline + transport panel (~126px tall)
         egui::Panel::bottom("video_timeline_panel")
             .resizable(false)
             .exact_size(126.0)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(pal.bg_chrome)
+                    .inner_margin(egui::Margin::symmetric(10, 6)),
+            )
             .show(ui, |ui| {
+                let top_rect = ui.max_rect();
+                ui.painter().line_segment(
+                    [top_rect.left_top(), top_rect.right_top()],
+                    Stroke::new(1.0, pal.border_subtle),
+                );
                 if let Some(act) = self.timeline_panel_ui(ui) {
                     action = Some(act);
                 }
@@ -867,7 +896,7 @@ impl VideoEditor {
 
         // Main preview canvas
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(ui.visuals().extreme_bg_color))
+            .frame(egui::Frame::NONE.fill(pal.bg_canvas))
             .show(ui, |ui| {
                 self.preview_canvas_ui(ui);
             });
@@ -1238,10 +1267,14 @@ impl VideoEditor {
         ui.add_space(4.0);
 
         // Row 1: Transport controls + Timecode readout + Open in system player
+        let pal = theme::current_palette(&ctx);
         ui.horizontal(|ui| {
             // Jump to Trim Start
             if ui
-                .add_enabled(!busy && duration > 0.0, egui::Button::new(t!("⏮ Início", "⏮ Start")))
+                .add_enabled_ui(!busy && duration > 0.0, |ui| {
+                    kit::icon_button(ui, Icon::SkipStart, false, 26.0)
+                })
+                .inner
                 .on_hover_text(t!(
                     "Pula para o início do trecho selecionado (Home).",
                     "Jump to the start of the selected clip (Home)."
@@ -1256,7 +1289,10 @@ impl VideoEditor {
 
             // Step -0.1s
             if ui
-                .add_enabled(!busy && duration > 0.0, egui::Button::new("◀ -0.1s"))
+                .add_enabled_ui(!busy && duration > 0.0, |ui| {
+                    kit::small_ghost_button(ui, Some(Icon::StepBack), "-0.1s", false)
+                })
+                .inner
                 .on_hover_text(t!(
                     "Recua 0,1 segundo (Seta esquerda).",
                     "Step back 0.1 seconds (Left arrow)."
@@ -1270,16 +1306,20 @@ impl VideoEditor {
             }
 
             // Play / Pause preview
-            let play_label = if self.is_playing {
-                t!("⏸ Pausar", "⏸ Pause")
+            let (play_icon, play_label) = if self.is_playing {
+                (Icon::Pause, t!("Pausar", "Pause"))
             } else {
-                t!("▶ Reproduzir", "▶ Play")
+                (Icon::Play, t!("Reproduzir", "Play"))
             };
             if ui
-                .add_enabled(
-                    !busy && duration > 0.0,
-                    egui::Button::new(play_label).selected(self.is_playing),
-                )
+                .add_enabled_ui(!busy && duration > 0.0, |ui| {
+                    if self.is_playing {
+                        kit::pill_toggle(ui, Some(play_icon), play_label, true)
+                    } else {
+                        kit::primary_button(ui, Some(play_icon), play_label)
+                    }
+                })
+                .inner
                 .on_hover_text(t!(
                     "Reproduz ou pausa a prévia visual e de áudio do trecho (Espaço).",
                     "Play or pause the visual and audio clip preview (Space)."
@@ -1291,7 +1331,10 @@ impl VideoEditor {
 
             // Step +0.1s
             if ui
-                .add_enabled(!busy && duration > 0.0, egui::Button::new("▶ +0.1s"))
+                .add_enabled_ui(!busy && duration > 0.0, |ui| {
+                    kit::small_ghost_button(ui, Some(Icon::StepForward), "+0.1s", false)
+                })
+                .inner
                 .on_hover_text(t!(
                     "Avança 0,1 segundo (Seta direita).",
                     "Step forward 0.1 seconds (Right arrow)."
@@ -1306,7 +1349,10 @@ impl VideoEditor {
 
             // Jump to Trim End
             if ui
-                .add_enabled(!busy && duration > 0.0, egui::Button::new(t!("⏭ Fim", "⏭ End")))
+                .add_enabled_ui(!busy && duration > 0.0, |ui| {
+                    kit::icon_button(ui, Icon::SkipEnd, false, 26.0)
+                })
+                .inner
                 .on_hover_text(t!(
                     "Pula para o fim do trecho selecionado (End).",
                     "Jump to the end of the selected clip (End)."
@@ -1319,14 +1365,14 @@ impl VideoEditor {
                 self.request_frame(&ctx, self.playhead);
             }
 
-            ui.separator();
+            kit::divider_v(ui, 18.0);
 
             // Set In `[` and Set Out `]` at playhead buttons
             if ui
-                .add_enabled(
-                    !busy && duration > MIN_TRIM_GAP,
-                    egui::Button::new(t!("[ Marcar início", "[ Mark In")),
-                )
+                .add_enabled_ui(!busy && duration > MIN_TRIM_GAP, |ui| {
+                    kit::small_ghost_button(ui, Some(Icon::MarkIn), t!("Marcar início", "Mark In"), false)
+                })
+                .inner
                 .on_hover_text(t!(
                     "Define o início do corte na posição atual da agulha (tecla [).",
                     "Sets trim start at the current playhead position ([ key)."
@@ -1338,13 +1384,12 @@ impl VideoEditor {
                     .clamp(0.0, (self.trim_end - MIN_TRIM_GAP).max(0.0));
             }
             if ui
-                .add_enabled(
-                    !busy && duration > MIN_TRIM_GAP,
-                    egui::Button::new(t!("Marcar fim ]", "Mark Out ]")),
-                )
+                .add_enabled_ui(!busy && duration > MIN_TRIM_GAP, |ui| {
+                    kit::small_ghost_button(ui, Some(Icon::MarkOut), t!("Marcar fim", "Mark Out"), false)
+                })
+                .inner
                 .on_hover_text(t!(
-                    "Define o fim do corte na posição atual da agulha (tecla ]).
-",
+                    "Define o fim do corte na posição atual da agulha (tecla ]).",
                     "Sets trim end at the current playhead position (] key)."
                 ))
                 .clicked()
@@ -1355,8 +1400,7 @@ impl VideoEditor {
             }
 
             if (self.trim_start > 0.01 || (duration > 0.0 && (duration - self.trim_end) > 0.01))
-                && ui
-                    .small_button(t!("Vídeo inteiro", "Full video"))
+                && kit::small_ghost_button(ui, Some(Icon::Refresh), t!("Vídeo inteiro", "Full video"), false)
                     .on_hover_text(t!(
                         "Restaura o trecho para a duração completa do vídeo.",
                         "Resets the trim handles to the full video duration."
@@ -1367,15 +1411,19 @@ impl VideoEditor {
                 self.trim_end = duration;
             }
 
-            ui.separator();
+            kit::divider_v(ui, 18.0);
 
             // Timecode readout
             let clip_dur = (self.trim_end - self.trim_start).max(0.0) / self.speed.max(0.1);
-            ui.strong(format!(
-                "{} / {}",
-                format_timecode(self.playhead),
-                format_timecode(duration)
-            ));
+            ui.label(
+                kit::semibold(format!(
+                    "{} / {}",
+                    format_timecode(self.playhead),
+                    format_timecode(duration)
+                ))
+                .size(12.0)
+                .color(pal.text_primary),
+            );
             ui.colored_label(
                 self.accent,
                 tf!(
@@ -1389,13 +1437,17 @@ impl VideoEditor {
 
             // Right-aligned system player button
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(t!("🔊 Abrir no player", "🔊 Open in player"))
-                    .on_hover_text(t!(
-                        "Abre o vídeo no reprodutor padrão do Windows com som e taxa máxima de quadros.",
-                        "Opens the video in the default Windows media player with full audio and frame rate."
-                    ))
-                    .clicked()
+                if kit::small_ghost_button(
+                    ui,
+                    Some(Icon::ExternalOpen),
+                    t!("Abrir no player", "Open in player"),
+                    false,
+                )
+                .on_hover_text(t!(
+                    "Abre o vídeo no reprodutor padrão do Windows com som e taxa máxima de quadros.",
+                    "Opens the video in the default Windows media player with full audio and frame rate."
+                ))
+                .clicked()
                 {
                     let _ = std::process::Command::new("explorer").arg(&self.path).spawn();
                 }

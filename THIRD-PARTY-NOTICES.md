@@ -29,7 +29,7 @@ Only the debug symbol sections were removed from `libtesseract-5.dll` (`scripts/
 
 `snapkit.exe` is built with open-source Rust libraries, almost all under MIT and/or Apache-2.0. The exact list, with versions, is in the repository's `Cargo.lock` file. The main ones are egui/eframe, image, tiny-skia, ab_glyph, xcap, arboard, rfd, global-hotkey, tray-icon, cpal, ort, serde, winreg, trash, windows-sys, ureq and native-tls (the update check, over Windows' own TLS) and sha2.
 
-The interface uses egui's default fonts (Ubuntu Light, Hack, Noto Emoji, emoji-icon-font), under the Ubuntu Font Licence, MIT and OFL licenses.
+The interface embeds the **Inter** font (Regular and SemiBold, SIL Open Font License 1.1, `licenses\OFL-Inter.txt`) and falls back to egui's default fonts (Ubuntu Light, Hack, Noto Emoji, emoji-icon-font), under the Ubuntu Font Licence, MIT and OFL licenses.
 
 ## Known limitation
 

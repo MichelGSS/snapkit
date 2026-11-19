@@ -8,6 +8,7 @@ mod capture;
 mod config;
 mod editor;
 mod export;
+mod icons;
 mod legacy;
 mod library;
 mod neural;
@@ -19,6 +20,7 @@ mod scroll;
 mod steps;
 mod theme;
 mod tray;
+mod ui;
 mod update;
 mod video_editor;
 mod win;
@@ -29,13 +31,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions};
+use egui::{Color32, ColorImage, CornerRadius, Margin, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions};
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use image::RgbaImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use config::{Config, HotkeyCfg};
+use icons::Icon;
+use ui as kit;
 
 const APP_NAME: &str = "SnapKit";
 
@@ -331,6 +335,8 @@ struct App {
     /// Thumbnails already loaded, by file name.
     thumbs: HashMap<String, TextureHandle>,
     show_library: bool,
+    tools_expanded: bool,
+    logo_tex: Option<TextureHandle>,
     search: String,
     library_filter: library::MediaFilter,
     /// Library entry currently being renamed / tagged: `(file, title_draft, tags_csv_draft)`.
@@ -466,17 +472,29 @@ fn hud_setup(ctx: &egui::Context, hwnd: isize, rect: win::PxRect, size: egui::Ve
 }
 const NORMAL_MIN_SIZE: egui::Vec2 = egui::vec2(520.0, 320.0);
 /// Width that Copy, Save, Pin, Read text, Auto-redact, Library and Preferences take up together in the bar.
-const RIGHT_GROUP_WIDTH: f32 = 680.0;
+const RIGHT_GROUP_WIDTH: f32 = 600.0;
+
+fn apply_window_theme(ctx: &egui::Context, hwnd: isize, theme: &theme::Theme) {
+    theme::apply(ctx, theme);
+    let pal = theme::palette(theme);
+    win::apply_titlebar_theme(
+        hwnd,
+        pal.dark,
+        [pal.bg_chrome.r(), pal.bg_chrome.g(), pal.bg_chrome.b()],
+        [pal.text_primary.r(), pal.text_primary.g(), pal.text_primary.b()],
+    );
+}
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let cfg = Config::load();
         i18n::set(cfg.language.unwrap_or_else(i18n::Lang::system));
-        theme::apply(&cc.egui_ctx, theme::by_name(&cfg.theme));
+        theme::install_fonts(&cc.egui_ctx);
         let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
             Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
             _ => 0,
         };
+        apply_window_theme(&cc.egui_ctx, hwnd, theme::by_name(&cfg.theme));
         let shared = Arc::new(Shared {
             pending: Mutex::new(None),
             select_request: Mutex::new(None),
@@ -546,6 +564,8 @@ impl App {
             selection_anchor: None,
             thumbs: HashMap::new(),
             show_library: true,
+            tools_expanded: false,
+            logo_tex: None,
             search: String::new(),
             library_filter: library::MediaFilter::All,
             edit_meta: None,
@@ -676,6 +696,16 @@ impl App {
         self.theme().accent
     }
 
+    fn sync_titlebar(&self) {
+        let pal = theme::palette(self.theme());
+        win::apply_titlebar_theme(
+            self.shared.hwnd,
+            pal.dark,
+            [pal.bg_chrome.r(), pal.bg_chrome.g(), pal.bg_chrome.b()],
+            [pal.text_primary.r(), pal.text_primary.g(), pal.text_primary.b()],
+        );
+    }
+
     fn save_cfg(&mut self) {
         if let Err(e) = self.cfg.save() {
             self.status = tf!("Não foi possível salvar as preferências: {e}", "Could not save the preferences: {e}");
@@ -773,15 +803,28 @@ impl App {
 
     /// Preferences > Updates: the version, the check button and the daily check.
     fn updates_ui(&mut self, ui: &mut egui::Ui) {
-        ui.strong(t!("Atualizações", "Updates"));
-        ui.label(tf!("Versão instalada: {}", "Installed version: {}", update::CURRENT));
+        let pal = theme::current_palette(ui.ctx());
+        ui.label(
+            egui::RichText::new(tf!("Versão instalada: {}", "Installed version: {}", update::CURRENT))
+                .size(12.0)
+                .color(pal.text_secondary),
+        );
+        ui.add_space(4.0);
         let mut check = false;
         let mut install = None;
         let mut page = None;
         ui.horizontal(|ui| {
             let busy = matches!(self.update_state, UpdateState::Checking | UpdateState::Downloading(_));
             check = ui
-                .add_enabled(!busy, egui::Button::new(t!("Verificar atualização", "Check for updates")))
+                .add_enabled_ui(!busy, |ui| {
+                    kit::ghost_button(
+                        ui,
+                        Some(Icon::Refresh),
+                        t!("Verificar atualização", "Check for updates"),
+                        false,
+                    )
+                })
+                .inner
                 .on_hover_text(t!(
                     "Consulta a versão mais recente no GitHub. Só o nome e a versão do SnapKit são enviados.",
                     "Looks up the latest version on GitHub. Only SnapKit's name and version are sent."
@@ -794,7 +837,7 @@ impl App {
                     ui.label(t!("Verificando…", "Checking…"));
                 }
                 UpdateState::Latest => {
-                    ui.label(t!("Você tem a versão mais recente.", "You have the latest version."));
+                    ui.colored_label(pal.success, t!("Você tem a versão mais recente.", "You have the latest version."));
                 }
                 UpdateState::Available(release) => {
                     ui.colored_label(self.accent(), tf!("Versão {} disponível.", "Version {} is available.", release.version));
@@ -806,10 +849,10 @@ impl App {
             }
         });
         if let UpdateState::Available(release) = &self.update_state {
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if update::is_installed() {
-                    if ui
-                        .button(t!("Atualizar agora", "Update now"))
+                    if kit::primary_button(ui, Some(Icon::UpdateArrow), t!("Atualizar agora", "Update now"))
                         .on_hover_text(t!(
                             "Baixa o instalador, confere o SHA-256, instala e abre o SnapKit de novo. Preferências, estilos e biblioteca são mantidos.",
                             "Downloads the installer, checks its SHA-256, installs it and opens SnapKit again. Preferences, styles and library are kept."
@@ -818,17 +861,20 @@ impl App {
                     {
                         install = Some(release.clone());
                     }
-                } else if ui
-                    .button(t!("Abrir a página de download", "Open the download page"))
-                    .on_hover_text(t!(
-                        "Esta cópia é a portátil (zip): baixe o zip novo e extraia por cima.",
-                        "This is the portable copy (zip): download the new zip and extract it over this one."
-                    ))
-                    .clicked()
+                } else if kit::primary_button(
+                    ui,
+                    Some(Icon::ExternalOpen),
+                    t!("Abrir a página de download", "Open the download page"),
+                )
+                .on_hover_text(t!(
+                    "Esta cópia é a portátil (zip): baixe o zip novo e extraia por cima.",
+                    "This is the portable copy (zip): download the new zip and extract it over this one."
+                ))
+                .clicked()
                 {
                     page = Some(release.page.clone());
                 }
-                if ui.button(t!("Novidades", "What's new")).clicked() {
+                if kit::ghost_button(ui, Some(Icon::ExternalOpen), t!("Novidades", "What's new"), false).clicked() {
                     page = Some(release.page.clone());
                 }
             });
@@ -836,6 +882,7 @@ impl App {
         if !self.update_note.is_empty() {
             ui.colored_label(ui.visuals().warn_fg_color, &self.update_note);
         }
+        ui.add_space(4.0);
         let mut auto = self.cfg.check_updates;
         ui.checkbox(&mut auto, t!("Verificar automaticamente (uma vez por dia)", "Check automatically (once a day)"))
             .on_hover_text(t!(
@@ -860,141 +907,243 @@ impl App {
 
     fn prefs_ui(&mut self, ctx: &egui::Context) {
         let mut open = self.show_prefs;
+        let pal = theme::current_palette(ctx);
         egui::Window::new(t!("Preferências", "Preferences"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
+            .default_width(500.0)
             .show(ctx, |ui| {
-                ui.strong(t!("Atalho global de captura (Região)", "Global capture shortcut (Region)"));
-                ui.horizontal(|ui| {
-                    hotkey_editor_row(ui, "key", &mut self.hotkey_draft);
-                });
-                ui.collapsing(t!("Atalhos para outros modos", "Shortcuts for other modes"), |ui| {
-                    egui::Grid::new("mode_hotkeys_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                        for (idx, mode) in ALL_SHORTCUT_MODES.iter().copied().enumerate() {
-                            let mut enabled = self.mode_hotkeys_draft.get(mode).is_some();
-                            if ui.checkbox(&mut enabled, mode_hotkey_label(mode)).changed() {
-                                let next = if enabled { Some(HotkeyCfg::default()) } else { None };
-                                self.mode_hotkeys_draft.set(mode, next);
-                            }
+                egui::ScrollArea::vertical()
+                    .max_height(560.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 8.0;
+
+                        kit::section_card(ui, t!("Aparência", "Appearance"), |ui| {
                             ui.horizontal(|ui| {
-                                if let Some(hk) = self.mode_hotkeys_draft.get_mut(mode) {
-                                    hotkey_editor_row(ui, ("mode_hk", idx), hk);
-                                } else {
-                                    ui.weak(t!("Desativado", "Disabled"));
+                                ui.label(egui::RichText::new(t!("Idioma:", "Language:")).color(pal.text_secondary));
+                                let mut lang = i18n::current();
+                                egui::ComboBox::from_id_salt("language")
+                                    .selected_text(lang.name())
+                                    .width(180.0)
+                                    .show_ui(ui, |ui| {
+                                        for option in i18n::Lang::ALL {
+                                            ui.selectable_value(&mut lang, option, option.name());
+                                        }
+                                    });
+                                if lang != i18n::current() {
+                                    self.set_language(lang);
                                 }
                             });
-                            ui.end_row();
-                        }
-                    });
-                });
-                ui.horizontal(|ui| {
-                    let changed = self.hotkey_draft != self.cfg.hotkey || self.mode_hotkeys_draft != self.cfg.mode_hotkeys;
-                    if ui.add_enabled(changed, egui::Button::new(t!("Aplicar atalhos", "Apply shortcuts"))).clicked() {
-                        let primary = self.hotkey_draft.clone();
-                        let modes = self.mode_hotkeys_draft.clone();
-                        match self.apply_hotkeys(&primary, &modes) {
-                            Ok(()) => {
-                                self.cfg.hotkey = primary;
-                                self.cfg.mode_hotkeys = modes;
-                                self.save_cfg();
-                                if let Some(tray) = &self.tray {
-                                    tray.relabel(&self.cfg.hotkey.label());
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(t!(
+                                    "Tema da interface (muda as cores na hora):",
+                                    "Interface theme (updates colors right away):"
+                                ))
+                                .size(12.0)
+                                .color(pal.text_secondary),
+                            );
+                            ui.add_space(4.0);
+                            let mut picked_theme: Option<String> = None;
+                            egui::Grid::new("theme_swatch_grid")
+                                .num_columns(3)
+                                .spacing([6.0, 6.0])
+                                .show(ui, |ui| {
+                                    for (idx, t_item) in theme::THEMES.iter().enumerate() {
+                                        let active = self.cfg.theme == t_item.name;
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(146.0, 34.0),
+                                            Sense::click(),
+                                        );
+                                        if resp.hovered() {
+                                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                        let chip_bg = if active {
+                                            pal.accent.gamma_multiply(0.14)
+                                        } else if resp.hovered() {
+                                            pal.bg_elevated
+                                        } else {
+                                            pal.bg_chrome
+                                        };
+                                        let chip_border = if active {
+                                            Stroke::new(1.5, pal.accent)
+                                        } else if resp.hovered() {
+                                            Stroke::new(1.0, pal.border_strong)
+                                        } else {
+                                            Stroke::new(1.0, pal.border_subtle)
+                                        };
+                                        let p = ui.painter_at(rect);
+                                        p.rect_filled(rect, CornerRadius::same(7), chip_bg);
+                                        p.rect_stroke(rect, CornerRadius::same(7), chip_border, StrokeKind::Inside);
+
+                                        let sw_center = Pos2::new(rect.min.x + 16.0, rect.center().y);
+                                        p.circle_filled(sw_center, 8.0, t_item.panel_fill);
+                                        p.circle_stroke(sw_center, 8.0, Stroke::new(1.0, pal.border_strong));
+                                        p.circle_filled(sw_center + egui::vec2(4.0, 2.0), 4.5, t_item.accent);
+
+                                        let name = theme::display_name(t_item.name);
+                                        let font = if active {
+                                            egui::FontId::new(11.5, theme::semibold_family())
+                                        } else {
+                                            egui::FontId::proportional(11.5)
+                                        };
+                                        p.text(
+                                            Pos2::new(rect.min.x + 30.0, rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            name,
+                                            font,
+                                            if active { pal.text_primary } else { pal.text_secondary },
+                                        );
+                                        if active {
+                                            icons::paint(
+                                                &p,
+                                                ctx,
+                                                Icon::Check,
+                                                Pos2::new(rect.max.x - 12.0, rect.center().y),
+                                                12.0,
+                                                pal.accent,
+                                            );
+                                        }
+                                        if resp.clicked() && !active {
+                                            picked_theme = Some(t_item.name.to_owned());
+                                        }
+                                        if idx % 3 == 2 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                            if let Some(name) = picked_theme {
+                                self.cfg.theme = name;
+                                apply_window_theme(ctx, self.shared.hwnd, self.theme());
+                                let accent = self.accent();
+                                if let Some(editor) = &mut self.editor {
+                                    editor.set_accent(accent);
                                 }
-                                self.status = tf!("Atalho global: {}", "Global shortcut: {}", self.cfg.hotkey.label());
+                                if let Some(ve) = &mut self.video_editor {
+                                    ve.set_accent(accent);
+                                }
+                                self.save_cfg();
                             }
-                            Err(e) => {
-                                self.status = e;
+                        });
+
+                        kit::section_card(ui, t!("Atalhos", "Shortcuts"), |ui| {
+                            ui.label(
+                                egui::RichText::new(t!("Atalho global de captura (Região)", "Global capture shortcut (Region)"))
+                                    .size(12.0)
+                                    .color(pal.text_secondary),
+                            );
+                            ui.horizontal(|ui| {
+                                hotkey_editor_row(ui, "key", &mut self.hotkey_draft);
+                            });
+                            ui.collapsing(t!("Atalhos para outros modos", "Shortcuts for other modes"), |ui| {
+                                egui::Grid::new("mode_hotkeys_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                                    for (idx, mode) in ALL_SHORTCUT_MODES.iter().copied().enumerate() {
+                                        let mut enabled = self.mode_hotkeys_draft.get(mode).is_some();
+                                        if ui.checkbox(&mut enabled, mode_hotkey_label(mode)).changed() {
+                                            let next = if enabled { Some(HotkeyCfg::default()) } else { None };
+                                            self.mode_hotkeys_draft.set(mode, next);
+                                        }
+                                        ui.horizontal(|ui| {
+                                            if let Some(hk) = self.mode_hotkeys_draft.get_mut(mode) {
+                                                hotkey_editor_row(ui, ("mode_hk", idx), hk);
+                                            } else {
+                                                ui.weak(t!("Desativado", "Disabled"));
+                                            }
+                                        });
+                                        ui.end_row();
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                let changed = self.hotkey_draft != self.cfg.hotkey || self.mode_hotkeys_draft != self.cfg.mode_hotkeys;
+                                if ui
+                                    .add_enabled_ui(changed, |ui| {
+                                        kit::primary_button(ui, Some(Icon::Check), t!("Aplicar atalhos", "Apply shortcuts"))
+                                    })
+                                    .inner
+                                    .clicked()
+                                {
+                                    let primary = self.hotkey_draft.clone();
+                                    let modes = self.mode_hotkeys_draft.clone();
+                                    match self.apply_hotkeys(&primary, &modes) {
+                                        Ok(()) => {
+                                            self.cfg.hotkey = primary;
+                                            self.cfg.mode_hotkeys = modes;
+                                            self.save_cfg();
+                                            if let Some(tray) = &self.tray {
+                                                tray.relabel(&self.cfg.hotkey.label());
+                                            }
+                                            self.status = tf!("Atalho global: {}", "Global shortcut: {}", self.cfg.hotkey.label());
+                                        }
+                                        Err(e) => {
+                                            self.status = e;
+                                        }
+                                    }
+                                }
+                                ui.label(
+                                    egui::RichText::new(tf!("Atual: {}", "Current: {}", self.cfg.hotkey.label()))
+                                        .size(12.0)
+                                        .color(pal.text_muted),
+                                );
+                            });
+                        });
+
+                        kit::section_card(ui, t!("Captura", "Capture"), |ui| {
+                            let mut quick = self.cfg.quick_annotate;
+                            ui.checkbox(
+                                &mut quick,
+                                t!(
+                                    "Depois de escolher a região, anotar ali mesmo (Enter copia)",
+                                    "After choosing the region, annotate right there (Enter copies)"
+                                ),
+                            )
+                            .on_hover_text(t!(
+                                "Desligado, a captura de região abre direto no editor completo.",
+                                "When off, a region capture opens straight in the full editor."
+                            ));
+                            if quick != self.cfg.quick_annotate {
+                                self.cfg.quick_annotate = quick;
+                                self.save_cfg();
                             }
-                        }
-                    }
-                    ui.label(tf!("Atual: {}", "Current: {}", self.cfg.hotkey.label()));
-                });
-                ui.separator();
-                let mut quick = self.cfg.quick_annotate;
-                ui.checkbox(
-                    &mut quick,
-                    t!(
-                        "Depois de escolher a região, anotar ali mesmo (Enter copia)",
-                        "After choosing the region, annotate right there (Enter copies)"
-                    ),
-                )
-                .on_hover_text(t!(
-                    "Desligado, a captura de região abre direto no editor completo.",
-                    "When off, a region capture opens straight in the full editor."
-                ));
-                if quick != self.cfg.quick_annotate {
-                    self.cfg.quick_annotate = quick;
-                    self.save_cfg();
-                }
-                ui.separator();
-                ui.strong(t!("Idioma", "Language"));
-                let mut lang = i18n::current();
-                egui::ComboBox::from_id_salt("language")
-                    .selected_text(lang.name())
-                    .width(180.0)
-                    .show_ui(ui, |ui| {
-                        for option in i18n::Lang::ALL {
-                            ui.selectable_value(&mut lang, option, option.name());
-                        }
+                        });
+
+                        kit::section_card(ui, t!("Sistema", "System"), |ui| {
+                            let tray_ok = self.tray.is_some();
+                            let mut close_to_tray = self.cfg.close_to_tray;
+                            ui.add_enabled(
+                                tray_ok,
+                                egui::Checkbox::new(
+                                    &mut close_to_tray,
+                                    t!("Fechar a janela mantém o SnapKit na bandeja", "Closing the window keeps SnapKit in the tray"),
+                                ),
+                            );
+                            if close_to_tray != self.cfg.close_to_tray {
+                                self.cfg.close_to_tray = close_to_tray;
+                                self.save_cfg();
+                            }
+                            let mut autostart = self.autostart;
+                            ui.checkbox(&mut autostart, t!("Iniciar com o Windows (na bandeja)", "Start with Windows (in the tray)"));
+                            if autostart != self.autostart {
+                                match autostart::set_enabled(autostart) {
+                                    Ok(()) => self.autostart = autostart,
+                                    Err(e) => self.status = tf!("Não foi possível alterar a inicialização: {e}", "Could not change the startup setting: {e}"),
+                                }
+                            }
+                            if !tray_ok {
+                                ui.colored_label(
+                                    pal.warning,
+                                    t!("O ícone da bandeja não pôde ser criado nesta sessão.", "The tray icon could not be created in this session."),
+                                );
+                            }
+                        });
+
+                        kit::section_card(ui, t!("Atualizações", "Updates"), |ui| {
+                            self.updates_ui(ui);
+                        });
                     });
-                if lang != i18n::current() {
-                    self.set_language(lang);
-                }
-                ui.separator();
-                ui.strong(t!("Tema da interface", "Interface theme"));
-                let mut name = self.cfg.theme.clone();
-                let theme_combo = egui::ComboBox::from_id_salt("theme")
-                    .selected_text(theme::display_name(&name))
-                    .width(180.0)
-                    .show_ui(ui, |ui| {
-                        for theme in theme::THEMES.iter() {
-                            ui.selectable_value(&mut name, theme.name.to_owned(), theme::display_name(theme.name));
-                        }
-                    });
-                theme_combo.response.on_hover_text(t!(
-                    "Muda as cores da interface e do editor, na hora.",
-                    "Changes the colors of the interface and the editor right away."
-                ));
-                if name != self.cfg.theme {
-                    self.cfg.theme = name;
-                    theme::apply(ctx, self.theme());
-                    let accent = self.accent();
-                    if let Some(editor) = &mut self.editor {
-                        editor.set_accent(accent);
-                    }
-                    if let Some(ve) = &mut self.video_editor {
-                        ve.set_accent(accent);
-                    }
-                    self.save_cfg();
-                }
-                ui.separator();
-                let tray_ok = self.tray.is_some();
-                let mut close_to_tray = self.cfg.close_to_tray;
-                ui.add_enabled(
-                    tray_ok,
-                    egui::Checkbox::new(
-                        &mut close_to_tray,
-                        t!("Fechar a janela mantém o SnapKit na bandeja", "Closing the window keeps SnapKit in the tray"),
-                    ),
-                );
-                if close_to_tray != self.cfg.close_to_tray {
-                    self.cfg.close_to_tray = close_to_tray;
-                    self.save_cfg();
-                }
-                let mut autostart = self.autostart;
-                ui.checkbox(&mut autostart, t!("Iniciar com o Windows (na bandeja)", "Start with Windows (in the tray)"));
-                if autostart != self.autostart {
-                    match autostart::set_enabled(autostart) {
-                        Ok(()) => self.autostart = autostart,
-                        Err(e) => self.status = tf!("Não foi possível alterar a inicialização: {e}", "Could not change the startup setting: {e}"),
-                    }
-                }
-                if !tray_ok {
-                    ui.label(t!("O ícone da bandeja não pôde ser criado nesta sessão.", "The tray icon could not be created in this session."));
-                }
-                ui.separator();
-                self.updates_ui(ui);
             });
         self.show_prefs = open;
     }
@@ -1053,9 +1202,17 @@ impl App {
             .default_size([420.0, 280.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    copy = ui.button(t!("📋 Copiar", "📋 Copy")).clicked();
+                    copy = kit::primary_button(ui, Some(Icon::Copy), t!("Copiar", "Copy")).clicked();
                     reread = ui
-                        .add_enabled(can_reread, egui::Button::new(t!("✍ Ler como manuscrito", "✍ Read as handwriting")))
+                        .add_enabled_ui(can_reread, |ui| {
+                            kit::ghost_button(
+                                ui,
+                                Some(Icon::Edit),
+                                t!("Ler como manuscrito", "Read as handwriting"),
+                                false,
+                            )
+                        })
+                        .inner
                         .on_hover_text(t!(
                             "Relê a mesma área com o motor neural. Melhor para letra manuscrita ou \
                              decorativa; pior para código (perde maiúsculas).",
@@ -1063,8 +1220,9 @@ impl App {
                              decorative lettering; worse for code (loses capital letters)."
                         ))
                         .clicked();
-                    ui.label(t!("Você pode corrigir o texto antes de copiar.", "You can fix the text before copying."));
+                    ui.weak(t!("Você pode corrigir o texto antes de copiar.", "You can fix the text before copying."));
                 });
+                ui.add_space(4.0);
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.add(egui::TextEdit::multiline(text).desired_width(f32::INFINITY).desired_rows(10));
                 });
@@ -1444,35 +1602,158 @@ impl App {
 
     fn library_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let pal = theme::current_palette(&ctx);
         self.selected_files.retain(|f| self.library.get(f).is_some());
-        ui.add_space(6.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut self.search)
-                .hint_text(t!(
-                    "Buscar por janela, etiqueta ou data",
-                    "Search by window, tag or date"
-                ))
-                .desired_width(f32::INFINITY),
-        );
-        ui.add_space(4.0);
+
+        // Search input
+        egui::Frame::NONE
+            .fill(pal.bg_surface)
+            .stroke(Stroke::new(1.0, pal.border_subtle))
+            .corner_radius(CornerRadius::same(7))
+            .inner_margin(Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let (ic_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 18.0), Sense::hover());
+                    icons::paint(ui.painter(), &ctx, Icon::Search, ic_rect.center(), 14.0, pal.text_muted);
+                    let clear_w = if self.search.is_empty() { 0.0 } else { 24.0 };
+                    let edit_w = (ui.available_width() - clear_w).max(40.0);
+                    ui.add_sized(
+                        egui::vec2(edit_w, 20.0),
+                        egui::TextEdit::singleline(&mut self.search)
+                            .frame(egui::Frame::NONE)
+                            .margin(Margin::symmetric(0, 2))
+                            .hint_text(t!(
+                                "Buscar por janela, etiqueta ou data",
+                                "Search by window, tag or date"
+                            )),
+                    );
+                    if !self.search.is_empty()
+                        && kit::icon_button(ui, Icon::Close, false, 20.0)
+                            .on_hover_text(t!("Limpar busca", "Clear search"))
+                            .clicked()
+                    {
+                        self.search.clear();
+                    }
+                });
+            });
+        ui.add_space(5.0);
+
+        // Single-row segmented filter bar
         let (total_count, img_count, vid_count) = self.library.counts();
         let fav_count = self.library.favorite_count();
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (filter, label) in [
-                (library::MediaFilter::All, tf!("Todas ({total_count})", "All ({total_count})")),
-                (library::MediaFilter::Favorites, tf!("★ ({fav_count})", "★ ({fav_count})")),
-                (library::MediaFilter::Images, tf!("Imagens ({img_count})", "Images ({img_count})")),
-                (library::MediaFilter::Videos, tf!("Vídeos ({vid_count})", "Videos ({vid_count})")),
-            ] {
-                if ui
-                    .selectable_label(self.library_filter == filter, label)
-                    .clicked()
-                {
-                    self.library_filter = filter;
-                }
-            }
-        });
+        let filters = [
+            (
+                library::MediaFilter::All,
+                None,
+                t!("Todas", "All").to_owned(),
+                tf!("Todas ({total_count})", "All ({total_count})"),
+            ),
+            (
+                library::MediaFilter::Favorites,
+                Some(Icon::StarFilled),
+                format!("{fav_count}"),
+                tf!("Favoritas ({fav_count})", "Favorites ({fav_count})"),
+            ),
+            (
+                library::MediaFilter::Images,
+                None,
+                t!("Img", "Img").to_owned(),
+                tf!("Imagens ({img_count})", "Images ({img_count})"),
+            ),
+            (
+                library::MediaFilter::Videos,
+                None,
+                t!("Víd", "Vid").to_owned(),
+                tf!("Vídeos ({vid_count})", "Videos ({vid_count})"),
+            ),
+        ];
+        egui::Frame::NONE
+            .fill(pal.bg_surface)
+            .stroke(Stroke::new(1.0, pal.border_subtle))
+            .corner_radius(CornerRadius::same(7))
+            .inner_margin(Margin::same(2))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let seg_w = ((ui.available_width() - 6.0) / 4.0).max(28.0);
+                    for (filter, icon, short_label, tip) in filters {
+                        let active = self.library_filter == filter;
+                        let (seg_rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(seg_w, 24.0), Sense::click());
+                        if resp.hovered() {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        let bg = if active {
+                            pal.accent.gamma_multiply(0.18)
+                        } else if resp.hovered() {
+                            pal.bg_elevated
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let fg = if active {
+                            pal.accent
+                        } else if resp.hovered() {
+                            pal.text_primary
+                        } else {
+                            pal.text_secondary
+                        };
+                        let p = ui.painter_at(seg_rect);
+                        if bg.a() > 0 {
+                            p.rect_filled(seg_rect, CornerRadius::same(5), bg);
+                        }
+                        if active {
+                            p.rect_stroke(
+                                seg_rect,
+                                CornerRadius::same(5),
+                                Stroke::new(1.0, pal.accent.gamma_multiply(0.55)),
+                                StrokeKind::Inside,
+                            );
+                        }
+                        let font = if active {
+                            egui::FontId::new(11.5, theme::semibold_family())
+                        } else {
+                            egui::FontId::proportional(11.5)
+                        };
+                        if let Some(ic) = icon {
+                            let g = p.layout_no_wrap(short_label.clone(), font.clone(), fg);
+                            let total_w = 12.0 + 3.0 + g.size().x;
+                            let start_x = seg_rect.center().x - total_w * 0.5;
+                            let ic_color = if active {
+                                pal.accent
+                            } else {
+                                Color32::from_rgb(245, 196, 66)
+                            };
+                            icons::paint(
+                                &p,
+                                &ctx,
+                                ic,
+                                Pos2::new(start_x + 6.0, seg_rect.center().y),
+                                11.5,
+                                ic_color,
+                            );
+                            p.galley(
+                                Pos2::new(start_x + 15.0, seg_rect.center().y - g.size().y * 0.5),
+                                g,
+                                fg,
+                            );
+                        } else {
+                            p.text(
+                                seg_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                &short_label,
+                                font,
+                                fg,
+                            );
+                        }
+                        if resp.on_hover_text(tip).clicked() {
+                            self.library_filter = filter;
+                        }
+                    }
+                });
+            });
+
+        ui.add_space(4.0);
         let entries: Vec<library::Entry> = match self.library_filter {
             library::MediaFilter::All => self.library.search(&self.search),
             filter => self.library.search_filtered(&self.search, filter),
@@ -1481,9 +1762,16 @@ impl App {
         .cloned()
         .collect();
         ui.horizontal(|ui| {
-            ui.label(tf!("{} de {} itens", "{} of {} items", entries.len(), self.library.len()));
+            ui.label(
+                egui::RichText::new(tf!("{} de {} itens", "{} of {} items", entries.len(), self.library.len()))
+                    .size(11.5)
+                    .color(pal.text_muted),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button(t!("Abrir pasta", "Open folder")).clicked() {
+                if kit::small_ghost_button(ui, Some(Icon::Folder), t!("Pasta", "Folder"), false)
+                    .on_hover_text(t!("Abrir pasta", "Open folder"))
+                    .clicked()
+                {
                     let _ = std::fs::create_dir_all(self.library.dir());
                     let _ = std::process::Command::new("explorer").arg(self.library.dir()).spawn();
                 }
@@ -1497,24 +1785,30 @@ impl App {
         let mut batch_combine: Option<bool> = None;
 
         if !self.selected_files.is_empty() {
-            ui.add_space(2.0);
+            ui.add_space(4.0);
             let selected_img_count = self
                 .selected_files
                 .iter()
                 .filter(|f| !f.to_ascii_lowercase().ends_with(".mp4"))
                 .count();
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::same(6))
+            egui::Frame::NONE
+                .fill(pal.bg_surface)
+                .stroke(Stroke::new(1.0, pal.accent.gamma_multiply(0.7)))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(8))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.strong(tf!(
-                            "{} selecionadas",
-                            "{} selected",
-                            self.selected_files.len()
-                        ));
+                        ui.label(
+                            kit::semibold(tf!(
+                                "{} selecionadas",
+                                "{} selected",
+                                self.selected_files.len()
+                            ))
+                            .size(12.0)
+                            .color(pal.text_primary),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button("✕")
+                            if kit::icon_button(ui, Icon::Close, false, 22.0)
                                 .on_hover_text(t!("Limpar seleção", "Clear selection"))
                                 .clicked()
                             {
@@ -1522,10 +1816,10 @@ impl App {
                             }
                         });
                     });
+                    ui.add_space(3.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        if ui
-                            .small_button(t!("🗑 Apagar", "🗑 Delete"))
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        if kit::small_ghost_button(ui, Some(Icon::Trash), t!("Apagar", "Delete"), false)
                             .on_hover_text(t!(
                                 "Move todas as selecionadas para a Lixeira",
                                 "Moves all selected items to the Recycle Bin"
@@ -1534,8 +1828,7 @@ impl App {
                         {
                             batch_delete = true;
                         }
-                        if ui
-                            .small_button(t!("📂 Exportar…", "📂 Export…"))
+                        if kit::small_ghost_button(ui, Some(Icon::Folder), t!("Exportar…", "Export…"), false)
                             .on_hover_text(t!(
                                 "Copia os arquivos selecionados para uma pasta",
                                 "Copies the selected files to a folder"
@@ -1545,8 +1838,7 @@ impl App {
                             batch_export = true;
                         }
                         if selected_img_count >= 1
-                            && ui
-                                .small_button("📄 PDF")
+                            && kit::small_ghost_button(ui, Some(Icon::FilePdf), "PDF", false)
                                 .on_hover_text(t!(
                                     "Exporta as imagens selecionadas em um único PDF",
                                     "Exports selected images into a single PDF"
@@ -1555,26 +1847,23 @@ impl App {
                         {
                             batch_pdf = true;
                         }
-                        if ui
-                            .small_button(t!("📋 Copiar", "📋 Copy"))
-                            .on_hover_text(t!("📋 Copiar arquivos", "📋 Copy files"))
+                        if kit::small_ghost_button(ui, Some(Icon::Copy), t!("Copiar", "Copy"), false)
+                            .on_hover_text(t!("Copiar arquivos", "Copy files"))
                             .clicked()
                         {
                             batch_copy = Some(self.selected_files.clone());
                         }
                         if selected_img_count >= 2 {
-                            if ui
-                                .small_button(t!("↕ Juntar V", "↕ Combine V"))
-                                .on_hover_text(t!("↕ Juntar (Vertical)", "↕ Combine (Vertical)"))
+                            if kit::small_ghost_button(ui, Some(Icon::CombineV), t!("Juntar V", "Combine V"), false)
+                                .on_hover_text(t!("Juntar (Vertical)", "Combine (Vertical)"))
                                 .clicked()
                             {
                                 batch_combine = Some(true);
                             }
-                            if ui
-                                .small_button(t!("↔ Juntar H", "↔ Combine H"))
+                            if kit::small_ghost_button(ui, Some(Icon::CombineH), t!("Juntar H", "Combine H"), false)
                                 .on_hover_text(t!(
-                                    "↔ Juntar (Horizontal)",
-                                    "↔ Combine (Horizontal)"
+                                    "Juntar (Horizontal)",
+                                    "Combine (Horizontal)"
                                 ))
                                 .clicked()
                             {
@@ -1585,7 +1874,7 @@ impl App {
                 });
         }
 
-        ui.separator();
+        kit::divider_h(ui);
 
         let mut to_open = None;
         let mut to_delete = None;
@@ -1593,45 +1882,60 @@ impl App {
         let mut to_toggle_fav: Option<String> = None;
         let mut to_edit_meta: Option<(String, String, String)> = None;
         let mut to_drag: Option<Vec<std::path::PathBuf>> = None;
-        let thumb_h = 96.0;
-        let row_h = thumb_h + 44.0;
+        let thumb_h = 98.0;
+        let card_gap = 8.0;
+        let row_h = thumb_h + 56.0;
         let accent = self.accent();
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, entries.len(), |ui, rows| {
             for entry in &entries[rows] {
                 let selected = self.current_file.as_deref() == Some(entry.file.as_str());
                 let multi_selected = self.selected_files.iter().any(|f| f == &entry.file);
-                let (rect, response) = ui.allocate_exact_size(
+                let (outer_rect, response) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), row_h),
                     Sense::click_and_drag(),
                 );
-                if selected || multi_selected || response.hovered() {
-                    let fill = if selected || multi_selected {
-                        accent.gamma_multiply(0.25)
-                    } else {
-                        ui.visuals().widgets.hovered.weak_bg_fill
-                    };
-                    ui.painter().rect_filled(rect, 6.0, fill);
-                    if multi_selected {
-                        ui.painter().rect_stroke(
-                            rect,
-                            6.0,
-                            Stroke::new(1.5, accent),
-                            StrokeKind::Inside,
-                        );
-                    }
+                let rect = outer_rect.shrink2(egui::vec2(0.0, card_gap * 0.5));
+                let hovered = response.hovered();
+                let hover_t = ctx.animate_bool_responsive(response.id.with("card_h"), hovered);
+                if hovered {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
+
+                let card_fill = if hover_t > 0.01 {
+                    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * hover_t).round() as u8;
+                    Color32::from_rgb(
+                        mix(pal.bg_surface.r(), pal.bg_elevated.r()),
+                        mix(pal.bg_surface.g(), pal.bg_elevated.g()),
+                        mix(pal.bg_surface.b(), pal.bg_elevated.b()),
+                    )
+                } else {
+                    pal.bg_surface
+                };
+                let card_stroke = if selected || multi_selected {
+                    Stroke::new(1.5, accent)
+                } else if hovered {
+                    Stroke::new(1.0, pal.border_strong)
+                } else {
+                    Stroke::new(1.0, pal.border_subtle)
+                };
+                ui.painter().rect_filled(rect, CornerRadius::same(8), card_fill);
+                ui.painter().rect_stroke(rect, CornerRadius::same(8), card_stroke, StrokeKind::Inside);
+
                 let inner = rect.shrink(6.0);
-                let mut thumb_rect = Rect::from_min_size(inner.min, egui::vec2(inner.width(), thumb_h));
+                let thumb_box = Rect::from_min_size(inner.min, egui::vec2(inner.width(), thumb_h));
+                ui.painter().rect_filled(thumb_box, CornerRadius::same(6), pal.bg_canvas);
+                let mut thumb_rect = thumb_box;
                 if let Some(tex) = self.thumb_texture(&ctx, &entry.file) {
                     let size = tex.size_vec2();
-                    let scale = (inner.width() / size.x).min(thumb_h / size.y).min(1.0);
-                    let img_rect = Rect::from_min_size(inner.min, size * scale);
+                    let scale = (thumb_box.width() / size.x).min(thumb_box.height() / size.y).min(1.0);
+                    let img_rect = Rect::from_center_size(thumb_box.center(), size * scale);
                     thumb_rect = img_rect;
                     let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
                     ui.painter().image(tex.id(), img_rect, uv, Color32::WHITE);
                 }
+
                 let painter = ui.painter_at(inner);
-                // Overlay media type badge (MP4 / GIF) and duration pill over thumbnail
+                // Overlay media type badge (MP4 / GIF) and duration pill over thumbnail box
                 if entry.is_video() || entry.is_gif() {
                     let badge_text = if entry.is_video() { "MP4" } else { "GIF" };
                     let badge_bg = if entry.is_video() {
@@ -1646,69 +1950,128 @@ impl App {
                     };
                     let b_galley = painter.layout_no_wrap(
                         badge_text.to_owned(),
-                        egui::FontId::proportional(10.0),
+                        egui::FontId::new(10.0, theme::semibold_family()),
                         badge_fg,
                     );
-                    let b_pos = thumb_rect.min + egui::vec2(5.0, 5.0);
+                    let b_pos = thumb_box.min + egui::vec2(5.0, 5.0);
                     let b_rect = Rect::from_min_size(b_pos, b_galley.size() + egui::vec2(8.0, 3.0));
-                    painter.rect_filled(b_rect, 3.0, badge_bg);
+                    painter.rect_filled(b_rect, 4.0, badge_bg);
                     painter.galley(b_pos + egui::vec2(4.0, 1.5), b_galley, badge_fg);
 
                     if entry.duration_secs > 0.0 {
-                        let dur_str = format!("▶ {}", format_duration_short(entry.duration_secs));
+                        let dur_str = format_duration_short(entry.duration_secs);
                         let d_galley = painter.layout_no_wrap(
                             dur_str,
-                            egui::FontId::proportional(10.5),
+                            egui::FontId::proportional(10.0),
                             Color32::WHITE,
                         );
-                        let d_size = d_galley.size() + egui::vec2(10.0, 4.0);
+                        let d_size = d_galley.size() + egui::vec2(20.0, 4.0);
                         let d_pos = Pos2::new(
-                            (thumb_rect.max.x - d_size.x - 5.0).max(thumb_rect.min.x + 4.0),
-                            (thumb_rect.max.y - d_size.y - 5.0).max(thumb_rect.min.y + 4.0),
+                            (thumb_box.max.x - d_size.x - 5.0).max(thumb_box.min.x + 4.0),
+                            (thumb_box.max.y - d_size.y - 5.0).max(thumb_box.min.y + 4.0),
                         );
                         let d_rect = Rect::from_min_size(d_pos, d_size);
                         painter.rect_filled(d_rect, 4.0, Color32::from_black_alpha(185));
-                        painter.galley(d_pos + egui::vec2(5.0, 2.0), d_galley, Color32::WHITE);
+                        icons::paint(
+                            &painter,
+                            &ctx,
+                            Icon::Play,
+                            Pos2::new(d_rect.min.x + 8.0, d_rect.center().y),
+                            9.0,
+                            Color32::WHITE,
+                        );
+                        painter.galley(d_pos + egui::vec2(14.0, 2.0), d_galley, Color32::WHITE);
                     }
                 }
+                let _ = thumb_rect;
+
                 if multi_selected {
                     let check_rect = Rect::from_min_size(
-                        Pos2::new(inner.max.x - 20.0, inner.min.y + 4.0),
-                        egui::vec2(16.0, 16.0),
+                        Pos2::new(thumb_box.min.x + 5.0, thumb_box.min.y + if entry.is_video() || entry.is_gif() { 26.0 } else { 5.0 }),
+                        egui::vec2(18.0, 18.0),
                     );
-                    painter.rect_filled(check_rect, 4.0, accent);
-                    painter.text(
-                        check_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "✓",
-                        egui::FontId::proportional(11.0),
-                        theme::text_on(accent),
-                    );
+                    painter.rect_filled(check_rect, 5.0, accent);
+                    icons::paint(&painter, &ctx, Icon::Check, check_rect.center(), 12.0, theme::text_on(accent));
                 }
-                if entry.favorite {
-                    let fav_x = if multi_selected {
-                        inner.max.x - 40.0
-                    } else {
-                        inner.max.x - 20.0
-                    };
-                    let fav_rect = Rect::from_min_size(
-                        Pos2::new(fav_x, inner.min.y + 4.0),
-                        egui::vec2(16.0, 16.0),
+
+                // Quick hover action pill (top-right of thumb_box)
+                #[derive(Clone, Copy)]
+                enum QuickCardAct {
+                    Fav,
+                    Pin,
+                    Delete,
+                }
+                let mut action_slots: [(Rect, QuickCardAct); 3] = [(Rect::ZERO, QuickCardAct::Fav); 3];
+                let mut action_count = 0usize;
+                if hovered {
+                    let mut items = Vec::with_capacity(3);
+                    items.push((QuickCardAct::Fav, if entry.favorite { Icon::StarFilled } else { Icon::Star }));
+                    if !entry.is_video() {
+                        items.push((QuickCardAct::Pin, Icon::Pin));
+                    }
+                    items.push((QuickCardAct::Delete, Icon::Trash));
+                    let slot_w = 22.0;
+                    let slot_h = 20.0;
+                    let pill_w = items.len() as f32 * slot_w + 4.0;
+                    let pill_rect = Rect::from_min_size(
+                        Pos2::new(thumb_box.max.x - pill_w - 5.0, thumb_box.min.y + 5.0),
+                        egui::vec2(pill_w, slot_h + 2.0),
                     );
-                    painter.rect_filled(fav_rect, 4.0, Color32::from_black_alpha(175));
-                    painter.text(
+                    painter.rect_filled(pill_rect, CornerRadius::same(6), Color32::from_black_alpha(190));
+                    painter.rect_stroke(
+                        pill_rect,
+                        CornerRadius::same(6),
+                        Stroke::new(1.0, Color32::from_white_alpha(30)),
+                        StrokeKind::Inside,
+                    );
+                    let pointer = ctx.pointer_hover_pos();
+                    for (idx, (act, ic)) in items.into_iter().enumerate() {
+                        let sr = Rect::from_min_size(
+                            Pos2::new(pill_rect.min.x + 2.0 + idx as f32 * slot_w, pill_rect.min.y + 1.0),
+                            egui::vec2(slot_w, slot_h),
+                        );
+                        let over = pointer.is_some_and(|p| sr.contains(p));
+                        if over {
+                            painter.rect_filled(sr, CornerRadius::same(4), Color32::from_white_alpha(32));
+                        }
+                        let tint = match act {
+                            QuickCardAct::Fav if entry.favorite => Color32::from_rgb(255, 204, 51),
+                            QuickCardAct::Delete if over => pal.danger,
+                            _ => Color32::WHITE,
+                        };
+                        icons::paint(&painter, &ctx, ic, sr.center(), 12.0, tint);
+                        action_slots[action_count] = (sr, act);
+                        action_count += 1;
+                    }
+                } else if entry.favorite {
+                    let fav_rect = Rect::from_min_size(
+                        Pos2::new(thumb_box.max.x - 23.0, thumb_box.min.y + 5.0),
+                        egui::vec2(18.0, 18.0),
+                    );
+                    painter.rect_filled(fav_rect, 5.0, Color32::from_black_alpha(175));
+                    icons::paint(
+                        &painter,
+                        &ctx,
+                        Icon::StarFilled,
                         fav_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "★",
-                        egui::FontId::proportional(11.5),
+                        11.5,
                         Color32::from_rgb(255, 204, 51),
                     );
                 }
-                let text_top = inner.min + egui::vec2(0.0, thumb_h + 2.0);
+
+                let text_rect = Rect::from_min_max(
+                    Pos2::new(inner.min.x, thumb_box.max.y + 5.0),
+                    inner.max,
+                );
+                let text_painter = ui.painter_at(text_rect);
                 let title = if entry.title.is_empty() { t!("(sem título)", "(untitled)") } else { &entry.title };
-                // Theme colors: a fixed white disappeared on the light theme's background.
-                let (title_color, detail_color) = (ui.visuals().strong_text_color(), ui.visuals().weak_text_color());
-                painter.text(text_top, egui::Align2::LEFT_TOP, title, egui::FontId::proportional(12.5), title_color);
+                text_painter.text(
+                    text_rect.min,
+                    egui::Align2::LEFT_TOP,
+                    title,
+                    egui::FontId::new(12.5, theme::semibold_family()),
+                    pal.text_primary,
+                );
                 let mut detail = if entry.duration_secs > 0.0 && entry.width > 0 && entry.height > 0 {
                     format!(
                         "{}  •  {}×{}  •  {}",
@@ -1732,50 +2095,68 @@ impl App {
                     detail.push_str("  •  ");
                     detail.push_str(&tags_str);
                 }
-                painter.text(
-                    text_top + egui::vec2(0.0, 16.0),
+                text_painter.text(
+                    text_rect.min + egui::vec2(0.0, 17.0),
                     egui::Align2::LEFT_TOP,
                     detail,
                     egui::FontId::proportional(11.0),
-                    detail_color,
+                    pal.text_muted,
                 );
+
                 if response.clicked() {
-                    let (ctrl, shift) =
-                        ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
-                    if shift {
-                        let anchor = self
-                            .selection_anchor
-                            .clone()
-                            .or_else(|| self.current_file.clone());
-                        if let Some(anchor_file) = anchor
-                            && let Some(a_idx) = entries.iter().position(|e| e.file == anchor_file)
-                            && let Some(b_idx) = entries.iter().position(|e| e.file == entry.file)
-                        {
-                            let (lo, hi) = (a_idx.min(b_idx), a_idx.max(b_idx));
-                            self.selected_files =
-                                entries[lo..=hi].iter().map(|e| e.file.clone()).collect();
-                        } else {
-                            self.selected_files = vec![entry.file.clone()];
-                            self.selection_anchor = Some(entry.file.clone());
+                    let click_pos = response
+                        .interact_pointer_pos()
+                        .or_else(|| ctx.pointer_interact_pos());
+                    let quick_hit = click_pos.and_then(|p| {
+                        action_slots[..action_count]
+                            .iter()
+                            .find(|(sr, _)| sr.contains(p))
+                            .map(|(_, act)| *act)
+                    });
+                    if let Some(act) = quick_hit {
+                        match act {
+                            QuickCardAct::Fav => to_toggle_fav = Some(entry.file.clone()),
+                            QuickCardAct::Pin => to_pin = Some(entry.file.clone()),
+                            QuickCardAct::Delete => to_delete = Some(entry.file.clone()),
                         }
-                    } else if ctrl {
-                        if self.selected_files.is_empty()
-                            && let Some(cur) = &self.current_file
-                            && cur != &entry.file
-                        {
-                            self.selected_files.push(cur.clone());
-                        }
-                        if let Some(pos) = self.selected_files.iter().position(|f| f == &entry.file)
-                        {
-                            self.selected_files.remove(pos);
-                        } else {
-                            self.selected_files.push(entry.file.clone());
-                        }
-                        self.selection_anchor = Some(entry.file.clone());
                     } else {
-                        self.selected_files.clear();
-                        self.selection_anchor = Some(entry.file.clone());
-                        to_open = Some(entry.file.clone());
+                        let (ctrl, shift) =
+                            ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
+                        if shift {
+                            let anchor = self
+                                .selection_anchor
+                                .clone()
+                                .or_else(|| self.current_file.clone());
+                            if let Some(anchor_file) = anchor
+                                && let Some(a_idx) = entries.iter().position(|e| e.file == anchor_file)
+                                && let Some(b_idx) = entries.iter().position(|e| e.file == entry.file)
+                            {
+                                let (lo, hi) = (a_idx.min(b_idx), a_idx.max(b_idx));
+                                self.selected_files =
+                                    entries[lo..=hi].iter().map(|e| e.file.clone()).collect();
+                            } else {
+                                self.selected_files = vec![entry.file.clone()];
+                                self.selection_anchor = Some(entry.file.clone());
+                            }
+                        } else if ctrl {
+                            if self.selected_files.is_empty()
+                                && let Some(cur) = &self.current_file
+                                && cur != &entry.file
+                            {
+                                self.selected_files.push(cur.clone());
+                            }
+                            if let Some(pos) = self.selected_files.iter().position(|f| f == &entry.file)
+                            {
+                                self.selected_files.remove(pos);
+                            } else {
+                                self.selected_files.push(entry.file.clone());
+                            }
+                            self.selection_anchor = Some(entry.file.clone());
+                        } else {
+                            self.selected_files.clear();
+                            self.selection_anchor = Some(entry.file.clone());
+                            to_open = Some(entry.file.clone());
+                        }
                     }
                 }
                 if response.drag_started() {
@@ -1798,14 +2179,14 @@ impl App {
                     }
                     if !entry.is_video()
                         && ui
-                            .button(t!("📌 Fixar na tela", "📌 Pin to screen"))
+                            .button(t!("Fixar na tela", "Pin to screen"))
                             .clicked()
                     {
                         to_pin = Some(entry.file.clone());
                         ui.close();
                     }
                     if entry.is_video()
-                        && ui.button(t!("▶ Abrir no player", "▶ Open in player")).clicked()
+                        && ui.button(t!("Abrir no player", "Open in player")).clicked()
                     {
                         let _ = std::process::Command::new("explorer")
                             .arg(self.library.path(&entry.file))
@@ -1813,16 +2194,16 @@ impl App {
                         ui.close();
                     }
                     let fav_label = if entry.favorite {
-                        t!("☆ Remover dos favoritos", "☆ Remove from favorites")
+                        t!("Remover dos favoritos", "Remove from favorites")
                     } else {
-                        t!("★ Favoritar", "★ Favorite")
+                        t!("Favoritar", "Favorite")
                     };
                     if ui.button(fav_label).clicked() {
                         to_toggle_fav = Some(entry.file.clone());
                         ui.close();
                     }
                     if ui
-                        .button(t!("✎ Renomear / etiquetas…", "✎ Rename / tags…"))
+                        .button(t!("Renomear / etiquetas…", "Rename / tags…"))
                         .clicked()
                     {
                         to_edit_meta = Some((
@@ -1834,7 +2215,7 @@ impl App {
                     }
                     ui.separator();
                     if ui
-                        .button(t!("📋 Copiar arquivo", "📋 Copy file"))
+                        .button(t!("Copiar arquivo", "Copy file"))
                         .clicked()
                     {
                         batch_copy = Some(vec![entry.file.clone()]);
@@ -1859,14 +2240,14 @@ impl App {
                             self.selected_files.len()
                         ));
                         if ui
-                            .button(t!("📋 Copiar arquivos", "📋 Copy files"))
+                            .button(t!("Copiar arquivos", "Copy files"))
                             .clicked()
                         {
                             batch_copy = Some(self.selected_files.clone());
                             ui.close();
                         }
                         if ui
-                            .button(t!("📂 Exportar…", "📂 Export…"))
+                            .button(t!("Exportar…", "Export…"))
                             .clicked()
                         {
                             batch_export = true;
@@ -1879,7 +2260,7 @@ impl App {
                             .count();
                         if img_count >= 1
                             && ui
-                                .button(t!("📄 Exportar PDF…", "📄 Export PDF…"))
+                                .button(t!("Exportar PDF…", "Export PDF…"))
                                 .clicked()
                         {
                             batch_pdf = true;
@@ -1887,14 +2268,14 @@ impl App {
                         }
                         if img_count >= 2 {
                             if ui
-                                .button(t!("↕ Juntar (Vertical)", "↕ Combine (Vertical)"))
+                                .button(t!("Juntar (Vertical)", "Combine (Vertical)"))
                                 .clicked()
                             {
                                 batch_combine = Some(true);
                                 ui.close();
                             }
                             if ui
-                                .button(t!("↔ Juntar (Horizontal)", "↔ Combine (Horizontal)"))
+                                .button(t!("Juntar (Horizontal)", "Combine (Horizontal)"))
                                 .clicked()
                             {
                                 batch_combine = Some(false);
@@ -1902,7 +2283,7 @@ impl App {
                             }
                         }
                         if ui
-                            .button(t!("🗑 Apagar selecionadas", "🗑 Delete selected"))
+                            .button(t!("Apagar selecionadas", "Delete selected"))
                             .clicked()
                         {
                             batch_delete = true;
@@ -2060,10 +2441,10 @@ impl App {
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button(t!("Salvar", "Save")).clicked() {
+                    if kit::primary_button(ui, Some(Icon::Check), t!("Salvar", "Save")).clicked() {
                         save = true;
                     }
-                    if ui.button(t!("Cancelar", "Cancel")).clicked() {
+                    if kit::ghost_button(ui, None, t!("Cancelar", "Cancel"), false).clicked() {
                         cancel = true;
                     }
                 });
@@ -2307,35 +2688,41 @@ impl App {
         }
         let countdown_deadline = video.countdown_until;
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        let pal = theme::current_palette(ui.ctx());
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(pal.bg_chrome).inner_margin(Margin::symmetric(10, 6)))
+            .show(ui, |ui| {
             ui.horizontal_centered(|ui| match &video.recorder {
                 None => {
                     if let Some(deadline) = countdown_deadline {
+                        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
+                        icons::paint(ui.painter(), ui.ctx(), Icon::RecordDot, dot_rect.center(), 13.0, pal.danger);
                         let rem = deadline
                             .saturating_duration_since(Instant::now())
                             .as_secs_f32()
                             .ceil()
                             .max(1.0) as u32;
-                        ui.colored_label(Color32::from_rgb(235, 64, 52), "●");
                         ui.strong(tf!(
                             "Gravando em {rem} s…",
                             "Recording in {rem} s…"
                         ));
-                        ui.separator();
-                        start_now |= ui
-                            .button(t!("▶ Começar agora", "▶ Start now"))
+                        kit::divider_v(ui, 18.0);
+                        start_now |= kit::primary_button(ui, Some(Icon::Play), t!("Começar agora", "Start now"))
                             .clicked();
-                        cancel = ui.button(t!("Cancelar", "Cancel")).clicked();
+                        cancel = kit::ghost_button(ui, None, t!("Cancelar", "Cancel"), false).clicked();
                     } else {
-                        arm_record = ui
-                            .button(if as_gif {
-                                t!("● Gravar GIF", "● Record GIF")
+                        arm_record = kit::primary_button(
+                            ui,
+                            Some(Icon::RecordDot),
+                            if as_gif {
+                                t!("Gravar GIF", "Record GIF")
                             } else {
-                                t!("● Gravar", "● Record")
-                            })
-                            .clicked();
-                        cancel = ui.button(t!("Cancelar", "Cancel")).clicked();
-                        ui.separator();
+                                t!("Gravar", "Record")
+                            },
+                        )
+                        .clicked();
+                        cancel = kit::ghost_button(ui, None, t!("Cancelar", "Cancel"), false).clicked();
+                        kit::divider_v(ui, 18.0);
 
                         // FPS selector
                         egui::ComboBox::from_id_salt("hud_video_fps")
@@ -2371,11 +2758,11 @@ impl App {
                             if c == 0 {
                                 t!("0s", "0s").to_owned()
                             } else {
-                                format!("⏱ {c}s")
+                                format!("{c}s")
                             }
                         };
                         egui::ComboBox::from_id_salt("hud_video_countdown")
-                            .width(58.0)
+                            .width(52.0)
                             .selected_text(cd_label(countdown))
                             .show_ui(ui, |ui| {
                                 for c in [0u32, 3, 5] {
@@ -2404,15 +2791,19 @@ impl App {
                     }
                 }
                 Some(session) => {
-                    stop |= ui.button(t!("■ Parar", "■ Stop")).clicked();
+                    stop |= kit::primary_button(ui, Some(Icon::Stop), t!("Parar", "Stop")).clicked();
                     let paused = session.is_paused();
-                    toggle_pause = ui
-                        .button(if paused {
+                    toggle_pause = kit::ghost_button(
+                        ui,
+                        Some(if paused { Icon::Play } else { Icon::Pause }),
+                        if paused {
                             t!("Continuar", "Resume")
                         } else {
                             t!("Pausar", "Pause")
-                        })
-                        .clicked();
+                        },
+                        paused,
+                    )
+                    .clicked();
                     let secs = session.elapsed().as_secs();
                     if paused {
                         ui.label(tf!(
@@ -2422,7 +2813,8 @@ impl App {
                             secs % 60
                         ));
                     } else {
-                        ui.colored_label(Color32::from_rgb(235, 64, 52), "●");
+                        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
+                        icons::paint(ui.painter(), ui.ctx(), Icon::RecordDot, dot_rect.center(), 13.0, pal.danger);
                         ui.label(tf!(
                             "Gravando  {:02}:{:02}",
                             "Recording  {:02}:{:02}",
@@ -2794,6 +3186,7 @@ impl App {
         if let Some(pos) = self.normal_pos {
             win::set_window_pos(self.shared.hwnd, pos);
         }
+        self.sync_titlebar();
     }
 
     /// Turns the window into a small panel to control the step-by-step capture.
@@ -2811,12 +3204,15 @@ impl App {
         hud_setup(&ctx, hwnd, steps.rect, STEPS_HUD_SIZE, &mut steps.setup_frames);
 
         let (mut start, mut finish, mut cancel, mut undo) = (false, false, false, false);
-        egui::CentralPanel::default().show(ui, |ui| {
+        let pal = theme::current_palette(ui.ctx());
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(pal.bg_chrome).inner_margin(Margin::symmetric(10, 6)))
+            .show(ui, |ui| {
             ui.horizontal_centered(|ui| match &steps.recorder {
                 None => {
-                    start = ui.button(t!("● Começar", "● Start")).clicked();
-                    cancel = ui.button(t!("Cancelar", "Cancel")).clicked();
-                    ui.separator();
+                    start = kit::primary_button(ui, Some(Icon::RecordDot), t!("Começar", "Start")).clicked();
+                    cancel = kit::ghost_button(ui, None, t!("Cancelar", "Cancel"), false).clicked();
+                    kit::divider_v(ui, 18.0);
                     ui.label(t!(
                         "Depois de começar, cada clique na área (e cada Enter) vira um passo.",
                         "Once started, each click in the area (and each Enter) becomes a step."
@@ -2824,17 +3220,31 @@ impl App {
                 }
                 Some(recorder) => {
                     let count = recorder.count();
-                    finish = ui.add_enabled(count > 0, egui::Button::new(t!("■ Concluir", "■ Finish"))).clicked();
+                    finish = ui
+                        .add_enabled_ui(count > 0, |ui| {
+                            kit::primary_button(ui, Some(Icon::Stop), t!("Concluir", "Finish"))
+                        })
+                        .inner
+                        .clicked();
                     undo = ui
-                        .add_enabled(count > 0, egui::Button::new(t!("Tirar o último", "Remove the last one")))
+                        .add_enabled_ui(count > 0, |ui| {
+                            kit::ghost_button(
+                                ui,
+                                Some(Icon::Undo),
+                                t!("Tirar o último", "Remove the last one"),
+                                false,
+                            )
+                        })
+                        .inner
                         .on_hover_text(t!(
                             "Descarta o último passo, se o clique não fazia parte da tarefa.",
                             "Discards the last step, if that click was not part of the task."
                         ))
                         .clicked();
-                    cancel = ui.button(t!("Cancelar", "Cancel")).clicked();
-                    ui.separator();
-                    ui.colored_label(Color32::from_rgb(235, 64, 52), "●");
+                    cancel = kit::ghost_button(ui, None, t!("Cancelar", "Cancel"), false).clicked();
+                    kit::divider_v(ui, 18.0);
+                    let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
+                    icons::paint(ui.painter(), ui.ctx(), Icon::RecordDot, dot_rect.center(), 13.0, pal.danger);
                     let text = match count {
                         0 => t!("Clique na área para registrar o primeiro passo", "Click in the area to record the first step").to_owned(),
                         1 => t!("1 passo", "1 step").to_owned(),
@@ -2884,15 +3294,18 @@ impl App {
         let mut start = false;
         let mut stop = false;
         let mut cancel = false;
-        egui::CentralPanel::default().show(ui, |ui| {
+        let pal = theme::current_palette(ui.ctx());
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(pal.bg_chrome).inner_margin(Margin::symmetric(10, 6)))
+            .show(ui, |ui| {
             ui.horizontal_centered(|ui| match &pano.session {
                 None => {
-                    start = ui.button(t!("● Iniciar", "● Start")).clicked();
-                    cancel = ui.button(t!("Cancelar", "Cancel")).clicked();
+                    start = kit::primary_button(ui, Some(Icon::RecordDot), t!("Iniciar", "Start")).clicked();
+                    cancel = kit::ghost_button(ui, None, t!("Cancelar", "Cancel"), false).clicked();
                     ui.label(t!("Depois de iniciar, role a área devagar,\nem qualquer direção.", "Once started, scroll the area slowly,\nin any direction."));
                 }
                 Some(session) => {
-                    stop = ui.button(t!("■ Parar", "■ Stop")).clicked();
+                    stop = kit::primary_button(ui, Some(Icon::Stop), t!("Parar", "Stop")).clicked();
                     let (w, h) = session.size();
                     let lost = session.lost();
                     if lost == 0 {
@@ -2944,6 +3357,7 @@ impl App {
         if let Some(r) = self.normal_rect {
             win::set_window_rect(self.shared.hwnd, r);
         }
+        self.sync_titlebar();
         // The frame comes back a few frames later; the rectangle is reapplied until then.
         self.restore_frames = 10;
         ctx.request_repaint();
@@ -3136,21 +3550,24 @@ impl App {
         } else {
             area.left_bottom() + egui::vec2(8.0, -BAR_H - 8.0)
         };
-        pos.x = pos.x.min(rect.max.x - 960.0).max(rect.min.x + 4.0);
+        pos.x = pos.x.min(rect.max.x - 680.0).max(rect.min.x + 4.0);
         let mut action = None;
+        let pal = theme::current_palette(&ctx);
         egui::Area::new(egui::Id::unique("quick_bar"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .show(&ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                kit::floating_capsule_frame(&pal).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         quick.editor.quick_toolbar_ui(ui);
-                        ui.separator();
-                        if ui.button(t!("📋 Copiar", "📋 Copy")).on_hover_text(t!("Copia e fecha (Enter ou Ctrl C)", "Copies and closes (Enter or Ctrl C)")).clicked() {
+                        kit::divider_v(ui, 18.0);
+                        if kit::primary_button(ui, Some(Icon::Copy), t!("Copiar", "Copy"))
+                            .on_hover_text(t!("Copia e fecha (Enter ou Ctrl C)", "Copies and closes (Enter or Ctrl C)"))
+                            .clicked()
+                        {
                             action = Some(QuickAction::Copy);
                         }
-                        if ui
-                            .button(t!("📌 Fixar", "📌 Pin"))
+                        if kit::ghost_button(ui, Some(Icon::Pin), t!("Fixar", "Pin"), false)
                             .on_hover_text(t!(
                                 "Fixa na tela sempre visível (P)",
                                 "Pins on top of the screen (P)"
@@ -3159,13 +3576,22 @@ impl App {
                         {
                             action = Some(QuickAction::Pin);
                         }
-                        if ui.button(t!("💾 Salvar", "💾 Save")).on_hover_text("Ctrl S").clicked() {
+                        if kit::ghost_button(ui, Some(Icon::Save), t!("Salvar", "Save"), false)
+                            .on_hover_text("Ctrl S")
+                            .clicked()
+                        {
                             action = Some(QuickAction::Save);
                         }
-                        if ui.button(t!("✎ Editor", "✎ Editor")).on_hover_text(t!("Continua no editor completo (Ctrl E)", "Continues in the full editor (Ctrl E)")).clicked() {
+                        if kit::ghost_button(ui, Some(Icon::Edit), t!("Editor", "Editor"), false)
+                            .on_hover_text(t!("Continua no editor completo (Ctrl E)", "Continues in the full editor (Ctrl E)"))
+                            .clicked()
+                        {
                             action = Some(QuickAction::Editor);
                         }
-                        if ui.button("✕").on_hover_text(t!("Cancelar (Esc)", "Cancel (Esc)")).clicked() {
+                        if kit::icon_button(ui, Icon::Close, false, 26.0)
+                            .on_hover_text(t!("Cancelar (Esc)", "Cancel (Esc)"))
+                            .clicked()
+                        {
                             action = Some(QuickAction::Cancel);
                         }
                     });
@@ -3708,26 +4134,41 @@ impl App {
                 area.left_bottom() + egui::vec2(8.0, -BAR_H - 8.0)
             };
             pos.x = pos.x.min(rect.max.x - 330.0).max(rect.min.x + 4.0);
+            let pal = theme::current_palette(&ctx);
             egui::Area::new(egui::Id::unique("adjust_bar"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(pos)
                 .show(&ctx, |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    kit::floating_capsule_frame(&pal).show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            if ui
-                                .button(t!("📸 Capturar (Enter)", "📸 Capture (Enter)"))
-                                .on_hover_text(t!(
-                                    "Ctrl C ou duplo clique dentro da região também captura",
-                                    "Ctrl C or a double-click inside the region also captures"
-                                ))
-                                .clicked()
+                            if kit::primary_button(
+                                ui,
+                                Some(Icon::CaptureFrame),
+                                t!("Capturar (Enter)", "Capture (Enter)"),
+                            )
+                            .on_hover_text(t!(
+                                "Ctrl C ou duplo clique dentro da região também captura",
+                                "Ctrl C or a double-click inside the region also captures"
+                            ))
+                            .clicked()
                             {
                                 bar = Some(true);
                             }
-                            if ui.button(t!("↺ Refazer", "↺ Redo")).on_hover_text(t!("Desenha a região de novo", "Draws the region again")).clicked() {
+                            if kit::ghost_button(
+                                ui,
+                                Some(Icon::Refresh),
+                                t!("Refazer", "Redo"),
+                                false,
+                            )
+                            .on_hover_text(t!("Desenha a região de novo", "Draws the region again"))
+                            .clicked()
+                            {
                                 bar = Some(false);
                             }
-                            if ui.button("✕").on_hover_text(t!("Cancelar (Esc)", "Cancel (Esc)")).clicked() {
+                            if kit::icon_button(ui, Icon::Close, false, 28.0)
+                                .on_hover_text(t!("Cancelar (Esc)", "Cancel (Esc)"))
+                                .clicked()
+                            {
                                 cancel = true;
                             }
                         });
@@ -3878,311 +4319,424 @@ impl App {
 
     fn home_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let pal = theme::current_palette(&ctx);
         let mut styles_changed = false;
         let mut video_action = None;
-        egui::Panel::top("bar").show(ui, |ui| {
-            ui.add_space(6.0);
-            // Program row: on the left what captures, on the right what you do with the capture.
-            // With a narrow window the buttons move to the next row instead of overlapping.
-            ui.horizontal_wrapped(|ui| {
-                if ui.button(tf!("✂ Região ({})", "✂ Region ({})", self.cfg.hotkey.label())).clicked() {
-                    start_capture(CaptureKind::Region, self.shared.clone(), ctx.clone());
-                }
-                let fs_label = self.button_with_shortcut(
-                    t!("⛶ Tela cheia", "⛶ Full screen"),
-                    config::CaptureShortcutMode::FullScreen,
-                );
-                if ui
-                    .button(fs_label)
-                    .on_hover_text(t!("O monitor onde está o cursor.", "The monitor the cursor is on."))
-                    .clicked()
-                {
-                    start_capture(CaptureKind::FullScreen, self.shared.clone(), ctx.clone());
-                }
-                if win::monitor_count() > 1 {
-                    let all_label = self.button_with_shortcut(
-                        t!("▣ Todas as telas", "▣ All screens"),
-                        config::CaptureShortcutMode::AllScreens,
-                    );
-                    if ui
-                        .button(all_label)
-                        .on_hover_text(t!("Todos os monitores em uma imagem só.", "Every monitor in a single image."))
-                        .clicked()
-                    {
-                        start_capture(CaptureKind::AllScreens, self.shared.clone(), ctx.clone());
-                    }
-                }
-                let scroll_label = self.button_with_shortcut(
-                    t!("⇵ Rolagem", "⇵ Scrolling"),
-                    config::CaptureShortcutMode::Scrolling,
-                );
-                if ui
-                    .button(scroll_label)
-                    .on_hover_text(t!(
-                        "Escolha a área que rola; o SnapKit desce a página e junta tudo em uma imagem.",
-                        "Pick the area that scrolls; SnapKit scrolls the page and joins it all into one image."
-                    ))
-                    .clicked()
-                {
-                    start_capture(CaptureKind::Scroll, self.shared.clone(), ctx.clone());
-                }
-                let pano_label = self.button_with_shortcut(
-                    t!("▭ Panorâmica", "▭ Panoramic"),
-                    config::CaptureShortcutMode::Panoramic,
-                );
-                if ui
-                    .button(pano_label)
-                    .on_hover_text(t!(
-                        "Escolha uma área e role você mesmo, em qualquer direção; o SnapKit monta a imagem.",
-                        "Pick an area and scroll it yourself, in any direction; SnapKit builds the image."
-                    ))
-                    .clicked()
-                {
-                    start_capture(CaptureKind::Panoramic, self.shared.clone(), ctx.clone());
-                }
-                let video_label = self.button_with_shortcut(
-                    t!("● Vídeo", "● Video"),
-                    config::CaptureShortcutMode::Video,
-                );
-                if ui
-                    .button(video_label)
-                    .on_hover_text(t!(
-                        "Escolha uma área e grave a tela em MP4, com som do sistema e microfone.",
-                        "Pick an area and record the screen as MP4, with system sound and microphone."
-                    ))
-                    .clicked()
-                {
-                    start_capture(CaptureKind::Video, self.shared.clone(), ctx.clone());
-                }
-                if ui
-                    .button("GIF")
-                    .on_hover_text(t!(
-                        "Escolha uma área e grave; ao parar, a gravação vira um GIF animado, sem som.",
-                        "Pick an area and record; when stopped, the recording becomes an animated GIF, without sound."
-                    ))
-                    .clicked()
-                {
-                    start_capture(CaptureKind::Gif, self.shared.clone(), ctx.clone());
-                }
-                let steps_label = self.button_with_shortcut(
-                    t!("Passo a passo", "Step by step"),
-                    config::CaptureShortcutMode::Steps,
-                );
-                if ui
-                    .button(steps_label)
-                    .on_hover_text(t!(
-                        "Escolha uma área e faça a tarefa: cada clique vira uma foto numerada de um guia.",
-                        "Pick an area and do the task: each click becomes a numbered shot of a guide."
-                    ))
-                    .clicked()
-                {
-                    start_capture(CaptureKind::Steps, self.shared.clone(), ctx.clone());
-                }
-                let (mut delay, mut cursor) = (self.cfg.delay_secs, self.cfg.include_cursor);
-                let summary = match (delay, cursor) {
-                    (0, false) => t!("Opções", "Options").to_owned(),
-                    (0, true) => t!("Opções: com cursor", "Options: with cursor").to_owned(),
-                    (secs, false) => tf!("Opções: {}", "Options: {}", delay_label(secs)),
-                    (secs, true) => tf!("Opções: {}, com cursor", "Options: {}, with cursor", delay_label(secs)),
-                };
-                ui.menu_button(summary, |ui| {
-                    ui.weak(t!("Esperar antes de capturar", "Wait before capturing"));
-                    for secs in [0, 3, 5, 10] {
-                        ui.radio_value(&mut delay, secs, delay_label(secs));
-                    }
-                    ui.separator();
-                    ui.checkbox(&mut cursor, t!("Incluir o cursor do mouse", "Include the mouse cursor"));
-                });
-                if delay != self.cfg.delay_secs || cursor != self.cfg.include_cursor {
-                    self.cfg.delay_secs = delay;
-                    self.cfg.include_cursor = cursor;
-                    self.shared.delay_secs.store(delay, Ordering::Relaxed);
-                    self.shared.include_cursor.store(cursor, Ordering::Relaxed);
-                    self.save_cfg();
-                }
-                // The right-hand group needs room of its own; without it, it moves as a whole to
-                // another row. (In a wrapping row, `available_width` gives the whole row; what's
-                // really left goes from the next button to the edge.)
-                if ui.max_rect().right() - ui.cursor().left() < RIGHT_GROUP_WIDTH {
-                    ui.end_row();
-                }
-                // Right to left: the first item goes at the right end.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(t!("⚙ Preferências", "⚙ Preferences")).clicked() {
-                        self.show_prefs = !self.show_prefs;
-                        self.hotkey_draft = self.cfg.hotkey.clone();
-                        self.mode_hotkeys_draft = self.cfg.mode_hotkeys.clone();
-                    }
-                    if let UpdateState::Available(release) = &self.update_state {
-                        let label = tf!("⬆ Versão {}", "⬆ Version {}", release.version);
-                        if ui
-                            .button(egui::RichText::new(label).color(self.accent()))
-                            .on_hover_text(t!("Há uma versão nova. Abre Preferências > Atualizações.", "A new version is out. Opens Preferences > Updates."))
-                            .clicked()
-                        {
-                            self.show_prefs = true;
-                        }
-                    }
-                    ui.toggle_value(&mut self.show_library, t!("Biblioteca", "Library"));
-                    ui.separator();
-                    if let Some(ve) = &self.video_editor
-                        && self.editor.is_none()
-                    {
-                        if ui
-                            .button(t!("▶ Player", "▶ Player"))
-                            .on_hover_text(t!(
-                                "Abre o vídeo no reprodutor padrão do Windows.",
-                                "Opens the video in the default Windows media player."
-                            ))
-                            .clicked()
-                        {
-                            let _ = std::process::Command::new("explorer")
-                                .arg(ve.path())
-                                .spawn();
-                        }
-                        let can_grab = !self.video_job_running && ve.current_frame().is_some();
-                        if ui
-                            .add_enabled(
-                                can_grab,
-                                egui::Button::new(t!("📸 Quadro → Editor", "📸 Frame → Editor")),
+        egui::Panel::top("bar")
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE.fill(pal.bg_chrome).inner_margin(Margin::ZERO))
+            .show(ui, |ui| {
+                egui::Frame::NONE
+                    .inner_margin(Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        // Program row: on the left what captures, on the right what you do with the capture.
+                        // With a narrow window the buttons move to the next row instead of overlapping.
+                        ui.horizontal_wrapped(|ui| {
+                            if kit::primary_button(
+                                ui,
+                                Some(Icon::Region),
+                                &tf!("Região ({})", "Region ({})", self.cfg.hotkey.label()),
                             )
-                            .on_hover_text(t!(
-                                "Envia o quadro atual do vídeo direto para o editor de anotações.",
-                                "Sends the current video frame straight to the annotation editor."
-                            ))
                             .clicked()
-                            && let Some(frame) = ve.current_frame().cloned()
-                        {
-                            video_action = Some(video_editor::VideoAction::CaptureFrame { image: frame });
-                        }
-                    } else {
-                        let has_capture = self.editor.is_some();
-                        let can_ocr = has_capture && !self.ocr_running && !self.redact_running;
-                        if ui
-                            .add_enabled(
-                                can_ocr,
-                                egui::Button::new(t!("🔒 Ocultar dados", "🔒 Auto-redact")),
-                            )
-                            .on_hover_text(t!(
-                                "Detecta e desfoca automaticamente e-mails, senhas, chaves, CPFs, cartões e telefones via OCR local.",
-                                "Automatically detects and blurs emails, passwords, keys, IDs, cards, and phones via local OCR."
-                            ))
-                            .clicked()
-                            && let Some(e) = &mut self.editor
-                        {
-                            e.commit_pending_text();
-                            let image = e.image().clone();
-                            self.start_redact(&ctx, image);
-                        }
-                        if ui
-                            .add_enabled(can_ocr, egui::Button::new(t!("🔤 Ler texto", "🔤 Read text")))
-                            .on_hover_text(t!(
-                                "Reconhece todo o texto da imagem e copia. Para uma área só, use a ferramenta Extrair texto.",
-                                "Recognizes all the text in the image and copies it. For a single area, use the Grab text tool."
-                            ))
-                            .clicked()
-                            && let Some(e) = &mut self.editor
-                        {
-                            e.commit_pending_text();
-                            let image = e.image().clone();
-                            self.start_ocr(&ctx, image, ocr::Mode::Printed);
-                        }
-                        let acc = self.accent();
-                        if ui
-                            .add_enabled(has_capture, egui::Button::new(t!("📌 Fixar", "📌 Pin")))
-                            .on_hover_text(t!(
-                                "Fixa a captura na tela sempre visível.",
-                                "Pins the capture on top of the screen."
-                            ))
-                            .clicked()
-                            && let Some(e) = &mut self.editor
-                        {
-                            e.commit_pending_text();
-                            let img = e.image().clone();
-                            self.status = match pin::spawn(img, [acc.r(), acc.g(), acc.b()], None) {
-                                Ok(()) => t!(
-                                    "Captura fixada na tela (arraste para mover, Esc fecha).",
-                                    "Capture pinned to screen (drag to move, Esc closes)."
+                            {
+                                start_capture(CaptureKind::Region, self.shared.clone(), ctx.clone());
+                            }
+                            let fs_label = self.button_with_shortcut(
+                                t!("Tela cheia", "Full screen"),
+                                config::CaptureShortcutMode::FullScreen,
+                            );
+                            if kit::ghost_button(ui, Some(Icon::FullScreen), &fs_label, false)
+                                .on_hover_text(t!("O monitor onde está o cursor.", "The monitor the cursor is on."))
+                                .clicked()
+                            {
+                                start_capture(CaptureKind::FullScreen, self.shared.clone(), ctx.clone());
+                            }
+                            if win::monitor_count() > 1 {
+                                let all_label = self.button_with_shortcut(
+                                    t!("Todas as telas", "All screens"),
+                                    config::CaptureShortcutMode::AllScreens,
+                                );
+                                if kit::ghost_button(ui, Some(Icon::AllScreens), &all_label, false)
+                                    .on_hover_text(t!("Todos os monitores em uma imagem só.", "Every monitor in a single image."))
+                                    .clicked()
+                                {
+                                    start_capture(CaptureKind::AllScreens, self.shared.clone(), ctx.clone());
+                                }
+                            }
+                            let scroll_label = self.button_with_shortcut(
+                                t!("Rolagem", "Scrolling"),
+                                config::CaptureShortcutMode::Scrolling,
+                            );
+                            if kit::ghost_button(ui, Some(Icon::Scrolling), &scroll_label, false)
+                                .on_hover_text(t!(
+                                    "Escolha a área que rola; o SnapKit desce a página e junta tudo em uma imagem.",
+                                    "Pick the area that scrolls; SnapKit scrolls the page and joins it all into one image."
+                                ))
+                                .clicked()
+                            {
+                                start_capture(CaptureKind::Scroll, self.shared.clone(), ctx.clone());
+                            }
+                            let pano_label = self.button_with_shortcut(
+                                t!("Panorâmica", "Panoramic"),
+                                config::CaptureShortcutMode::Panoramic,
+                            );
+                            if kit::ghost_button(ui, Some(Icon::Panoramic), &pano_label, false)
+                                .on_hover_text(t!(
+                                    "Escolha uma área e role você mesmo, em qualquer direção; o SnapKit monta a imagem.",
+                                    "Pick an area and scroll it yourself, in any direction; SnapKit builds the image."
+                                ))
+                                .clicked()
+                            {
+                                start_capture(CaptureKind::Panoramic, self.shared.clone(), ctx.clone());
+                            }
+                            let video_label = self.button_with_shortcut(
+                                t!("Vídeo", "Video"),
+                                config::CaptureShortcutMode::Video,
+                            );
+                            if kit::ghost_button(ui, Some(Icon::Video), &video_label, false)
+                                .on_hover_text(t!(
+                                    "Escolha uma área e grave a tela em MP4, com som do sistema e microfone.",
+                                    "Pick an area and record the screen as MP4, with system sound and microphone."
+                                ))
+                                .clicked()
+                            {
+                                start_capture(CaptureKind::Video, self.shared.clone(), ctx.clone());
+                            }
+                            if kit::ghost_button(ui, Some(Icon::Gif), "GIF", false)
+                                .on_hover_text(t!(
+                                    "Escolha uma área e grave; ao parar, a gravação vira um GIF animado, sem som.",
+                                    "Pick an area and record; when stopped, the recording becomes an animated GIF, without sound."
+                                ))
+                                .clicked()
+                            {
+                                start_capture(CaptureKind::Gif, self.shared.clone(), ctx.clone());
+                            }
+                            let steps_label = self.button_with_shortcut(
+                                t!("Passo a passo", "Step by step"),
+                                config::CaptureShortcutMode::Steps,
+                            );
+                            if kit::ghost_button(ui, Some(Icon::Steps), &steps_label, false)
+                                .on_hover_text(t!(
+                                    "Escolha uma área e faça a tarefa: cada clique vira uma foto numerada de um guia.",
+                                    "Pick an area and do the task: each click becomes a numbered shot of a guide."
+                                ))
+                                .clicked()
+                            {
+                                start_capture(CaptureKind::Steps, self.shared.clone(), ctx.clone());
+                            }
+                            let (mut delay, mut cursor) = (self.cfg.delay_secs, self.cfg.include_cursor);
+                            let summary = match (delay, cursor) {
+                                (0, false) => t!("Opções", "Options").to_owned(),
+                                (0, true) => t!("Opções: com cursor", "Options: with cursor").to_owned(),
+                                (secs, false) => tf!("Opções: {}", "Options: {}", delay_label(secs)),
+                                (secs, true) => tf!("Opções: {}, com cursor", "Options: {}, with cursor", delay_label(secs)),
+                            };
+                            kit::ghost_menu_button(ui, Some(Icon::Options), &summary, |ui| {
+                                ui.weak(t!("Esperar antes de capturar", "Wait before capturing"));
+                                for secs in [0, 3, 5, 10] {
+                                    ui.radio_value(&mut delay, secs, delay_label(secs));
+                                }
+                                ui.separator();
+                                ui.checkbox(&mut cursor, t!("Incluir o cursor do mouse", "Include the mouse cursor"));
+                            });
+                            if delay != self.cfg.delay_secs || cursor != self.cfg.include_cursor {
+                                self.cfg.delay_secs = delay;
+                                self.cfg.include_cursor = cursor;
+                                self.shared.delay_secs.store(delay, Ordering::Relaxed);
+                                self.shared.include_cursor.store(cursor, Ordering::Relaxed);
+                                self.save_cfg();
+                            }
+                            // The right-hand group needs room of its own; without it, it moves as a whole to
+                            // another row. (In a wrapping row, `available_width` gives the whole row; what's
+                            // really left goes from the next button to the edge.)
+                            if ui.max_rect().right() - ui.cursor().left() < RIGHT_GROUP_WIDTH {
+                                ui.end_row();
+                            }
+                            // Right to left: the first item goes at the right end.
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if kit::icon_button(ui, Icon::Preferences, self.show_prefs, 28.0)
+                                    .on_hover_text(t!("Preferências", "Preferences"))
+                                    .clicked()
+                                {
+                                    self.show_prefs = !self.show_prefs;
+                                    self.hotkey_draft = self.cfg.hotkey.clone();
+                                    self.mode_hotkeys_draft = self.cfg.mode_hotkeys.clone();
+                                }
+                                if let UpdateState::Available(release) = &self.update_state {
+                                    let label = tf!("Versão {}", "Version {}", release.version);
+                                    if kit::pill_toggle(ui, Some(Icon::UpdateArrow), &label, true)
+                                        .on_hover_text(t!("Há uma versão nova. Abre Preferências > Atualizações.", "A new version is out. Opens Preferences > Updates."))
+                                        .clicked()
+                                    {
+                                        self.show_prefs = true;
+                                    }
+                                }
+                                if kit::ghost_button(
+                                    ui,
+                                    Some(Icon::Library),
+                                    t!("Biblioteca", "Library"),
+                                    self.show_library,
                                 )
-                                .to_owned(),
-                                Err(err) => tf!(
-                                    "Não foi possível fixar na tela: {err}",
-                                    "Could not pin to screen: {err}"
-                                ),
-                            };
-                        }
-                        if ui
-                            .add_enabled(has_capture, egui::Button::new(t!("💾 Salvar…", "💾 Save…")))
-                            .on_hover_text(t!(
-                                "Salva em PNG, JPEG, WebP, PDF ou BMP (Ctrl S)",
-                                "Saves as PNG, JPEG, WebP, PDF, or BMP (Ctrl S)"
-                            ))
-                            .clicked()
-                            && let Some(e) = &mut self.editor
-                        {
-                            e.commit_pending_text();
-                            self.status = export::save_capture_dialog(e.image());
-                        }
-                        if ui
-                            .add_enabled(has_capture, egui::Button::new(t!("📋 Copiar", "📋 Copy")))
-                            .on_hover_text("Ctrl C")
-                            .clicked()
-                            && let Some(e) = &mut self.editor
-                        {
-                            e.commit_pending_text();
-                            self.status = match copy_to_clipboard(e.image()) {
-                                Ok(()) => t!("Copiado para a área de transferência.", "Copied to the clipboard.").to_owned(),
-                                Err(e) => tf!("Não foi possível copiar: {e}", "Could not copy: {e}"),
-                            };
-                        }
-                    }
-                });
-            });
-            ui.add_space(4.0);
-            // Second row: options of the active image tool or the video editor toolbar.
-            if let Some(editor) = &mut self.editor {
-                ui.separator();
-                styles_changed = editor.options_ui(ui, &mut self.cfg.styles);
-                ui.add_space(6.0);
-            } else if let Some(ve) = &mut self.video_editor {
-                ui.separator();
-                if let Some(act) = ve.options_ui(ui) {
-                    video_action = Some(act);
+                                .clicked()
+                                {
+                                    self.show_library = !self.show_library;
+                                }
+                                kit::divider_v(ui, 18.0);
+                                if let Some(ve) = &self.video_editor
+                                    && self.editor.is_none()
+                                {
+                                    if kit::ghost_button(
+                                        ui,
+                                        Some(Icon::ExternalOpen),
+                                        t!("Player", "Player"),
+                                        false,
+                                    )
+                                    .on_hover_text(t!(
+                                        "Abre o vídeo no reprodutor padrão do Windows.",
+                                        "Opens the video in the default Windows media player."
+                                    ))
+                                    .clicked()
+                                    {
+                                        let _ = std::process::Command::new("explorer")
+                                            .arg(ve.path())
+                                            .spawn();
+                                    }
+                                    let can_grab = !self.video_job_running && ve.current_frame().is_some();
+                                    if ui
+                                        .add_enabled_ui(can_grab, |ui| {
+                                            kit::ghost_button(
+                                                ui,
+                                                Some(Icon::CaptureFrame),
+                                                t!("Quadro → Editor", "Frame → Editor"),
+                                                false,
+                                            )
+                                        })
+                                        .inner
+                                        .on_hover_text(t!(
+                                            "Envia o quadro atual do vídeo direto para o editor de anotações.",
+                                            "Sends the current video frame straight to the annotation editor."
+                                        ))
+                                        .clicked()
+                                        && let Some(frame) = ve.current_frame().cloned()
+                                    {
+                                        video_action = Some(video_editor::VideoAction::CaptureFrame { image: frame });
+                                    }
+                                } else {
+                                    let has_capture = self.editor.is_some();
+                                    let can_ocr = has_capture && !self.ocr_running && !self.redact_running;
+                                    if ui
+                                        .add_enabled_ui(can_ocr, |ui| {
+                                            kit::ghost_button(
+                                                ui,
+                                                Some(Icon::AutoRedact),
+                                                t!("Ocultar dados", "Auto-redact"),
+                                                false,
+                                            )
+                                        })
+                                        .inner
+                                        .on_hover_text(t!(
+                                            "Detecta e desfoca automaticamente e-mails, senhas, chaves, CPFs, cartões e telefones via OCR local.",
+                                            "Automatically detects and blurs emails, passwords, keys, IDs, cards, and phones via local OCR."
+                                        ))
+                                        .clicked()
+                                        && let Some(e) = &mut self.editor
+                                    {
+                                        e.commit_pending_text();
+                                        let image = e.image().clone();
+                                        self.start_redact(&ctx, image);
+                                    }
+                                    if ui
+                                        .add_enabled_ui(can_ocr, |ui| {
+                                            kit::ghost_button(
+                                                ui,
+                                                Some(Icon::ReadText),
+                                                t!("Ler texto", "Read text"),
+                                                false,
+                                            )
+                                        })
+                                        .inner
+                                        .on_hover_text(t!(
+                                            "Reconhece todo o texto da imagem e copia. Para uma área só, use a ferramenta Extrair texto.",
+                                            "Recognizes all the text in the image and copies it. For a single area, use the Grab text tool."
+                                        ))
+                                        .clicked()
+                                        && let Some(e) = &mut self.editor
+                                    {
+                                        e.commit_pending_text();
+                                        let image = e.image().clone();
+                                        self.start_ocr(&ctx, image, ocr::Mode::Printed);
+                                    }
+                                    let acc = self.accent();
+                                    if ui
+                                        .add_enabled_ui(has_capture, |ui| {
+                                            kit::ghost_button(ui, Some(Icon::Pin), t!("Fixar", "Pin"), false)
+                                        })
+                                        .inner
+                                        .on_hover_text(t!(
+                                            "Fixa a captura na tela sempre visível.",
+                                            "Pins the capture on top of the screen."
+                                        ))
+                                        .clicked()
+                                        && let Some(e) = &mut self.editor
+                                    {
+                                        e.commit_pending_text();
+                                        let img = e.image().clone();
+                                        self.status = match pin::spawn(img, [acc.r(), acc.g(), acc.b()], None) {
+                                            Ok(()) => t!(
+                                                "Captura fixada na tela (arraste para mover, Esc fecha).",
+                                                "Capture pinned to screen (drag to move, Esc closes)."
+                                            )
+                                            .to_owned(),
+                                            Err(err) => tf!(
+                                                "Não foi possível fixar na tela: {err}",
+                                                "Could not pin to screen: {err}"
+                                            ),
+                                        };
+                                    }
+                                    if ui
+                                        .add_enabled_ui(has_capture, |ui| {
+                                            kit::ghost_button(ui, Some(Icon::Save), t!("Salvar…", "Save…"), false)
+                                        })
+                                        .inner
+                                        .on_hover_text(t!(
+                                            "Salva em PNG, JPEG, WebP, PDF ou BMP (Ctrl S)",
+                                            "Saves as PNG, JPEG, WebP, PDF, or BMP (Ctrl S)"
+                                        ))
+                                        .clicked()
+                                        && let Some(e) = &mut self.editor
+                                    {
+                                        e.commit_pending_text();
+                                        self.status = export::save_capture_dialog(e.image());
+                                    }
+                                    if ui
+                                        .add_enabled_ui(has_capture, |ui| {
+                                            kit::ghost_button(
+                                                ui,
+                                                Some(Icon::Copy),
+                                                t!("Copiar", "Copy"),
+                                                has_capture,
+                                            )
+                                        })
+                                        .inner
+                                        .on_hover_text("Ctrl C")
+                                        .clicked()
+                                        && let Some(e) = &mut self.editor
+                                    {
+                                        e.commit_pending_text();
+                                        self.status = match copy_to_clipboard(e.image()) {
+                                            Ok(()) => t!("Copiado para a área de transferência.", "Copied to the clipboard.").to_owned(),
+                                            Err(e) => tf!("Não foi possível copiar: {e}", "Could not copy: {e}"),
+                                        };
+                                    }
+                                }
+                            });
+                        });
+                    });
+
+                // Second row: distinct properties strip for the active image tool or video editor.
+                if self.editor.is_some() || self.video_editor.is_some() {
+                    let top_r = ui.max_rect();
+                    ui.painter().line_segment(
+                        [Pos2::new(top_r.min.x, ui.cursor().top()), Pos2::new(top_r.max.x, ui.cursor().top())],
+                        Stroke::new(1.0, pal.border_subtle),
+                    );
+                    egui::Frame::NONE
+                        .fill(pal.bg_surface)
+                        .inner_margin(Margin::symmetric(10, 5))
+                        .show(ui, |ui| {
+                            if let Some(editor) = &mut self.editor {
+                                styles_changed = editor.options_ui(ui, &mut self.cfg.styles);
+                            } else if let Some(ve) = &mut self.video_editor
+                                && let Some(act) = ve.options_ui(ui)
+                            {
+                                video_action = Some(act);
+                            }
+                        });
                 }
-                ui.add_space(6.0);
-            }
-        });
+                let bot_r = ui.max_rect();
+                ui.painter().line_segment(
+                    [bot_r.left_bottom(), bot_r.right_bottom()],
+                    Stroke::new(1.0, pal.border_subtle),
+                );
+            });
         if styles_changed {
             self.save_cfg();
         }
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.status);
-                if let Some(editor) = &mut self.editor {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| editor.zoom_ui(ui));
-                } else if let Some(ve) = &self.video_editor {
-                    let info = ve.info();
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak(tf!(
-                            "{}×{} px  •  {:.1} s  •  Espaço reproduz, [ e ] marcam corte",
-                            "{}×{} px  •  {:.1} s  •  Space plays, [ and ] mark trim",
-                            info.width,
-                            info.height,
-                            info.duration
-                        ));
-                    });
-                }
+        egui::Panel::bottom("status")
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE.fill(pal.bg_chrome).inner_margin(Margin::symmetric(10, 4)))
+            .show(ui, |ui| {
+                let r = ui.max_rect();
+                ui.painter().line_segment(
+                    [r.left_top(), r.right_top()],
+                    Stroke::new(1.0, pal.border_subtle),
+                );
+                ui.horizontal(|ui| {
+                    if self.ocr_running || self.redact_running || self.video_job_running {
+                        ui.spinner();
+                    } else if !self.status.is_empty() {
+                        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 14.0), Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 3.0, pal.accent);
+                    }
+                    ui.label(
+                        egui::RichText::new(&self.status)
+                            .size(12.0)
+                            .color(pal.text_secondary),
+                    );
+                    if let Some(editor) = &mut self.editor {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| editor.zoom_ui(ui));
+                    } else if let Some(ve) = &self.video_editor {
+                        let info = ve.info();
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(tf!(
+                                    "{}×{} px  •  {:.1} s  •  Espaço reproduz, [ e ] marcam corte",
+                                    "{}×{} px  •  {:.1} s  •  Space plays, [ and ] mark trim",
+                                    info.width,
+                                    info.height,
+                                    info.duration
+                                ))
+                                .size(11.5)
+                                .color(pal.text_muted),
+                            );
+                        });
+                    }
+                });
             });
-        });
         if let Some(editor) = &mut self.editor {
-            egui::Panel::left("tools").resizable(false).default_size(132.0).show(ui, |ui| editor.tools_ui(ui));
+            egui::Panel::left("tools")
+                .resizable(false)
+                .exact_size(if self.tools_expanded { 156.0 } else { 50.0 })
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(pal.bg_chrome)
+                        .inner_margin(Margin::symmetric(if self.tools_expanded { 8 } else { 6 }, 6)),
+                )
+                .show(ui, |ui| {
+                    let r = ui.max_rect();
+                    ui.painter().line_segment(
+                        [r.right_top(), r.right_bottom()],
+                        Stroke::new(1.0, pal.border_subtle),
+                    );
+                    editor.tools_ui(ui, &mut self.tools_expanded);
+                });
         }
         if self.show_library {
             egui::Panel::right("library")
                 .resizable(true)
-                .default_size(250.0)
-                .size_range(200.0..=420.0)
-                .show(ui, |ui| self.library_ui(ui));
+                .default_size(256.0)
+                .size_range(210.0..=420.0)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE.fill(pal.bg_chrome).inner_margin(Margin::symmetric(10, 8)))
+                .show(ui, |ui| {
+                    let r = ui.max_rect();
+                    ui.painter().line_segment(
+                        [r.left_top(), r.left_bottom()],
+                        Stroke::new(1.0, pal.border_subtle),
+                    );
+                    self.library_ui(ui);
+                });
         }
         self.autosave(&ctx);
         if let Some(area) = self.editor.as_mut().and_then(|e| e.take_text_request()) {
@@ -4198,7 +4752,9 @@ impl App {
         self.poll_redact();
         self.poll_video_jobs(&ctx);
         self.edit_meta_ui(&ctx);
-        egui::CentralPanel::default().show(ui, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(pal.bg_canvas))
+            .show(ui, |ui| {
             if let Some(editor) = &mut self.editor {
                 editor.canvas_ui(ui);
             } else if let Some(ve) = &mut self.video_editor {
@@ -4256,142 +4812,250 @@ impl App {
     /// Quick-start empty state shown when no capture or video is currently open in the workspace.
     fn empty_state_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let avail = ui.available_size();
+        let pal = theme::current_palette(ctx);
         let accent = self.accent();
+        let logo = self
+            .logo_tex
+            .get_or_insert_with(|| {
+                let rgba = tray::icon_rgba(96);
+                let img = ColorImage::from_rgba_unmultiplied([96, 96], &rgba);
+                ctx.load_texture("snapkit_hero_logo", img, TextureOptions::LINEAR)
+            })
+            .clone();
+
         ui.vertical_centered(|ui| {
-            let top_pad = ((avail.y - 260.0) * 0.42).max(16.0);
+            let top_pad = ((avail.y - 340.0) * 0.42).max(20.0);
             ui.add_space(top_pad);
+
+            let (logo_rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), Sense::hover());
+            ui.painter().add(
+                egui::Shadow {
+                    offset: [0, 6],
+                    blur: 16,
+                    spread: 0,
+                    color: pal.shadow_color,
+                }
+                .as_shape(logo_rect, 10.0),
+            );
+            ui.painter().image(
+                logo.id(),
+                logo_rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            ui.add_space(12.0);
+
             ui.label(
-                egui::RichText::new(t!(
+                kit::semibold(t!(
                     "Pronto para capturar ou gravar",
                     "Ready to capture or record"
                 ))
-                .size(18.0)
-                .strong(),
+                .size(20.0)
+                .color(pal.text_primary),
             );
-            ui.add_space(4.0);
-            ui.weak(tf!(
-                "Escolha um modo abaixo, use a barra superior ou pressione {}.",
-                "Pick a mode below, use the top bar, or press {}.",
-                self.cfg.hotkey.label()
-            ));
-            ui.add_space(18.0);
+            ui.add_space(5.0);
 
-            let cards: [(CaptureKind, &str, &str); 6] = [
+            // Subtitle with styled keycap badge for the primary shortcut
+            let sub_prefix = t!(
+                "Escolha um modo abaixo, use a barra superior ou pressione",
+                "Pick a mode below, use the top bar, or press"
+            );
+            let hk_label = self.cfg.hotkey.label();
+            let row_w = ui.available_width();
+            let (sub_rect, _) = ui.allocate_exact_size(egui::vec2(row_w, 22.0), Sense::hover());
+            let sub_painter = ui.painter_at(sub_rect);
+            let sub_galley = sub_painter.layout_no_wrap(
+                sub_prefix.to_owned(),
+                egui::FontId::proportional(13.0),
+                pal.text_secondary,
+            );
+            let kbd_galley = sub_painter.layout_no_wrap(
+                hk_label.clone(),
+                egui::FontId::proportional(10.5),
+                pal.text_secondary,
+            );
+            let kbd_w = kbd_galley.size().x + 10.0;
+            let total_w = sub_galley.size().x + 6.0 + kbd_w;
+            let start_x = sub_rect.center().x - total_w * 0.5;
+            sub_painter.galley(
+                Pos2::new(start_x, sub_rect.center().y - sub_galley.size().y * 0.5),
+                sub_galley,
+                pal.text_secondary,
+            );
+            kit::kbd_badge(
+                &sub_painter,
+                Pos2::new(start_x + total_w, sub_rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                &hk_label,
+                &pal,
+            );
+
+            ui.add_space(20.0);
+
+            let cards: [(CaptureKind, Icon, &str, &str, Option<String>); 6] = [
                 (
                     CaptureKind::Region,
-                    t!("✂ Região", "✂ Region"),
+                    Icon::Region,
+                    t!("Região", "Region"),
                     t!(
                         "Selecione uma área ou janela e anote na hora",
                         "Select an area or window and annotate right away"
                     ),
+                    Some(self.cfg.hotkey.label()),
                 ),
                 (
                     CaptureKind::FullScreen,
-                    t!("⛶ Tela cheia", "⛶ Full screen"),
+                    Icon::FullScreen,
+                    t!("Tela cheia", "Full screen"),
                     t!(
                         "Captura imediata do monitor atual",
                         "Instant capture of the current monitor"
                     ),
+                    self.cfg
+                        .mode_hotkeys
+                        .get(config::CaptureShortcutMode::FullScreen)
+                        .map(|h| h.label()),
                 ),
                 (
                     CaptureKind::Scroll,
-                    t!("⇵ Rolagem", "⇵ Scrolling"),
+                    Icon::Scrolling,
+                    t!("Rolagem", "Scrolling"),
                     t!(
                         "Página inteira costurada automaticamente",
                         "Full scrolling page stitched automatically"
                     ),
+                    self.cfg
+                        .mode_hotkeys
+                        .get(config::CaptureShortcutMode::Scrolling)
+                        .map(|h| h.label()),
                 ),
                 (
                     CaptureKind::Video,
-                    t!("● Vídeo MP4", "● MP4 Video"),
+                    Icon::Video,
+                    t!("Vídeo MP4", "MP4 Video"),
                     t!(
                         "Grave com som, corte na linha do tempo e recorte",
                         "Record with sound, trim on the timeline, and crop"
                     ),
+                    self.cfg
+                        .mode_hotkeys
+                        .get(config::CaptureShortcutMode::Video)
+                        .map(|h| h.label()),
                 ),
                 (
                     CaptureKind::Gif,
-                    t!("🎞 GIF", "🎞 GIF"),
+                    Icon::Gif,
+                    "GIF",
                     t!(
                         "Animação leve pronta para compartilhar",
                         "Lightweight animation ready to share"
                     ),
+                    None,
                 ),
                 (
                     CaptureKind::Steps,
-                    t!("① Passo a passo", "① Step by step"),
+                    Icon::Steps,
+                    t!("Passo a passo", "Step by step"),
                     t!(
                         "Cada clique vira um passo numerado no guia",
                         "Each click becomes a numbered step in a guide"
                     ),
+                    self.cfg
+                        .mode_hotkeys
+                        .get(config::CaptureShortcutMode::Steps)
+                        .map(|h| h.label()),
                 ),
             ];
 
-            let card_w = 185.0;
-            let card_h = 74.0;
-            let gap = 10.0;
+            let card_w = 204.0;
+            let card_h = 84.0;
+            let gap = 12.0;
             for row in cards.chunks(3) {
                 let row_w = row.len() as f32 * card_w + (row.len().saturating_sub(1)) as f32 * gap;
                 ui.horizontal(|ui| {
                     let left_pad = ((ui.available_width() - row_w) * 0.5).max(0.0);
                     ui.add_space(left_pad);
                     ui.spacing_mut().item_spacing.x = gap;
-                    for &(kind, title, subtitle) in row {
+                    for (kind, icon, title, subtitle, shortcut) in row {
                         let (rect, resp) = ui.allocate_exact_size(
                             egui::vec2(card_w, card_h),
                             Sense::click(),
                         );
+                        let hover_t = ctx.animate_bool_responsive(resp.id.with("hero_card"), resp.hovered());
                         if resp.hovered() {
                             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
-                        let bg = if resp.hovered() {
-                            accent.gamma_multiply(0.16)
+                        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * hover_t).round() as u8;
+                        let bg = Color32::from_rgb(
+                            mix(pal.bg_surface.r(), pal.bg_elevated.r()),
+                            mix(pal.bg_surface.g(), pal.bg_elevated.g()),
+                            mix(pal.bg_surface.b(), pal.bg_elevated.b()),
+                        );
+                        let border = if hover_t > 0.05 {
+                            Stroke::new(
+                                1.0 + 0.5 * hover_t,
+                                Color32::from_rgba_unmultiplied(
+                                    mix(pal.border_subtle.r(), accent.r()),
+                                    mix(pal.border_subtle.g(), accent.g()),
+                                    mix(pal.border_subtle.b(), accent.b()),
+                                    mix(pal.border_subtle.a(), 255),
+                                ),
+                            )
                         } else {
-                            ui.visuals().widgets.noninteractive.bg_fill
-                        };
-                        let border = if resp.hovered() {
-                            Stroke::new(1.5, accent)
-                        } else {
-                            ui.visuals().widgets.noninteractive.bg_stroke
+                            Stroke::new(1.0, pal.border_subtle)
                         };
                         let painter = ui.painter_at(rect);
-                        painter.rect_filled(rect, 8.0, bg);
-                        painter.rect_stroke(rect, 8.0, border, StrokeKind::Inside);
+                        painter.rect_filled(rect, CornerRadius::same(10), bg);
+                        painter.rect_stroke(rect, CornerRadius::same(10), border, StrokeKind::Inside);
 
-                        let inner = rect.shrink2(egui::vec2(12.0, 10.0));
+                        let inner = rect.shrink2(egui::vec2(12.0, 11.0));
+                        let badge_rect = Rect::from_min_size(inner.left_top(), egui::vec2(32.0, 32.0));
+                        painter.rect_filled(badge_rect, CornerRadius::same(8), accent.gamma_multiply(0.15));
+                        icons::paint(&painter, ctx, *icon, badge_rect.center(), 17.0, accent);
+
+                        if let Some(hk) = shortcut {
+                            kit::kbd_badge(&painter, inner.right_top(), egui::Align2::RIGHT_TOP, hk, &pal);
+                        }
+
+                        let text_x = inner.left() + 42.0;
+                        let text_w = (inner.right() - text_x).max(40.0);
                         painter.text(
-                            inner.left_top(),
+                            Pos2::new(text_x, inner.top() + 1.0),
                             egui::Align2::LEFT_TOP,
-                            title,
-                            egui::FontId::proportional(13.5),
-                            ui.visuals().strong_text_color(),
+                            *title,
+                            egui::FontId::new(13.5, theme::semibold_family()),
+                            pal.text_primary,
                         );
                         let sub_galley = painter.layout(
-                            subtitle.to_owned(),
-                            egui::FontId::proportional(11.0),
-                            ui.visuals().weak_text_color(),
-                            inner.width(),
+                            (*subtitle).to_owned(),
+                            egui::FontId::proportional(11.5),
+                            pal.text_secondary,
+                            text_w,
                         );
                         painter.galley(
-                            inner.left_top() + egui::vec2(0.0, 22.0),
+                            Pos2::new(text_x, inner.top() + 21.0),
                             sub_galley,
-                            ui.visuals().weak_text_color(),
+                            pal.text_secondary,
                         );
 
                         if resp.clicked() {
-                            start_capture(kind, self.shared.clone(), ctx.clone());
+                            start_capture(*kind, self.shared.clone(), ctx.clone());
                         }
                     }
                 });
                 ui.add_space(gap);
             }
-            ui.add_space(4.0);
-            if ui
-                .button(t!(
-                    "📋 Abrir imagem da área de transferência (Ctrl V)",
-                    "📋 Open image from clipboard (Ctrl V)"
-                ))
-                .clicked()
+            ui.add_space(6.0);
+            if kit::pill_toggle(
+                ui,
+                Some(Icon::Clipboard),
+                t!(
+                    "Abrir imagem da área de transferência (Ctrl V)",
+                    "Open image from clipboard (Ctrl V)"
+                ),
+                false,
+            )
+            .clicked()
             {
                 self.open_from_clipboard(ctx);
             }
