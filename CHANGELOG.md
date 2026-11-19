@@ -2,7 +2,7 @@
 
 All notable changes to SnapKit are listed here. The project follows [Semantic Versioning](https://semver.org).
 
-## [0.7.0] - 2026-11-18
+## [0.7.0] - 2026-11-19
 
 ### Added
 
@@ -16,6 +16,11 @@ All notable changes to SnapKit are listed here. The project follows [Semantic Ve
 - **Integrated Video Editor & Recording**: visual filmstrip timeline, 60 FPS raw-RGBA preview with synchronized live audio playback and an audio waveform overlay, area crop, playback speed (`0.5×–2.0×`), resolution scaling, frame-to-editor capture, configurable recording FPS (`15–60`), quality presets and countdown, optional animated mouse-click highlights, and native Per-Monitor V2 DPI accuracy across mixed-scaling monitors.
 - **Library & Global Shortcuts**: unified image, MP4 and GIF library with persistent editable annotation layers when reopening captures, favorites (**★**), custom titles and searchable tags, multi-selection (**Ctrl+Click** / **Shift+Click**), native OLE file drag-and-drop (`CF_HDROP`) into other apps, and optional global shortcuts for every capture mode.
 - **Release CI**: automated GitHub Actions release workflow (`.github/workflows/release.yml`) that fetches vendor binaries, runs the locked test suite, builds the portable zip and Inno Setup installer, generates `SHA256SUMS.txt`, and publishes GitHub Releases on version tags.
+
+### Changed
+
+- **Redesigned Desktop UI**: embedded **Inter** typography (`Regular` & `SemiBold`), custom rasterized vector icons (`src/icons.rs`), a 4-surface color palette across all 9 themes with automatic Windows DWM title bar tinting, a collapsible compact 50 px tool rail, elevated library cards with hover actions, a redesigned home empty state, and sectioned **Preferences** with live `3×3` theme swatches.
+- **New App Icon & Brand Assets**: new sunset-lens squircle application icon across the Windows executable, taskbar, system tray, SVG logo, and dark/light README banners.
 
 ## [0.6.0] - 2026-11-13
 
