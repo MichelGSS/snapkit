@@ -34,7 +34,7 @@
 <br>
 
 <p align="center">
-  <img src="assets/readme/editor.png" alt="The SnapKit editor showing a settings page with numbered steps, a highlighted row, a blue callout and a blurred API key." width="100%">
+  <img src="assets/readme/editor.png" alt="The redesigned SnapKit editor with its compact left icon rail, top capture bar, library sidebar, and an annotated settings page featuring numbered steps, a highlighted toggle, a blue callout, and a blurred API key." width="100%">
 </p>
 
 ---
@@ -55,7 +55,7 @@
   <tr>
     <td width="50%" valign="top">
       <h3>🪶 Lightweight</h3>
-      One native app written in Rust. A 66 MB installer, about 100 MB of memory while idle, no background services and no updater running behind your back.
+      One native app written in Rust. A 67 MB installer, about 100 MB of memory while idle, no background services and no updater running behind your back.
     </td>
     <td width="50%" valign="top">
       <h3>📝 Made for documentation</h3>
@@ -79,6 +79,23 @@ Press **Alt+Shift+S**, drag over what you need, annotate it right where it is, a
   <img src="assets/readme/quick-result.png" alt="The copied image: the Profile card with an arrow, the label 'Use your work email' and the API key blurred." width="85%">
 </p>
 </details>
+
+## 🎨 Clean, modern interface
+
+Built with crisp **Inter** typography, custom vector icons, a collapsible tool rail, elevated library cards and a themed Windows title bar that adapts to every color preset.
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="assets/readme/home.png" alt="SnapKit home screen with capture mode cards and the library sidebar showing images and GIFs." width="100%">
+      <p align="center"><sub><b>Home &amp; Library</b> — quick-launch capture cards alongside searchable history, favorites (★), tags and GIF badges.</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="assets/readme/themes.png" alt="SnapKit Preferences window displaying the 3x3 color theme swatches and language settings." width="100%">
+      <p align="center"><sub><b>Preferences &amp; 9 Themes</b> — switch themes live with automatic Windows title bar tinting, plus English and Portuguese UI.</sub></p>
+    </td>
+  </tr>
+</table>
 
 ## ✨ Features
 
@@ -116,7 +133,7 @@ Press **Alt+Shift+S**, drag over what you need, annotate it right where it is, a
 - **Screen recording** to MP4 (`15–60` FPS) with system sound, microphone and optional click highlights
 - **Video editor**: visual filmstrip, live audio preview with waveform, trim, crop, speed (`0.5×–2×`) and **GIF** export
 - **Library** of images, MP4s and GIFs with editable layers, favorites (`★`), tags, search and drag-and-drop
-- English and Portuguese, **9 themes**, tray icon
+- **Modern desktop UI**: embedded **Inter** typography, crisp vector icons, collapsible tool rail, themed Windows title bar, English & Portuguese, **9 themes**, and tray icon
 
 </td>
   </tr>
@@ -256,7 +273,8 @@ You need [Rust](https://rustup.rs) (stable) and the Visual Studio Build Tools wi
 | `src/library.rs` | Capture library, persistent annotation layers, favorites and tags |
 | `src/i18n.rs` | English and Portuguese interface texts |
 | `src/win.rs` | Direct Windows API calls and Per-Monitor V2 DPI handling |
-| `src/tray.rs`, `src/config.rs`, `src/theme.rs`, `src/autostart.rs`, `src/update.rs` | Tray, preferences, themes, start with Windows and updates |
+| `src/icons.rs`, `src/ui.rs`, `src/theme.rs` | Rasterized vector icon set, reusable UI components and 9 color themes |
+| `src/tray.rs`, `src/config.rs`, `src/autostart.rs`, `src/update.rs` | App icon & tray, preferences, start with Windows and updates |
 
 </details>
 
@@ -281,6 +299,6 @@ SnapKit is released under the [MIT License](LICENSE). The installer and the zip 
 <br>
 
 <p align="center">
-  <img src="assets/logo.svg" alt="" width="48"><br>
+  <img src="assets/logo.svg" alt="" width="56"><br>
   <sub>Made with Rust for people who explain things with screenshots.</sub>
 </p>

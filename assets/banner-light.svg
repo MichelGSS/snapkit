@@ -11,6 +11,30 @@
       <stop offset="0" stop-color="#FF8A4C" stop-opacity="0.22"/>
       <stop offset="1" stop-color="#FF8A4C" stop-opacity="0"/>
     </radialGradient>
+    <linearGradient id="logo_bg" x1="10%" y1="6%" x2="92%" y2="96%">
+      <stop offset="0%" stop-color="#FFB443"/>
+      <stop offset="48%" stop-color="#FF6E3A"/>
+      <stop offset="100%" stop-color="#DE2E5B"/>
+    </linearGradient>
+    <radialGradient id="logo_bloom" cx="28%" cy="18%" r="62%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="60%" stop-color="#FFFFFF" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="logo_rim" x1="50%" y1="1.5%" x2="50%" y2="98.5%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.40"/>
+      <stop offset="45%" stop-color="#FFFFFF" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.16"/>
+    </linearGradient>
+    <linearGradient id="logo_glass" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2B3248"/>
+      <stop offset="55%" stop-color="#161925"/>
+      <stop offset="100%" stop-color="#0D0F18"/>
+    </linearGradient>
+    <linearGradient id="logo_ar" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FF944D" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#6EAFFF" stop-opacity="0.45"/>
+    </linearGradient>
   </defs>
   <rect width="1280" height="360" rx="24" fill="url(#bg)"/>
   <rect width="1280" height="360" rx="24" fill="url(#grid)"/>
@@ -28,23 +52,36 @@
     <path d="M40 160 L138 87" stroke="#E5484D" stroke-width="7" stroke-linecap="round"/>
     <path d="M162 69 L126 78 L143 101 Z" fill="#E5484D" stroke="#E5484D" stroke-width="4" stroke-linejoin="round"/>
     <circle cx="215" cy="62" r="22" fill="#2F81F7"/>
-    <text x="215" y="71" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="25" font-weight="700" fill="#fff">1</text>
+    <text x="215" y="71" text-anchor="middle" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="25" font-weight="700" fill="#fff">1</text>
     <rect x="185" y="120" width="90" height="16" rx="4" fill="#FFD43B" fill-opacity="0.65"/>
     <rect x="185" y="150" width="70" height="12" rx="3" fill="#4b5260" fill-opacity="0.35"/>
-    <text x="150" y="238" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17" fill="#4b5260">1280 × 800</text>
+    <text x="150" y="238" text-anchor="middle" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="17" fill="#4b5260">1280 × 800</text>
   </g>
 
   <!-- logo -->
   <g transform="translate(72 92) scale(1.76)">
-    <rect width="100" height="100" rx="22" fill="#FF8A4C"/>
-    <path d="M27 53V27H53M73 47V73H47" fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
-    <rect x="43" y="43" width="14" height="14" fill="#fff"/>
+    <rect width="100" height="100" rx="24" fill="url(#logo_bg)"/>
+    <rect width="100" height="100" rx="24" fill="url(#logo_bloom)"/>
+    <rect x="1.5" y="1.5" width="97" height="97" rx="22.8" fill="none" stroke="url(#logo_rim)" stroke-width="1.8"/>
+    <g transform="translate(0 3)" opacity="0.28" fill="none" stroke="#4A0C16" stroke-width="7.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 38V28.5Q21 21 28.5 21H38 M62 21H71.5Q79 21 79 28.5V38 M79 62V71.5Q79 79 71.5 79H62 M38 79H28.5Q21 79 21 71.5V62"/>
+      <circle cx="50" cy="50" r="18.5" fill="#4A0C16" stroke="none"/>
+    </g>
+    <path d="M21 38V28.5Q21 21 28.5 21H38 M62 21H71.5Q79 21 79 28.5V38 M79 62V71.5Q79 79 71.5 79H62 M38 79H28.5Q21 79 21 71.5V62"
+          fill="none" stroke="#FFFFFF" stroke-width="7.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="50" cy="50" r="18.5" fill="#FFFFFF"/>
+    <circle cx="50" cy="50" r="13.2" fill="url(#logo_glass)"/>
+    <circle cx="50" cy="50" r="10.4" fill="none" stroke="url(#logo_ar)" stroke-width="1.6"/>
+    <circle cx="50" cy="50" r="5.4" fill="#090B12"/>
+    <circle cx="50" cy="50" r="3.2" fill="#465C94" fill-opacity="0.48"/>
+    <circle cx="44.8" cy="44.8" r="3.2" fill="#FFFFFF"/>
+    <circle cx="54.8" cy="54.6" r="1.3" fill="#FFD7AF" fill-opacity="0.85"/>
   </g>
 
-  <text x="290" y="168" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="92" font-weight="700" letter-spacing="-2" fill="#16181d">SnapKit</text>
-  <text x="294" y="214" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="27" fill="#4b5260">Capture, annotate and document your screen.</text>
+  <text x="290" y="168" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="92" font-weight="700" letter-spacing="-2" fill="#16181d">SnapKit</text>
+  <text x="294" y="214" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="27" fill="#4b5260">Capture, annotate and document your screen.</text>
 
-  <g font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="19" font-weight="600" fill="#2b2f38">
+  <g font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="19" font-weight="600" fill="#2b2f38">
     <rect x="294" y="244" width="132" height="40" rx="20" fill="#ffffff" stroke="#FF8A4C" stroke-opacity="0.55"/>
     <text x="360" y="270" text-anchor="middle">100% local</text>
     <rect x="438" y="244" width="152" height="40" rx="20" fill="#ffffff" stroke="#FF8A4C" stroke-opacity="0.55"/>

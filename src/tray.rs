@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, Path, PathBuilder,
+    Pixmap, Point, RadialGradient, SpreadMode, Stroke, Transform,
+};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -19,51 +22,196 @@ const ID_FULL: &str = "full";
 const ID_OPEN: &str = "open";
 const ID_QUIT: &str = "quit";
 
-/// Draws the SnapKit icon: a rounded orange square with white crop marks. Returns non-premultiplied
-/// RGBA, `size`×`size`.
+fn squircle_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
+    let k = r * 0.552_28;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+fn brackets_path() -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    // Top-left
+    pb.move_to(21.0, 38.0);
+    pb.line_to(21.0, 28.5);
+    pb.quad_to(21.0, 21.0, 28.5, 21.0);
+    pb.line_to(38.0, 21.0);
+    // Top-right
+    pb.move_to(62.0, 21.0);
+    pb.line_to(71.5, 21.0);
+    pb.quad_to(79.0, 21.0, 79.0, 28.5);
+    pb.line_to(79.0, 38.0);
+    // Bottom-right
+    pb.move_to(79.0, 62.0);
+    pb.line_to(79.0, 71.5);
+    pb.quad_to(79.0, 79.0, 71.5, 79.0);
+    pb.line_to(62.0, 79.0);
+    // Bottom-left
+    pb.move_to(38.0, 79.0);
+    pb.line_to(28.5, 79.0);
+    pb.quad_to(21.0, 79.0, 21.0, 71.5);
+    pb.line_to(21.0, 62.0);
+    pb.finish()
+}
+
+/// Draws the SnapKit icon: a warm gradient squircle framing precision viewfinder corners and an
+/// optical camera lens. Returns non-premultiplied RGBA, `size`×`size`.
 pub fn icon_rgba(size: u32) -> Vec<u8> {
     let s = size as f32;
+    let xform = Transform::from_scale(s / 100.0, s / 100.0);
     let mut pm = Pixmap::new(size, size).expect("invalid icon size");
 
-    let mut bg = Paint::default();
-    bg.set_color(Color::from_rgba8(255, 138, 76, 255));
-    bg.anti_alias = true;
-    let r = s * 0.22;
-    let mut pb = PathBuilder::new();
-    pb.move_to(r, 0.0);
-    pb.line_to(s - r, 0.0);
-    pb.quad_to(s, 0.0, s, r);
-    pb.line_to(s, s - r);
-    pb.quad_to(s, s, s - r, s);
-    pb.line_to(r, s);
-    pb.quad_to(0.0, s, 0.0, s - r);
-    pb.line_to(0.0, r);
-    pb.quad_to(0.0, 0.0, r, 0.0);
-    pb.close();
-    if let Some(path) = pb.finish() {
-        pm.fill_path(&path, &bg, FillRule::Winding, Transform::identity(), None);
+    // Layer 1: Warm sunset gradient squircle + specular bloom + crisp inner rim highlight
+    if let Some(bg_path) = squircle_path(0.0, 0.0, 100.0, 100.0, 24.0) {
+        let mut bg = Paint { anti_alias: true, ..Default::default() };
+        if let Some(shader) = LinearGradient::new(
+            Point::from_xy(10.0, 6.0),
+            Point::from_xy(92.0, 96.0),
+            vec![
+                GradientStop::new(0.0, Color::from_rgba8(255, 180, 67, 255)),
+                GradientStop::new(0.48, Color::from_rgba8(255, 110, 58, 255)),
+                GradientStop::new(1.0, Color::from_rgba8(222, 46, 91, 255)),
+            ],
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            bg.shader = shader;
+        }
+        pm.fill_path(&bg_path, &bg, FillRule::Winding, xform, None);
+
+        let mut bloom = Paint { anti_alias: true, ..Default::default() };
+        if let Some(shader) = RadialGradient::new(
+            Point::from_xy(28.0, 18.0),
+            0.0,
+            Point::from_xy(28.0, 18.0),
+            62.0,
+            vec![
+                GradientStop::new(0.0, Color::from_rgba8(255, 255, 255, 72)),
+                GradientStop::new(0.6, Color::from_rgba8(255, 255, 255, 13)),
+                GradientStop::new(1.0, Color::from_rgba8(255, 255, 255, 0)),
+            ],
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            bloom.shader = shader;
+        }
+        pm.fill_path(&bg_path, &bloom, FillRule::Winding, xform, None);
     }
 
-    // Two "L" corners, like the marks of a selection.
-    let mut fg = Paint::default();
-    fg.set_color(Color::WHITE);
-    fg.anti_alias = true;
-    let stroke = Stroke { width: (s * 0.11).max(1.5), line_cap: LineCap::Round, ..Default::default() };
-    let (a, b, len) = (s * 0.27, s * 0.73, s * 0.26);
-    let mut pb = PathBuilder::new();
-    pb.move_to(a, a + len);
-    pb.line_to(a, a);
-    pb.line_to(a + len, a);
-    pb.move_to(b, b - len);
-    pb.line_to(b, b);
-    pb.line_to(b - len, b);
-    if let Some(path) = pb.finish() {
-        pm.stroke_path(&path, &fg, &stroke, Transform::identity(), None);
+    if let Some(rim_path) = squircle_path(1.5, 1.5, 97.0, 97.0, 22.8) {
+        let mut rim = Paint { anti_alias: true, ..Default::default() };
+        if let Some(shader) = LinearGradient::new(
+            Point::from_xy(50.0, 1.5),
+            Point::from_xy(50.0, 98.5),
+            vec![
+                GradientStop::new(0.0, Color::from_rgba8(255, 255, 255, 102)),
+                GradientStop::new(0.45, Color::from_rgba8(255, 255, 255, 20)),
+                GradientStop::new(1.0, Color::from_rgba8(0, 0, 0, 40)),
+            ],
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            rim.shader = shader;
+        }
+        let rim_stroke = Stroke { width: 1.8, ..Default::default() };
+        pm.stroke_path(&rim_path, &rim, &rim_stroke, xform, None);
     }
-    // Center dot, so the icon doesn't look empty at small sizes.
-    let dot = s * 0.07;
-    if let Some(rect) = Rect::from_xywh(s / 2.0 - dot, s / 2.0 - dot, dot * 2.0, dot * 2.0) {
-        pm.fill_rect(rect, &fg, Transform::identity(), None);
+
+    let bracket_w = if size <= 24 { 8.8 } else { 7.4 };
+    let bracket_stroke = Stroke {
+        width: bracket_w,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Default::default()
+    };
+
+    // Layer 2: Soft contact shadow under foreground marks
+    if let (Some(b_path), Some(bezel_path)) = (
+        brackets_path(),
+        PathBuilder::from_circle(50.0, 50.0, 18.5),
+    ) {
+        for (dy, alpha, extra_w) in [(4.0f32, 36u8, 2.0f32), (3.0, 72, 0.0)] {
+            let mut sh_paint = Paint { anti_alias: true, ..Default::default() };
+            sh_paint.set_color(Color::from_rgba8(74, 12, 22, alpha));
+            let sh_xform = xform.post_translate(0.0, dy * (s / 100.0));
+            let mut sh_stroke = bracket_stroke.clone();
+            sh_stroke.width += extra_w;
+            pm.stroke_path(&b_path, &sh_paint, &sh_stroke, sh_xform, None);
+            pm.fill_path(&bezel_path, &sh_paint, FillRule::Winding, sh_xform, None);
+        }
+    }
+
+    // Layer 3: Four pure white viewfinder corner brackets
+    let mut white = Paint { anti_alias: true, ..Default::default() };
+    white.set_color(Color::WHITE);
+    if let Some(b_path) = brackets_path() {
+        pm.stroke_path(&b_path, &white, &bracket_stroke, xform, None);
+    }
+
+    // Layer 4: Precision optical camera lens
+    if let Some(bezel) = PathBuilder::from_circle(50.0, 50.0, 18.5) {
+        pm.fill_path(&bezel, &white, FillRule::Winding, xform, None);
+    }
+    if let Some(glass) = PathBuilder::from_circle(50.0, 50.0, 13.2) {
+        let mut glass_paint = Paint { anti_alias: true, ..Default::default() };
+        if let Some(shader) = LinearGradient::new(
+            Point::from_xy(38.0, 38.0),
+            Point::from_xy(62.0, 62.0),
+            vec![
+                GradientStop::new(0.0, Color::from_rgba8(43, 50, 72, 255)),
+                GradientStop::new(0.55, Color::from_rgba8(22, 25, 37, 255)),
+                GradientStop::new(1.0, Color::from_rgba8(13, 15, 24, 255)),
+            ],
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            glass_paint.shader = shader;
+        }
+        pm.fill_path(&glass, &glass_paint, FillRule::Winding, xform, None);
+    }
+    if let Some(ar_ring) = PathBuilder::from_circle(50.0, 50.0, 10.4) {
+        let mut ar_paint = Paint { anti_alias: true, ..Default::default() };
+        if let Some(shader) = LinearGradient::new(
+            Point::from_xy(40.0, 60.0),
+            Point::from_xy(60.0, 40.0),
+            vec![
+                GradientStop::new(0.0, Color::from_rgba8(255, 148, 77, 140)),
+                GradientStop::new(1.0, Color::from_rgba8(110, 175, 255, 115)),
+            ],
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            ar_paint.shader = shader;
+        }
+        let ar_stroke = Stroke { width: 1.6, ..Default::default() };
+        pm.stroke_path(&ar_ring, &ar_paint, &ar_stroke, xform, None);
+    }
+    if let Some(pupil) = PathBuilder::from_circle(50.0, 50.0, 5.4) {
+        let mut p = Paint { anti_alias: true, ..Default::default() };
+        p.set_color(Color::from_rgba8(9, 11, 18, 255));
+        pm.fill_path(&pupil, &p, FillRule::Winding, xform, None);
+    }
+    if let Some(tint) = PathBuilder::from_circle(50.0, 50.0, 3.2) {
+        let mut p = Paint { anti_alias: true, ..Default::default() };
+        p.set_color(Color::from_rgba8(70, 92, 148, 122));
+        pm.fill_path(&tint, &p, FillRule::Winding, xform, None);
+    }
+    if let Some(glint) = PathBuilder::from_circle(44.8, 44.8, 3.2) {
+        pm.fill_path(&glint, &white, FillRule::Winding, xform, None);
+    }
+    if let Some(glint2) = PathBuilder::from_circle(54.8, 54.6, 1.3) {
+        let mut p = Paint { anti_alias: true, ..Default::default() };
+        p.set_color(Color::from_rgba8(255, 215, 175, 217));
+        pm.fill_path(&glint2, &p, FillRule::Winding, xform, None);
     }
 
     pm.pixels()
@@ -170,8 +318,15 @@ mod tests {
         assert_eq!(rgba.len(), 32 * 32 * 4);
         let px = |x: usize, y: usize| &rgba[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
         assert_eq!(px(0, 0)[3], 0, "rounded corner is transparent");
-        assert_eq!(px(16, 4), [255, 138, 76, 255], "orange background");
-        assert_eq!(px(16, 16), [255, 255, 255, 255], "ponto central branco");
+        let bg = px(16, 3);
+        assert_eq!(bg[3], 255);
+        assert!(bg[0] > 200 && bg[0] > bg[2], "warm gradient background: {bg:?}");
+        let lens = px(16, 16);
+        assert_eq!(lens[3], 255);
+        assert!(lens[0] < 85 && lens[1] < 95 && lens[2] < 130, "dark lens interior: {lens:?}");
+        let bezel = px(16, 11);
+        assert_eq!(bezel[3], 255);
+        assert!(bezel[0] > 190 && bezel[1] > 190 && bezel[2] > 190, "white lens bezel: {bezel:?}");
     }
 
     #[test]

@@ -1,5 +1,55 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="256" height="256" role="img" aria-label="SnapKit logo">
-  <rect width="100" height="100" rx="22" fill="#FF8A4C"/>
-  <path d="M27 53V27H53M73 47V73H47" fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="43" y="43" width="14" height="14" fill="#fff"/>
+  <defs>
+    <linearGradient id="logo_bg" x1="10%" y1="6%" x2="92%" y2="96%">
+      <stop offset="0%" stop-color="#FFB443"/>
+      <stop offset="48%" stop-color="#FF6E3A"/>
+      <stop offset="100%" stop-color="#DE2E5B"/>
+    </linearGradient>
+    <radialGradient id="logo_bloom" cx="28%" cy="18%" r="62%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="60%" stop-color="#FFFFFF" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="logo_rim" x1="50%" y1="1.5%" x2="50%" y2="98.5%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.40"/>
+      <stop offset="45%" stop-color="#FFFFFF" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.16"/>
+    </linearGradient>
+    <linearGradient id="logo_glass" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2B3248"/>
+      <stop offset="55%" stop-color="#161925"/>
+      <stop offset="100%" stop-color="#0D0F18"/>
+    </linearGradient>
+    <linearGradient id="logo_ar" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FF944D" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#6EAFFF" stop-opacity="0.45"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="100" height="100" rx="24" fill="url(#logo_bg)"/>
+  <rect width="100" height="100" rx="24" fill="url(#logo_bloom)"/>
+  <rect x="1.5" y="1.5" width="97" height="97" rx="22.8" fill="none" stroke="url(#logo_rim)" stroke-width="1.8"/>
+
+  <!-- Soft contact shadow -->
+  <g transform="translate(0 4)" opacity="0.14" fill="none" stroke="#4A0C16" stroke-width="9.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 38V28.5Q21 21 28.5 21H38 M62 21H71.5Q79 21 79 28.5V38 M79 62V71.5Q79 79 71.5 79H62 M38 79H28.5Q21 79 21 71.5V62"/>
+    <circle cx="50" cy="50" r="18.5" fill="#4A0C16" stroke="none"/>
+  </g>
+  <g transform="translate(0 3)" opacity="0.28" fill="none" stroke="#4A0C16" stroke-width="7.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 38V28.5Q21 21 28.5 21H38 M62 21H71.5Q79 21 79 28.5V38 M79 62V71.5Q79 79 71.5 79H62 M38 79H28.5Q21 79 21 71.5V62"/>
+    <circle cx="50" cy="50" r="18.5" fill="#4A0C16" stroke="none"/>
+  </g>
+
+  <!-- Viewfinder brackets -->
+  <path d="M21 38V28.5Q21 21 28.5 21H38 M62 21H71.5Q79 21 79 28.5V38 M79 62V71.5Q79 79 71.5 79H62 M38 79H28.5Q21 79 21 71.5V62"
+        fill="none" stroke="#FFFFFF" stroke-width="7.4" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Optical camera lens -->
+  <circle cx="50" cy="50" r="18.5" fill="#FFFFFF"/>
+  <circle cx="50" cy="50" r="13.2" fill="url(#logo_glass)"/>
+  <circle cx="50" cy="50" r="10.4" fill="none" stroke="url(#logo_ar)" stroke-width="1.6"/>
+  <circle cx="50" cy="50" r="5.4" fill="#090B12"/>
+  <circle cx="50" cy="50" r="3.2" fill="#465C94" fill-opacity="0.48"/>
+  <circle cx="44.8" cy="44.8" r="3.2" fill="#FFFFFF"/>
+  <circle cx="54.8" cy="54.6" r="1.3" fill="#FFD7AF" fill-opacity="0.85"/>
 </svg>
