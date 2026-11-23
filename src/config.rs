@@ -13,6 +13,30 @@ pub const KEYS: [&str; 49] = [
     "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "PrintScreen",
 ];
 
+/// Keys offered in the shortcut list on this system. Mac keyboards have no Print Screen key.
+pub fn keys() -> impl Iterator<Item = &'static str> {
+    KEYS.into_iter().filter(|k| !cfg!(target_os = "macos") || *k != "PrintScreen")
+}
+
+/// Short names of the modifiers, in the order of the fields `ctrl`, `alt`, `shift`, `win`. On macOS
+/// these are the symbols of the Mac menus (Control, Option, Shift, Command), which also come in
+/// this order there.
+#[cfg(not(target_os = "macos"))]
+pub const MODIFIER_NAMES: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
+#[cfg(target_os = "macos")]
+pub const MODIFIER_NAMES: [&str; 4] = ["⌃", "⌥", "⇧", "⌘"];
+
+/// Names of the modifiers for the shortcut checkboxes, same order as [`MODIFIER_NAMES`].
+#[cfg(not(target_os = "macos"))]
+pub const MODIFIER_LONG_NAMES: [&str; 4] = MODIFIER_NAMES;
+#[cfg(target_os = "macos")]
+pub const MODIFIER_LONG_NAMES: [&str; 4] = ["⌃ Control", "⌥ Option", "⇧ Shift", "⌘ Command"];
+
+/// Between the parts of a shortcut label: "Alt+Shift+S" on Windows, "⌥⇧S" on macOS.
+const LABEL_SEPARATOR: &str = if cfg!(target_os = "macos") { "" } else { "+" };
+
+/// A global shortcut. The field names are those of the Windows keyboard and stay as they are in
+/// `config.json`; on macOS `alt` is the Option key and `win` is the Command key.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HotkeyCfg {
@@ -36,20 +60,22 @@ impl HotkeyCfg {
         mods.set(Modifiers::CONTROL, self.ctrl);
         mods.set(Modifiers::ALT, self.alt);
         mods.set(Modifiers::SHIFT, self.shift);
+        // META is the Windows key on Windows and the Command key on macOS (global-hotkey treats
+        // SUPER as META too).
         mods.set(Modifiers::META, self.win);
         Some(HotKey::new(Some(mods), key_code(&self.key)?))
     }
 
-    /// Text to show the user, such as "Alt+Shift+S".
+    /// Text to show the user, such as "Alt+Shift+S" (Windows) or "⌥⇧S" (macOS).
     pub fn label(&self) -> String {
         let mut parts = Vec::new();
-        for (on, name) in [(self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift"), (self.win, "Win")] {
+        for (on, name) in [self.ctrl, self.alt, self.shift, self.win].into_iter().zip(MODIFIER_NAMES) {
             if on {
                 parts.push(name);
             }
         }
         parts.push(&self.key);
-        parts.join("+")
+        parts.join(LABEL_SEPARATOR)
     }
 
     /// A single letter or digit as a global shortcut would steal normal typing.
@@ -271,7 +297,11 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::path().ok_or(t!("pasta APPDATA não encontrada", "APPDATA folder not found"))?;
+        #[cfg(windows)]
+        let missing = t!("pasta APPDATA não encontrada", "APPDATA folder not found");
+        #[cfg(not(windows))]
+        let missing = t!("pasta pessoal não encontrada", "home folder not found");
+        let path = Self::path().ok_or(missing)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
@@ -312,8 +342,19 @@ mod tests {
     #[test]
     fn label_lists_modifiers_in_order() {
         let h = HotkeyCfg { ctrl: true, alt: false, shift: true, win: true, key: "F5".into() };
-        assert_eq!(h.label(), "Ctrl+Shift+Win+F5");
-        assert_eq!(HotkeyCfg::default().label(), "Alt+Shift+S");
+        if cfg!(target_os = "macos") {
+            assert_eq!(h.label(), "⌃⇧⌘F5");
+            assert_eq!(HotkeyCfg::default().label(), "⌥⇧S");
+        } else {
+            assert_eq!(h.label(), "Ctrl+Shift+Win+F5");
+            assert_eq!(HotkeyCfg::default().label(), "Alt+Shift+S");
+        }
+    }
+
+    #[test]
+    fn the_key_list_fits_the_keyboard() {
+        assert_eq!(keys().any(|k| k == "PrintScreen"), !cfg!(target_os = "macos"));
+        assert!(keys().all(|k| key_code(k).is_some()));
     }
 
     #[test]

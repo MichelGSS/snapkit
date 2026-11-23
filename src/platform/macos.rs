@@ -25,7 +25,7 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
-    NSApplication, NSApplicationActivationOptions, NSBackingStoreType, NSColor, NSCursor,
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSCursor,
     NSNormalWindowLevel, NSPasteboard, NSPasteboardWriting, NSPopUpMenuWindowLevel,
     NSRunningApplication, NSScreen, NSStatusWindowLevel, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask, NSWorkspace,
@@ -223,6 +223,20 @@ pub fn enter_down() -> bool {
 /// Returns whether it's granted; the first time, macOS shows its own prompt.
 pub fn ensure_input_permission() -> bool {
     objc2_core_graphics::CGPreflightPostEventAccess() || objc2_core_graphics::CGRequestPostEventAccess()
+}
+
+/// Asks for the Input Monitoring permission, which reading the keyboard state of the whole system
+/// needs ([`escape_pressed`], [`enter_down`]): Esc stopping the scrolling capture, Enter as a
+/// step. The mouse buttons don't need it. Returns whether it's granted; the first time, macOS
+/// shows its own prompt.
+pub fn ensure_key_permission() -> bool {
+    key_permission() || objc2_core_graphics::CGRequestListenEventAccess()
+}
+
+/// Is the Input Monitoring permission granted? Unlike [`ensure_key_permission`], never shows the
+/// system prompt (which would land in the middle of a capture).
+pub fn key_permission() -> bool {
+    objc2_core_graphics::CGPreflightListenEventAccess()
 }
 
 /// Asks for the Screen Recording permission. Without it, captures only show the wallpaper and
@@ -552,6 +566,11 @@ pub fn is_on_screen(hwnd: isize) -> bool {
     with_window(hwnd, |w, _| w.isVisible() && !w.isMiniaturized())
 }
 
+/// Is the window put away: hidden, and not just minimized to the Dock?
+pub fn is_hidden(hwnd: isize) -> bool {
+    with_window(hwnd, |w, _| !w.isVisible() && !w.isMiniaturized())
+}
+
 pub fn minimize(hwnd: isize) {
     with_window(hwnd, |w, _| {
         // A borderless window (the selection layer) can't go to the Dock; it's hidden instead.
@@ -602,6 +621,24 @@ pub fn set_tool_window(hwnd: isize, on: bool) {
     });
 }
 
+/// Shows or removes SnapKit's icon in the Dock (and its menu bar). Put away in the menu bar, the
+/// program has no window on screen and shouldn't linger in the Dock.
+pub fn set_dock_icon(visible: bool) {
+    let policy = if visible { NSApplicationActivationPolicy::Regular } else { NSApplicationActivationPolicy::Accessory };
+    run_on_main(move |mtm| {
+        let app = NSApplication::sharedApplication(mtm);
+        if app.activationPolicy() == policy {
+            return;
+        }
+        app.setActivationPolicy(policy);
+        if visible {
+            // Coming back as a regular app, it has to be activated again to get its menu bar.
+            #[allow(deprecated)]
+            app.activateIgnoringOtherApps(true);
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Messages, clipboard, drag
 
@@ -643,10 +680,9 @@ pub fn copy_files_to_clipboard(paths: &[PathBuf]) -> Result<(), String> {
     if ok { Ok(()) } else { Err(t!("a área de transferência recusou os arquivos", "the clipboard refused the files").to_owned()) }
 }
 
-/// Dragging files out of the library into other programs isn't available on macOS yet.
-pub fn start_file_drag(_paths: &[PathBuf]) -> bool {
-    false
-}
+#[path = "macos_drag.rs"]
+mod drag;
+pub use drag::start_file_drag;
 
 // ---------------------------------------------------------------------------------------------
 // Time and child processes

@@ -48,6 +48,18 @@ use ui as kit;
 
 const APP_NAME: &str = "SnapKit";
 
+/// A shortcut with the system's command key, for the hints: "Ctrl C" on Windows, "⌘C" on macOS.
+/// The keys themselves are read with `egui::Modifiers::COMMAND`, which is the same key.
+fn cmd_key(key: &str) -> String {
+    if cfg!(target_os = "macos") { format!("⌘{key}") } else { format!("Ctrl {key}") }
+}
+
+/// Where the error log is, written the way the system shows paths.
+#[cfg(windows)]
+const ERROR_LOG: &str = "%APPDATA%\\SnapKit\\error.log";
+#[cfg(not(windows))]
+const ERROR_LOG: &str = "~/Library/Application Support/SnapKit/error.log";
+
 #[derive(Clone, Copy, PartialEq)]
 enum CaptureKind {
     Region,
@@ -388,6 +400,15 @@ struct App {
     update_note: String,
     /// Results of the update check and download, from the background.
     update_pending: Arc<Mutex<Option<UpdateMsg>>>,
+    /// macOS: whether SnapKit's icon is in the Dock right now (see `sync_dock_icon`).
+    #[cfg(target_os = "macos")]
+    dock_visible: bool,
+    /// `shutdown` already ran (it's also called when macOS ends the program with Quit).
+    #[cfg(target_os = "macos")]
+    shut_down: bool,
+    /// For `on_exit`, which gets no context.
+    #[cfg(target_os = "macos")]
+    egui_ctx: egui::Context,
 }
 
 /// State of the small floating panel of the panoramic capture.
@@ -407,6 +428,8 @@ struct StepsUi {
     title: String,
     /// `None` until the user presses Start.
     recorder: Option<steps::Recorder>,
+    /// The keyboard can be read (macOS asks for Input Monitoring), so Enter also makes a step.
+    keys_ok: bool,
     /// Frame around the area, visible while the panel exists.
     _frame: Option<platform::RegionFrame>,
     setup_frames: u8,
@@ -597,6 +620,12 @@ impl App {
             update_state: UpdateState::Idle,
             update_note: String::new(),
             update_pending: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            dock_visible: true,
+            #[cfg(target_os = "macos")]
+            shut_down: false,
+            #[cfg(target_os = "macos")]
+            egui_ctx: cc.egui_ctx.clone(),
         };
         // `snapkit --select` opens straight into region selection (shortcuts and tests).
         if std::env::args().any(|a| a == "--select") {
@@ -632,9 +661,10 @@ impl App {
         let mut candidates: Vec<(HotkeyCfg, HotKey, CaptureKind)> = Vec::new();
         let mut push_candidate = |cfg: &HotkeyCfg, kind: CaptureKind| -> Result<(), String> {
             if !cfg.is_safe() {
+                let [ctrl, alt, _, win] = config::MODIFIER_LONG_NAMES;
                 return Err(tf!(
-                    "{} atrapalharia a digitação; inclua Ctrl, Alt ou Win.",
-                    "{} would get in the way of typing; include Ctrl, Alt or Win.",
+                    "{} atrapalharia a digitação; inclua {ctrl}, {alt} ou {win}.",
+                    "{} would get in the way of typing; include {ctrl}, {alt} or {win}.",
                     cfg.label()
                 ));
             }
@@ -1127,7 +1157,11 @@ impl App {
                                 tray_ok,
                                 egui::Checkbox::new(
                                     &mut close_to_tray,
-                                    t!("Fechar a janela mantém o SnapKit na bandeja", "Closing the window keeps SnapKit in the tray"),
+                                    if cfg!(target_os = "macos") {
+                                        t!("Fechar a janela mantém o SnapKit na barra de menus", "Closing the window keeps SnapKit in the menu bar")
+                                    } else {
+                                        t!("Fechar a janela mantém o SnapKit na bandeja", "Closing the window keeps SnapKit in the tray")
+                                    },
                                 ),
                             );
                             if close_to_tray != self.cfg.close_to_tray {
@@ -1135,7 +1169,12 @@ impl App {
                                 self.save_cfg();
                             }
                             let mut autostart = self.autostart;
-                            ui.checkbox(&mut autostart, t!("Iniciar com o Windows (na bandeja)", "Start with Windows (in the tray)"));
+                            let autostart_label = if cfg!(target_os = "macos") {
+                                t!("Abrir ao iniciar sessão (na barra de menus)", "Start at login (in the menu bar)")
+                            } else {
+                                t!("Iniciar com o Windows (na bandeja)", "Start with Windows (in the tray)")
+                            };
+                            ui.checkbox(&mut autostart, autostart_label);
                             if autostart != self.autostart {
                                 match autostart::set_enabled(autostart) {
                                     Ok(()) => self.autostart = autostart,
@@ -1145,7 +1184,14 @@ impl App {
                             if !tray_ok {
                                 ui.colored_label(
                                     pal.warning,
-                                    t!("O ícone da bandeja não pôde ser criado nesta sessão.", "The tray icon could not be created in this session."),
+                                    if cfg!(target_os = "macos") {
+                                        t!(
+                                            "O ícone da barra de menus não pôde ser criado nesta sessão.",
+                                            "The menu bar icon could not be created in this session."
+                                        )
+                                    } else {
+                                        t!("O ícone da bandeja não pôde ser criado nesta sessão.", "The tray icon could not be created in this session.")
+                                    },
                                 );
                             }
                         });
@@ -1378,6 +1424,10 @@ impl App {
     /// Stops any active recording or capture session and finishes writing pending captures before
     /// the program exits.
     fn shutdown(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        {
+            self.shut_down = true;
+        }
         pin::close_all();
         if let Some(session) = self.video.take().and_then(|v| v.recorder) {
             let _ = session.stop();
@@ -2602,10 +2652,30 @@ impl App {
         direction: scroll::Direction,
         title: String,
     ) {
+        // macOS: the scrolling is done with synthesized wheel events, which need the Accessibility
+        // permission. Without it nothing would scroll and the capture would end after one shot.
+        if !platform::ensure_input_permission() {
+            self.settle_window(false);
+            self.status = t!(
+                "A captura com rolagem precisa controlar a rolagem: permita o SnapKit em Ajustes do Sistema > Privacidade e Segurança > Acessibilidade e tente de novo.",
+                "The scrolling capture needs to control scrolling: allow SnapKit in System Settings > Privacy & Security > Accessibility and try again."
+            )
+            .to_owned();
+            return;
+        }
         if self.shared.busy.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.status = t!("Capturando com rolagem… Esc interrompe.", "Scrolling capture… Esc stops.").to_owned();
+        self.status = if platform::key_permission() {
+            t!("Capturando com rolagem… Esc interrompe.", "Scrolling capture… Esc stops.")
+        } else {
+            // macOS without Input Monitoring: Esc can't be read, the capture runs to the end.
+            t!(
+                "Capturando com rolagem… Para o Esc interromper, permita o SnapKit em Ajustes do Sistema > Privacidade e Segurança > Monitoramento de Entrada.",
+                "Scrolling capture… For Esc to stop it, allow SnapKit in System Settings > Privacy & Security > Input Monitoring."
+            )
+        }
+        .to_owned();
         let (shared, ctx) = (self.shared.clone(), ctx.clone());
         ctx.request_repaint();
         std::thread::spawn(move || {
@@ -3195,7 +3265,10 @@ impl App {
     fn start_steps(&mut self, rect: platform::PxRect, title: String) {
         self.shared.busy.store(true, Ordering::SeqCst);
         let frame = platform::RegionFrame::show(rect);
-        self.steps = Some(StepsUi { rect, title, recorder: None, _frame: frame, setup_frames: 6 });
+        // Asked now, before Start: once the session runs, clicking the system prompt inside the
+        // area would become a step.
+        let keys_ok = platform::ensure_key_permission();
+        self.steps = Some(StepsUi { rect, title, recorder: None, keys_ok, _frame: frame, setup_frames: 6 });
     }
 
     fn steps_ui(&mut self, ui: &mut egui::Ui) {
@@ -3215,10 +3288,18 @@ impl App {
                     start = kit::primary_button(ui, Some(Icon::RecordDot), t!("Começar", "Start")).clicked();
                     cancel = kit::ghost_button(ui, None, t!("Cancelar", "Cancel"), false).clicked();
                     kit::divider_v(ui, 18.0);
-                    ui.label(t!(
-                        "Depois de começar, cada clique na área (e cada Enter) vira um passo.",
-                        "Once started, each click in the area (and each Enter) becomes a step."
-                    ));
+                    if steps.keys_ok {
+                        ui.label(t!(
+                            "Depois de começar, cada clique na área (e cada Enter) vira um passo.",
+                            "Once started, each click in the area (and each Enter) becomes a step."
+                        ));
+                    } else {
+                        // macOS without Input Monitoring: the clicks still count, Enter doesn't.
+                        ui.label(egui::RichText::new(t!(
+                            "Depois de começar, cada clique na área vira um passo. Para o Enter contar também, permita o SnapKit em Ajustes do Sistema > Privacidade e Segurança > Monitoramento de Entrada.",
+                            "Once started, each click in the area becomes a step. For Enter to count too, allow SnapKit in System Settings > Privacy & Security > Input Monitoring."
+                        )).size(12.0));
+                    }
                 }
                 Some(recorder) => {
                     let count = recorder.count();
@@ -3564,7 +3645,7 @@ impl App {
                         quick.editor.quick_toolbar_ui(ui);
                         kit::divider_v(ui, 18.0);
                         if kit::primary_button(ui, Some(Icon::Copy), t!("Copiar", "Copy"))
-                            .on_hover_text(t!("Copia e fecha (Enter ou Ctrl C)", "Copies and closes (Enter or Ctrl C)"))
+                            .on_hover_text(tf!("Copia e fecha (Enter ou {})", "Copies and closes (Enter or {})", cmd_key("C")))
                             .clicked()
                         {
                             action = Some(QuickAction::Copy);
@@ -3579,13 +3660,13 @@ impl App {
                             action = Some(QuickAction::Pin);
                         }
                         if kit::ghost_button(ui, Some(Icon::Save), t!("Salvar", "Save"), false)
-                            .on_hover_text("Ctrl S")
+                            .on_hover_text(cmd_key("S"))
                             .clicked()
                         {
                             action = Some(QuickAction::Save);
                         }
                         if kit::ghost_button(ui, Some(Icon::Edit), t!("Editor", "Editor"), false)
-                            .on_hover_text(t!("Continua no editor completo (Ctrl E)", "Continues in the full editor (Ctrl E)"))
+                            .on_hover_text(tf!("Continua no editor completo ({})", "Continues in the full editor ({})", cmd_key("E")))
                             .clicked()
                         {
                             action = Some(QuickAction::Editor);
@@ -3734,6 +3815,23 @@ impl App {
             self.put_away();
         }
         ctx.request_repaint();
+    }
+
+    /// macOS: the Dock icon follows the main window. Put away in the menu bar (hidden, not
+    /// minimized), SnapKit leaves the Dock and the app menu bar; when the window comes back, so does
+    /// the icon. Without a menu bar icon the Dock is the only way back, so it stays. Captures in
+    /// progress don't count: the window is only passing through (selection layer, minimized while
+    /// scrolling, panels).
+    #[cfg(target_os = "macos")]
+    fn sync_dock_icon(&mut self) {
+        if self.tray.is_none() || self.selecting.is_some() || self.settle.is_some() || self.shared.busy.load(Ordering::SeqCst) {
+            return;
+        }
+        let visible = !platform::is_hidden(self.shared.hwnd);
+        if visible != self.dock_visible {
+            self.dock_visible = visible;
+            platform::set_dock_icon(visible);
+        }
     }
 
     /// Takes the window off the screen: to the tray, if there is one, or to the taskbar.
@@ -3981,7 +4079,7 @@ impl App {
                 painter.rect_stroke(s, 0.0, Stroke::new(2.0, self.accent()), StrokeKind::Inside);
                 let size = format!("{:.0} × {:.0}", s.width() * scale_x, s.height() * scale_y);
                 let label = if drawn.is_some() {
-                    tf!("{size}  •  arraste para mover, puxe as alças, Ctrl C captura", "{size}  •  drag to move, pull the handles, Ctrl C captures")
+                    tf!("{size}  •  arraste para mover, puxe as alças, {} captura", "{size}  •  drag to move, pull the handles, {} captures", cmd_key("C"))
                 } else if drag_rect.is_some() {
                     size
                 } else {
@@ -4148,9 +4246,10 @@ impl App {
                                 Some(Icon::CaptureFrame),
                                 t!("Capturar (Enter)", "Capture (Enter)"),
                             )
-                            .on_hover_text(t!(
-                                "Ctrl C ou duplo clique dentro da região também captura",
-                                "Ctrl C or a double-click inside the region also captures"
+                            .on_hover_text(tf!(
+                                "{} ou duplo clique dentro da região também captura",
+                                "{} or a double-click inside the region also captures",
+                                cmd_key("C")
                             ))
                             .clicked()
                             {
@@ -4493,10 +4592,14 @@ impl App {
                                         t!("Player", "Player"),
                                         false,
                                     )
-                                    .on_hover_text(t!(
-                                        "Abre o vídeo no reprodutor padrão do Windows.",
-                                        "Opens the video in the default Windows media player."
-                                    ))
+                                    .on_hover_text(if cfg!(target_os = "macos") {
+                                        t!("Abre o vídeo no reprodutor padrão do macOS.", "Opens the video in the default macOS player.")
+                                    } else {
+                                        t!(
+                                            "Abre o vídeo no reprodutor padrão do Windows.",
+                                            "Opens the video in the default Windows media player."
+                                        )
+                                    })
                                     .clicked()
                                     {
                                         platform::open(ve.path());
@@ -4598,9 +4701,10 @@ impl App {
                                             kit::ghost_button(ui, Some(Icon::Save), t!("Salvar…", "Save…"), false)
                                         })
                                         .inner
-                                        .on_hover_text(t!(
-                                            "Salva em PNG, JPEG, WebP, PDF ou BMP (Ctrl S)",
-                                            "Saves as PNG, JPEG, WebP, PDF, or BMP (Ctrl S)"
+                                        .on_hover_text(tf!(
+                                            "Salva em PNG, JPEG, WebP, PDF ou BMP ({})",
+                                            "Saves as PNG, JPEG, WebP, PDF, or BMP ({})",
+                                            cmd_key("S")
                                         ))
                                         .clicked()
                                         && let Some(e) = &mut self.editor
@@ -4618,7 +4722,7 @@ impl App {
                                             )
                                         })
                                         .inner
-                                        .on_hover_text("Ctrl C")
+                                        .on_hover_text(cmd_key("C"))
                                         .clicked()
                                         && let Some(e) = &mut self.editor
                                     {
@@ -5049,9 +5153,10 @@ impl App {
             if kit::pill_toggle(
                 ui,
                 Some(Icon::Clipboard),
-                t!(
-                    "Abrir imagem da área de transferência (Ctrl V)",
-                    "Open image from clipboard (Ctrl V)"
+                &tf!(
+                    "Abrir imagem da área de transferência ({})",
+                    "Open image from clipboard ({})",
+                    cmd_key("V")
                 ),
                 false,
             )
@@ -5244,6 +5349,19 @@ impl eframe::App for App {
             }
             self.home_ui(ui);
         }
+        #[cfg(target_os = "macos")]
+        self.sync_dock_icon();
+    }
+
+    /// macOS: Quit in the app menu (⌘Q) ends the event loop without a close request, and the
+    /// process exits right after; what closing does (finish a recording, save the open capture)
+    /// still has to happen.
+    #[cfg(target_os = "macos")]
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if !self.shut_down {
+            let ctx = self.egui_ctx.clone();
+            self.shutdown(&ctx);
+        }
     }
 }
 
@@ -5275,7 +5393,7 @@ fn spawn_instance_listener(shared: Arc<Shared>, ctx: egui::Context) {
 /// it's restarted. The panic itself is written to `error.log` by the hook set in `main`.
 fn guarded<T>(job: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-        .unwrap_or_else(|_| Err(t!("erro interno (detalhes em %APPDATA%\\SnapKit\\error.log)", "internal error (details in %APPDATA%\\SnapKit\\error.log)").to_owned()))
+        .unwrap_or_else(|_| Err(tf!("erro interno (detalhes em {ERROR_LOG})", "internal error (details in {ERROR_LOG})")))
 }
 
 const ALL_SHORTCUT_MODES: [config::CaptureShortcutMode; 6] = [
@@ -5310,15 +5428,17 @@ fn mode_hotkey_label(mode: config::CaptureShortcutMode) -> &'static str {
 }
 
 fn hotkey_editor_row(ui: &mut egui::Ui, id_salt: impl std::hash::Hash + std::fmt::Debug, hk: &mut HotkeyCfg) {
-    ui.checkbox(&mut hk.ctrl, "Ctrl");
-    ui.checkbox(&mut hk.alt, "Alt");
-    ui.checkbox(&mut hk.shift, "Shift");
-    ui.checkbox(&mut hk.win, "Win");
+    // Windows: Ctrl, Alt, Shift, Win. macOS: Control, Option, Shift, Command.
+    let [ctrl, alt, shift, win] = config::MODIFIER_LONG_NAMES;
+    ui.checkbox(&mut hk.ctrl, ctrl);
+    ui.checkbox(&mut hk.alt, alt);
+    ui.checkbox(&mut hk.shift, shift);
+    ui.checkbox(&mut hk.win, win);
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(hk.key.clone())
         .width(100.0)
         .show_ui(ui, |ui| {
-            for key in config::KEYS {
+            for key in config::keys() {
                 ui.selectable_value(&mut hk.key, key.to_owned(), key);
             }
         });
@@ -5501,7 +5621,16 @@ fn fatal_box(detail: &str) {
              Suas capturas estão na biblioteca. Se isso se repetir, informe o problema junto com o \
              arquivo abaixo.\n\n\
              {detail}\n\n\
-             Details / Detalhes: %APPDATA%\\SnapKit\\error.log"
+             Details / Detalhes: {ERROR_LOG}"
+        )
+    } else if cfg!(target_os = "macos") {
+        format!(
+            "SnapKit could not start.\n\
+             If this keeps happening, please report it with the file below.\n\n\
+             O SnapKit não conseguiu iniciar.\n\
+             Se isso se repetir, informe o problema junto com o arquivo abaixo.\n\n\
+             {detail}\n\n\
+             Details / Detalhes: {ERROR_LOG}"
         )
     } else {
         format!(
@@ -5512,7 +5641,7 @@ fn fatal_box(detail: &str) {
              Se isso se repetir, atualize o driver de vídeo e instale o Microsoft Visual C++ \
              Redistributable (x64) mais recente.\n\n\
              {detail}\n\n\
-             Details / Detalhes: %APPDATA%\\SnapKit\\error.log"
+             Details / Detalhes: {ERROR_LOG}"
         )
     };
     platform::error_box(APP_NAME, &text);

@@ -235,7 +235,13 @@ pub struct Tray {
 impl Tray {
     /// Writes the menu items in the current language, with the capture shortcut next to it.
     pub fn relabel(&self, hotkey_label: &str) {
-        self.region.set_text(tf!("Capturar região\t{hotkey_label}", "Capture region\t{hotkey_label}"));
+        // Windows menus align what follows a tab to the right, like a shortcut. macOS menus don't,
+        // so the shortcut goes in parentheses there.
+        if cfg!(target_os = "macos") {
+            self.region.set_text(tf!("Capturar região ({hotkey_label})", "Capture region ({hotkey_label})"));
+        } else {
+            self.region.set_text(tf!("Capturar região\t{hotkey_label}", "Capture region\t{hotkey_label}"));
+        }
         self.full.set_text(t!("Capturar tela cheia", "Capture full screen"));
         self.open.set_text(t!("Abrir SnapKit", "Open SnapKit"));
         self.quit.set_text(t!("Sair", "Quit"));

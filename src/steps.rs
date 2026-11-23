@@ -69,6 +69,10 @@ fn contains(r: PxRect, p: (i32, i32)) -> bool {
 impl Recorder {
     /// Starts watching the actions inside `rect` (screen coordinates). Clicks on the window
     /// `own_hwnd` (our panel) don't count. `on_shot` is called after each shot.
+    ///
+    /// On macOS the mouse buttons can always be read, but the Enter key only with the Input
+    /// Monitoring permission (`platform::ensure_key_permission`, asked when the panel opens).
+    /// Without it, the clicks still become steps.
     pub fn start(rect: PxRect, own_hwnd: isize, on_shot: impl Fn() + Send + 'static) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let shots = Arc::new(Mutex::new(Vec::new()));

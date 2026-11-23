@@ -636,6 +636,16 @@ pub fn ensure_input_permission() -> bool {
     true
 }
 
+/// Windows needs no permission to read the keyboard state.
+pub fn ensure_key_permission() -> bool {
+    true
+}
+
+/// Windows needs no permission to read the keyboard state.
+pub fn key_permission() -> bool {
+    true
+}
+
 /// Windows needs no permission to capture the screen.
 pub fn ensure_screen_permission() -> bool {
     true
