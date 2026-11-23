@@ -45,7 +45,12 @@ impl Default for Options {
     }
 }
 
-/// Path of the bundled `ffmpeg` (`ffmpeg.exe` on Windows), if it exists.
+#[cfg(not(target_os = "linux"))]
+const H264_ENCODER: &str = "libopenh264";
+#[cfg(target_os = "linux")]
+const H264_ENCODER: &str = "libx264";
+
+/// Path of the bundled `ffmpeg` (`ffmpeg.exe` on Windows, or system `ffmpeg` on Linux), if it exists.
 pub fn find_ffmpeg() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(dir) = std::env::var_os("SNAPKIT_FFMPEG_DIR") {
@@ -56,7 +61,24 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
     }
     #[cfg(debug_assertions)]
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor").join("ffmpeg"));
-    candidates.into_iter().map(|d| d.join(crate::platform::exe_name("ffmpeg"))).find(|p| p.is_file())
+    if let Some(found) = candidates.into_iter().map(|d| d.join(crate::platform::exe_name("ffmpeg"))).find(|p| p.is_file()) {
+        return Some(found);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(paths) = std::env::var_os("PATH")
+            && let Some(found) = std::env::split_paths(&paths)
+                .map(|p| p.join("ffmpeg"))
+                .find(|p| p.is_file())
+        {
+            return Some(found);
+        }
+        let sys = Path::new("/usr/bin/ffmpeg");
+        if sys.is_file() {
+            return Some(sys.to_path_buf());
+        }
+    }
+    None
 }
 
 fn ffmpeg_command(ffmpeg: &Path) -> Command {
@@ -75,7 +97,7 @@ fn bitrate_kbps(w: i32, h: i32, quality: crate::config::VideoQuality) -> i64 {
     ((base_kbps as f64 * quality.bitrate_factor()).round() as i64).clamp(1000, 35_000)
 }
 
-/// FFmpeg command line to record the image of `rect` to `out` (Windows, `gdigrab`).
+/// FFmpeg command line to record the image of `rect` to `out` (Windows `gdigrab`, Linux `x11grab`).
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn capture_args(rect: PxRect, options: Options, out: &Path) -> Vec<String> {
     // H.264 requires an even width and height.
@@ -83,28 +105,34 @@ fn capture_args(rect: PxRect, options: Options, out: &Path) -> Vec<String> {
     let fps = options.fps.clamp(10, 60);
     let kbps = bitrate_kbps(w, h, options.quality);
     let draw_mouse = if options.draw_mouse { "1" } else { "0" };
-    let mut a: Vec<String> = [
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-thread_queue_size",
-        "1024",
-        "-f",
-        "gdigrab",
-        "-draw_mouse",
-        draw_mouse,
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let mut a: Vec<String> = ["-y", "-hide_banner", "-loglevel", "error"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let mut add = |key: &str, value: String| a.extend([key.to_owned(), value]);
-    add("-framerate", fps.to_string());
-    add("-offset_x", rect.0.to_string());
-    add("-offset_y", rect.1.to_string());
-    add("-video_size", format!("{w}x{h}"));
-    add("-i", "desktop".to_owned());
-    add("-c:v", "libopenh264".to_owned());
+    #[cfg(not(target_os = "linux"))]
+    {
+        add("-thread_queue_size", "1024".to_owned());
+        add("-f", "gdigrab".to_owned());
+        add("-draw_mouse", draw_mouse.to_owned());
+        add("-framerate", fps.to_string());
+        add("-offset_x", rect.0.to_string());
+        add("-offset_y", rect.1.to_string());
+        add("-video_size", format!("{w}x{h}"));
+        add("-i", "desktop".to_owned());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned());
+        add("-f", "x11grab".to_owned());
+        add("-draw_mouse", draw_mouse.to_owned());
+        add("-framerate", fps.to_string());
+        add("-video_size", format!("{w}x{h}"));
+        add("-i", format!("{display}+{},{}", rect.0, rect.1));
+    }
+    add("-c:v", H264_ENCODER.to_owned());
+    #[cfg(target_os = "linux")]
+    add("-preset", "veryfast".to_owned());
     add("-b:v", format!("{kbps}k"));
     add("-pix_fmt", "yuv420p".to_owned());
     add("-movflags", "+faststart".to_owned());
@@ -1155,7 +1183,7 @@ fn edit_video_args(video: &Path, opts: &VideoEditOptions, out: &Path) -> Vec<Str
         a.extend(["-vf".to_owned(), vf_parts.join(",")]);
     }
 
-    for s in ["-c:v", "libopenh264", "-b:v", "8000k", "-pix_fmt", "yuv420p"] {
+    for s in ["-c:v", H264_ENCODER, "-b:v", "8000k", "-pix_fmt", "yuv420p"] {
         a.push(s.to_owned());
     }
     if opts.mute {
@@ -1209,7 +1237,7 @@ fn trim_args(video: &Path, start: f64, end: f64, out: &Path) -> Vec<String> {
     a.push(path(video));
     // After "-i" the cut is frame-accurate; the image is re-encoded because of that.
     a.extend(["-ss".to_owned(), format!("{start:.3}"), "-to".to_owned(), format!("{end:.3}")]);
-    for s in ["-c:v", "libopenh264", "-b:v", "8000k", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"] {
+    for s in ["-c:v", H264_ENCODER, "-b:v", "8000k", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"] {
         a.push(s.to_owned());
     }
     a.push(path(out));
@@ -1295,9 +1323,17 @@ mod tests {
     fn capture_uses_even_size_and_screen_offsets() {
         // Monitor to the left of the primary one: negative coordinates; an odd size becomes even.
         let a = capture_args((-1920, 191, -1119, 792), Options::default(), Path::new("saida.mp4")).join(" ");
-        assert!(a.contains("-thread_queue_size 1024 -f gdigrab"), "{a}");
-        assert!(a.contains("-offset_x -1920 -offset_y 191 -video_size 800x600 -i desktop"), "{a}");
-        assert!(a.contains("-framerate 30") && a.contains("-c:v libopenh264"), "{a}");
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(a.contains("-thread_queue_size 1024 -f gdigrab"), "{a}");
+            assert!(a.contains("-offset_x -1920 -offset_y 191 -video_size 800x600 -i desktop"), "{a}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(a.contains("-f x11grab"), "{a}");
+            assert!(a.contains("-video_size 800x600 -i") && a.contains("+-1920,191"), "{a}");
+        }
+        assert!(a.contains("-framerate 30") && a.contains(&format!("-c:v {H264_ENCODER}")), "{a}");
         assert!(a.contains("-draw_mouse 1"), "{a}");
         assert!(a.ends_with("-movflags +faststart saida.mp4"), "{a}");
 
@@ -1398,7 +1434,7 @@ Input #0, mov,mp4, from 'silent.mp4':
         assert!(args.contains("-ss 1.250 -to 8.500"), "{args}");
         assert!(args.contains("crop=640:480:10:20,scale='min(1280,iw)':-2,setpts=0.5000*PTS"), "{args}");
         assert!(args.contains("-af atempo=2.000"), "{args}");
-        assert!(args.contains("-c:v libopenh264") && args.contains("-pix_fmt yuv420p"), "{args}");
+        assert!(args.contains(&format!("-c:v {H264_ENCODER}")) && args.contains("-pix_fmt yuv420p"), "{args}");
 
         let muted = VideoEditOptions { mute: true, ..VideoEditOptions::default() };
         let args_m = edit_video_args(Path::new("in.mp4"), &muted, Path::new("out.mp4")).join(" ");
@@ -1476,7 +1512,7 @@ Input #0, mov,mp4, from 'silent.mp4':
         assert!(gif.contains("-i v.mp4 -ss 1.500 -to 4.000 -vf fps=24,split[a][b]"), "{gif}");
 
         let cut = trim_args(Path::new("v.mp4"), 2.0, 5.25, Path::new("o.mp4")).join(" ");
-        assert!(cut.contains("-i v.mp4 -ss 2.000 -to 5.250 -c:v libopenh264"), "{cut}");
+        assert!(cut.contains(&format!("-i v.mp4 -ss 2.000 -to 5.250 -c:v {H264_ENCODER}")), "{cut}");
         assert!(cut.ends_with("o.mp4"), "{cut}");
     }
 

@@ -1,7 +1,7 @@
 //! Screen capture: photographs the monitor under the cursor, in physical pixels.
 
 use image::RgbaImage;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use xcap::Monitor;
 
 use crate::platform::{self, PxRect};
@@ -55,6 +55,66 @@ fn photograph_monitor_at(p: (i32, i32)) -> Result<(RgbaImage, (i32, i32)), Strin
     let rect = platform::monitor_rect_at(p);
     let image = platform::capture_px(rect).map_err(|e| tf!("falha ao capturar a tela: {e}", "could not capture the screen: {e}"))?;
     Ok((image, (rect.0, rect.1)))
+}
+
+#[cfg(target_os = "linux")]
+fn capture_linux_fallback() -> Result<RgbaImage, String> {
+    static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("snapkit-cap-{}-{id}.png", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    let ok = std::process::Command::new("spectacle")
+        .args(["-b", "-n", "-f", "-o"])
+        .arg(&tmp)
+        .status()
+        .is_ok_and(|s| s.success())
+        || std::process::Command::new("grim")
+            .arg(&tmp)
+            .status()
+            .is_ok_and(|s| s.success());
+
+    if ok && tmp.is_file() {
+        let img = image::open(&tmp).map(|i| i.to_rgba8()).map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&tmp);
+        return img;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(t!("falha ao capturar a tela", "could not capture the screen").to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_monitor_rect(m: &Monitor) -> Option<PxRect> {
+    platform::monitor_physical_rect(m)
+}
+
+#[cfg(target_os = "linux")]
+fn photograph_monitor_at(p: (i32, i32)) -> Result<(RgbaImage, (i32, i32)), String> {
+    let monitor = Monitor::from_point(p.0, p.1)
+        .or_else(|_| primary_monitor())
+        .map_err(|e| tf!("nenhum monitor encontrado: {e}", "no monitor found: {e}"))?;
+    let rect = linux_monitor_rect(&monitor);
+    let (ox, oy) = rect
+        .map(|r| (r.0, r.1))
+        .unwrap_or_else(|| (monitor.x().unwrap_or(0), monitor.y().unwrap_or(0)));
+    let image = match monitor.capture_image() {
+        Ok(img) => img,
+        Err(e) => {
+            if let Ok(full) = capture_linux_fallback() {
+                let mw = rect.map(|r| r.2 - r.0).unwrap_or_else(|| full.width() as i32);
+                let mh = rect.map(|r| r.3 - r.1).unwrap_or_else(|| full.height() as i32);
+                let desktop = platform::virtual_screen();
+                let rx = (ox - desktop.0).clamp(0, full.width() as i32);
+                let ry = (oy - desktop.1).clamp(0, full.height() as i32);
+                let rw = mw.min(full.width() as i32 - rx).max(1) as u32;
+                let rh = mh.min(full.height() as i32 - ry).max(1) as u32;
+                image::imageops::crop_imm(&full, rx as u32, ry as u32, rw, rh).to_image()
+            } else {
+                return Err(tf!("falha ao capturar a tela: {e}", "could not capture the screen: {e}"));
+            }
+        }
+    };
+    Ok((image, (ox, oy)))
 }
 
 /// Photographs only the rectangle `rect` (screen coordinates), without the cursor.
@@ -127,7 +187,98 @@ fn photograph_area(rect: PxRect) -> Result<RgbaImage, String> {
     platform::capture_px(rect).map_err(|e| tf!("falha ao capturar a tela: {e}", "could not capture the screen: {e}"))
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "linux")]
+fn photograph_area(rect: PxRect) -> Result<RgbaImage, String> {
+    let (w, h) = (rect.2 - rect.0, rect.3 - rect.1);
+    let mut out = RgbaImage::from_pixel(w as u32, h as u32, image::Rgba([0, 0, 0, 255]));
+    let mut found = false;
+    for monitor in Monitor::all().map_err(|e| tf!("nenhum monitor encontrado: {e}", "no monitor found: {e}"))? {
+        let mrect = linux_monitor_rect(&monitor);
+        let (ox, oy) = mrect
+            .map(|r| (r.0, r.1))
+            .unwrap_or_else(|| (monitor.x().unwrap_or(0), monitor.y().unwrap_or(0)));
+        if let Some(mr) = mrect
+            && overlap(rect, mr).is_none()
+        {
+            continue;
+        }
+        let image = match monitor.capture_image() {
+            Ok(img) => img,
+            Err(e) => {
+                if let Ok(full) = capture_linux_fallback() {
+                    let desktop = platform::virtual_screen();
+                    let dw = full.width() as i32;
+                    let dh = full.height() as i32;
+                    let bounds = (desktop.0, desktop.1, desktop.0 + dw, desktop.1 + dh);
+                    if let Some(part) = overlap(rect, bounds) {
+                        let piece = image::imageops::crop_imm(
+                            &full,
+                            (part.0 - desktop.0) as u32,
+                            (part.1 - desktop.1) as u32,
+                            (part.2 - part.0) as u32,
+                            (part.3 - part.1) as u32,
+                        )
+                        .to_image();
+                        image::imageops::replace(&mut out, &piece, (part.0 - rect.0) as i64, (part.1 - rect.1) as i64);
+                        found = true;
+                        break;
+                    }
+                }
+                return Err(tf!("falha ao capturar a tela: {e}", "could not capture the screen: {e}"));
+            }
+        };
+        let bounds = (ox, oy, ox + image.width() as i32, oy + image.height() as i32);
+        let Some(part) = overlap(rect, bounds) else { continue };
+        let piece = image::imageops::crop_imm(
+            &image,
+            (part.0 - ox) as u32,
+            (part.1 - oy) as u32,
+            (part.2 - part.0) as u32,
+            (part.3 - part.1) as u32,
+        )
+        .to_image();
+        image::imageops::replace(&mut out, &piece, (part.0 - rect.0) as i64, (part.1 - rect.1) as i64);
+        found = true;
+    }
+    if !found {
+        return Err(t!("nenhum monitor na área escolhida", "no monitor in the chosen area").to_owned());
+    }
+    Ok(out)
+}
+
+/// Captures the full desktop backdrop along with its exact physical pixel bounds (used on Linux
+/// where selection overlays cannot be excluded from screen capture).
+#[cfg(target_os = "linux")]
+pub fn grab_desktop_backdrop(include_cursor: bool) -> Result<(RgbaImage, PxRect), String> {
+    let monitors = Monitor::all().map_err(|e| tf!("nenhum monitor encontrado: {e}", "no monitor found: {e}"))?;
+    if monitors.len() == 1 {
+        let monitor = &monitors[0];
+        let (ox, oy) = linux_monitor_rect(monitor)
+            .map(|r| (r.0, r.1))
+            .unwrap_or_else(|| (monitor.x().unwrap_or(0), monitor.y().unwrap_or(0)));
+        let cursor = if include_cursor { platform::cursor_image() } else { None };
+        let mut image = match monitor.capture_image() {
+            Ok(img) => img,
+            Err(e) => {
+                if let Ok(full) = capture_linux_fallback() {
+                    full
+                } else {
+                    return Err(tf!("falha ao capturar a tela: {e}", "could not capture the screen: {e}"));
+                }
+            }
+        };
+        if let Some((cursor_img, (x, y))) = cursor {
+            image::imageops::overlay(&mut image, &cursor_img, (x - ox) as i64, (y - oy) as i64);
+        }
+        let bounds = (ox, oy, ox + image.width() as i32, oy + image.height() as i32);
+        return Ok((image, bounds));
+    }
+    let desktop = platform::virtual_screen();
+    let image = grab_virtual(desktop, include_cursor)?;
+    Ok((image, desktop))
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 fn primary_monitor() -> xcap::XCapResult<Monitor> {
     let monitors = Monitor::all()?;
     monitors

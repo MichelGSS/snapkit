@@ -83,7 +83,7 @@ pub fn recognize(img: &RgbaImage, mode: Mode) -> Result<(String, Engine), String
         }
     }
     if mode == Mode::Printed
-        && let Some(res) = find_tesseract().map(|dir| tesseract_words(&dir, img))
+        && let Some(res) = find_tesseract().map(|install| tesseract_words(&install, img))
     {
         match res {
             Ok(words) => return Ok((layout(&words), Engine::Tesseract)),
@@ -158,8 +158,8 @@ pub fn recognize_boxes(img: &RgbaImage) -> Result<Vec<WordBox>, String> {
         Ok(words) => return Ok(words),
         Err(e) => Some(e),
     };
-    if let Some(dir) = find_tesseract() {
-        match tesseract_words_in_image_coords(&dir, img) {
+    if let Some(install) = find_tesseract() {
+        match tesseract_words_in_image_coords(&install, img) {
             Ok(words) => return Ok(words),
             Err(e) => last_err = Some(e),
         }
@@ -202,7 +202,7 @@ pub fn find_sensitive_regions(img: &RgbaImage) -> Result<Vec<(f32, f32, f32, f32
         .collect())
 }
 
-fn tesseract_words_in_image_coords(dir: &Path, img: &RgbaImage) -> Result<Vec<Word>, String> {
+fn tesseract_words_in_image_coords(install: &TesseractInstall, img: &RgbaImage) -> Result<Vec<Word>, String> {
     let scale = if img.width() * 3 <= 9000 {
         3
     } else if img.width() * 2 <= 9000 {
@@ -222,7 +222,7 @@ fn tesseract_words_in_image_coords(dir: &Path, img: &RgbaImage) -> Result<Vec<Wo
     let pad_x = if eff_w < MIN_SIDE { (MIN_SIDE - eff_w) / 2 } else { 0 } as f32;
     let pad_y = if eff_h < MIN_SIDE { (MIN_SIDE - eff_h) / 2 } else { 0 } as f32;
 
-    let words = tesseract_words(dir, img)?;
+    let words = tesseract_words(install, img)?;
     Ok(words
         .into_iter()
         .map(|w| Word {
@@ -527,8 +527,14 @@ pub fn detect_sensitive_boxes(words: &[WordBox]) -> Vec<(f32, f32, f32, f32)> {
 
 // ---------------------------------------------------------------- Tesseract
 
-/// Folder with `tesseract.exe` and `tessdata`, if it exists.
-fn find_tesseract() -> Option<PathBuf> {
+struct TesseractInstall {
+    bin: PathBuf,
+    tessdata: PathBuf,
+}
+
+/// Tesseract binary and `tessdata` folder, if available.
+fn find_tesseract() -> Option<TesseractInstall> {
+    let bin_name = crate::platform::exe_name("tesseract");
     let mut candidates = Vec::new();
     if let Some(dir) = std::env::var_os("SNAPKIT_TESSERACT_DIR") {
         candidates.push(PathBuf::from(dir));
@@ -539,14 +545,51 @@ fn find_tesseract() -> Option<PathBuf> {
     // During development the binaries are in `vendor/tesseract` (see scripts/fetch-tesseract.ps1).
     #[cfg(debug_assertions)]
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor").join("tesseract"));
-    candidates
-        .into_iter()
-        .find(|d| d.join(crate::platform::exe_name("tesseract")).is_file() && d.join("tessdata").is_dir())
+    if let Some(dir) = candidates.iter().find(|d| d.join(&bin_name).is_file() && d.join("tessdata").is_dir()) {
+        return Some(TesseractInstall {
+            bin: dir.join(&bin_name),
+            tessdata: dir.join("tessdata"),
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let bin = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|p| p.join("tesseract"))
+                    .find(|p| p.is_file())
+            })
+            .or_else(|| {
+                let p = PathBuf::from("/usr/bin/tesseract");
+                p.is_file().then_some(p)
+            })?;
+        let tessdata = candidates
+            .into_iter()
+            .map(|d| d.join("tessdata"))
+            .chain(
+                [
+                    "/usr/share/tessdata",
+                    "/usr/share/tesseract-ocr/5/tessdata",
+                    "/usr/share/tesseract-ocr/4.00/tessdata",
+                ]
+                .into_iter()
+                .map(PathBuf::from),
+            )
+            .find(|d| d.is_dir())?;
+        return Some(TesseractInstall { bin, tessdata });
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
 }
 
 /// Languages installed in `tessdata`, with Portuguese and English first: "por+eng".
+#[cfg_attr(not(test), allow(dead_code))]
 fn tesseract_languages(dir: &Path) -> String {
-    let mut langs: Vec<String> = std::fs::read_dir(dir.join("tessdata"))
+    tesseract_languages_in(&dir.join("tessdata"))
+}
+
+fn tesseract_languages_in(tessdata: &Path) -> String {
+    let mut langs: Vec<String> = std::fs::read_dir(tessdata)
         .into_iter()
         .flatten()
         .flatten()
@@ -565,7 +608,7 @@ fn tesseract_languages(dir: &Path) -> String {
     langs.join("+")
 }
 
-fn tesseract_words(dir: &Path, img: &RgbaImage) -> Result<Vec<Word>, String> {
+fn tesseract_words(install: &TesseractInstall, img: &RgbaImage) -> Result<Vec<Word>, String> {
     // Scaling 3× helps Tesseract the most with screen text; the cap avoids giant images.
     let scale = if img.width() * 3 <= 9000 {
         3
@@ -575,7 +618,7 @@ fn tesseract_words(dir: &Path, img: &RgbaImage) -> Result<Vec<Word>, String> {
         1
     };
     let prepared = prepare(img, scale, 30_000);
-    let langs = tesseract_languages(dir);
+    let langs = tesseract_languages_in(&install.tessdata);
     if langs.is_empty() {
         return Err(t!("nenhum idioma em tessdata", "no language in tessdata").to_owned());
     }
@@ -587,7 +630,7 @@ fn tesseract_words(dir: &Path, img: &RgbaImage) -> Result<Vec<Word>, String> {
         let tile = image::imageops::crop_imm(&prepared, 0, top, prepared.width(), bottom - top).to_image();
         let path = std::env::temp_dir().join(format!("snapkit-ocr-{}-{run_id}-{index}.png", std::process::id()));
         tile.save(&path).map_err(|e| e.to_string())?;
-        let output = crate::platform::background_command(dir.join(crate::platform::exe_name("tesseract")))
+        let output = crate::platform::background_command(&install.bin)
             .arg(&path)
             .arg("stdout")
             .args(["-l", &langs])
@@ -595,7 +638,7 @@ fn tesseract_words(dir: &Path, img: &RgbaImage) -> Result<Vec<Word>, String> {
             // panels.
             .args(["--psm", "11"])
             .args(["-c", "tessedit_create_tsv=1"])
-            .env("TESSDATA_PREFIX", dir.join("tessdata"))
+            .env("TESSDATA_PREFIX", &install.tessdata)
             .output();
         let _ = std::fs::remove_file(&path);
         let output = output.map_err(|e| e.to_string())?;
@@ -984,8 +1027,8 @@ three");
         if crate::in_ci() {
             return;
         }
-        let dir = find_tesseract().expect("Tesseract not found: run scripts/fetch-tesseract.ps1");
-        let text = layout(&tesseract_words(&dir, &sample()).unwrap());
+        let install = find_tesseract().expect("Tesseract not found: run scripts/fetch-tesseract.ps1");
+        let text = layout(&tesseract_words(&install, &sample()).unwrap());
         assert_sample_text(&text);
         assert!(text.contains("espaço"), "the Portuguese model must read the cedilla: {text:?}");
         assert_eq!(recognize(&sample(), Mode::Printed).unwrap().1, Engine::PRINTED, "the default engine has priority");

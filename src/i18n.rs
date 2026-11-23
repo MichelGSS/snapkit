@@ -43,6 +43,24 @@ impl Lang {
         // Codes like "pt-BR", "pt-PT" or "pt".
         if first.is_some_and(|code| code.to_string().starts_with("pt")) { Lang::Portuguese } else { Lang::English }
     }
+
+    /// System language: Portuguese if the locale starts with `pt`, English otherwise.
+    #[cfg(target_os = "linux")]
+    pub fn system() -> Lang {
+        for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+            if let Ok(val) = std::env::var(var) {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return if trimmed.to_ascii_lowercase().starts_with("pt") {
+                        Lang::Portuguese
+                    } else {
+                        Lang::English
+                    };
+                }
+            }
+        }
+        Lang::English
+    }
 }
 
 #[cfg_attr(test, allow(dead_code))]

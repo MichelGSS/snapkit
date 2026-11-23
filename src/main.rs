@@ -18,6 +18,7 @@ mod ocr;
 #[cfg(target_os = "macos")]
 mod ocr_vision;
 #[cfg_attr(target_os = "macos", path = "pin_macos.rs")]
+#[cfg_attr(target_os = "linux", path = "pin_linux.rs")]
 mod pin;
 mod record;
 mod render;
@@ -57,8 +58,71 @@ fn cmd_key(key: &str) -> String {
 /// Where the error log is, written the way the system shows paths.
 #[cfg(windows)]
 const ERROR_LOG: &str = "%APPDATA%\\SnapKit\\error.log";
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 const ERROR_LOG: &str = "~/Library/Application Support/SnapKit/error.log";
+#[cfg(target_os = "linux")]
+const ERROR_LOG: &str = "~/.config/SnapKit/error.log";
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+type SelectionBackdrop = (image::RgbaImage, platform::PxRect);
+
+/// Reads a `w × h` block of RGB pixels around `(x, y)` in virtual-desktop coordinates from a
+/// pre-captured backdrop image, clamping at image edges.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn sample_backdrop_pixels(
+    img: &image::RgbaImage,
+    bounds: platform::PxRect,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> Option<Vec<[u8; 3]>> {
+    if w <= 0 || h <= 0 || img.width() == 0 || img.height() == 0 {
+        return None;
+    }
+    let bw = (bounds.2 - bounds.0).max(1) as f64;
+    let bh = (bounds.3 - bounds.1).max(1) as f64;
+    let sx = img.width() as f64 / bw;
+    let sy = img.height() as f64 / bh;
+    let max_x = img.width() - 1;
+    let max_y = img.height() - 1;
+    let mut pixels = Vec::with_capacity((w as usize) * (h as usize));
+    for dy in 0..h {
+        let py = ((((y + dy - bounds.1) as f64 + 0.5) * sy).floor() as i64).clamp(0, max_y as i64) as u32;
+        for dx in 0..w {
+            let px = ((((x + dx - bounds.0) as f64 + 0.5) * sx).floor() as i64).clamp(0, max_x as i64) as u32;
+            let [r, g, b, _] = img.get_pixel(px, py).0;
+            pixels.push([r, g, b]);
+        }
+    }
+    Some(pixels)
+}
+
+/// Crops `rect` (in virtual-desktop coordinates) from a pre-captured backdrop image.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn crop_from_backdrop(
+    img: &image::RgbaImage,
+    bounds: platform::PxRect,
+    rect: platform::PxRect,
+) -> Result<image::RgbaImage, String> {
+    if img.width() == 0 || img.height() == 0 {
+        return Err(t!("área pequena demais", "area too small").to_owned());
+    }
+    let bw = (bounds.2 - bounds.0).max(1) as f64;
+    let bh = (bounds.3 - bounds.1).max(1) as f64;
+    let sx = img.width() as f64 / bw;
+    let sy = img.height() as f64 / bh;
+    let x0 = (((rect.0 - bounds.0) as f64 * sx).round() as i64).clamp(0, img.width() as i64) as u32;
+    let y0 = (((rect.1 - bounds.1) as f64 * sy).round() as i64).clamp(0, img.height() as i64) as u32;
+    let x1 = (((rect.2 - bounds.0) as f64 * sx).round() as i64).clamp(0, img.width() as i64) as u32;
+    let y1 = (((rect.3 - bounds.1) as f64 * sy).round() as i64).clamp(0, img.height() as i64) as u32;
+    let cw = x1.saturating_sub(x0);
+    let ch = y1.saturating_sub(y0);
+    if cw < 4 || ch < 4 {
+        return Err(t!("área pequena demais", "area too small").to_owned());
+    }
+    Ok(image::imageops::crop_imm(img, x0, y0, cw, ch).to_image())
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum CaptureKind {
@@ -82,9 +146,9 @@ enum CaptureKind {
 struct Shared {
     /// A finished capture, waiting for the interface to pick it up.
     pending: Mutex<Option<(CaptureKind, Result<capture::Shot, String>)>>,
-    /// Request to open the selection: the mode and the title of the window that was in the
-    /// foreground. The last value says whether the window was showing before the capture.
-    select_request: Mutex<Option<(CaptureKind, String, bool)>>,
+    /// Request to open the selection: the mode, foreground window title, whether our window was
+    /// visible before the capture, and an optional pre-captured desktop backdrop (Linux).
+    select_request: Mutex<Option<(CaptureKind, String, bool, Option<SelectionBackdrop>)>>,
     /// True from the moment the capture is triggered until the selection ends.
     busy: AtomicBool,
     /// HWND of the main window (0 if unknown).
@@ -97,6 +161,9 @@ struct Shared {
     hotkey_map: Mutex<Vec<(u32, CaptureKind)>>,
     /// True while the window is cloaked (`DWMWA_CLOAK`), so it isn't mistaken for visible.
     cloaked: AtomicBool,
+    /// Tracks whether the main window is currently mapped (used on Wayland where `hwnd == 0`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    window_visible: AtomicBool,
     /// Asked to show the main window from the tray or a second copy.
     open_requested: AtomicBool,
     /// Asked to close the program cleanly from the tray or `--quit`.
@@ -116,6 +183,7 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
         if matches!(kind, CaptureKind::FullScreen | CaptureKind::AllScreens) {
             let delay = shared.delay_secs.load(Ordering::Relaxed);
             let cursor = shared.include_cursor.load(Ordering::Relaxed);
+            #[cfg(not(target_os = "linux"))]
             if hwnd != 0 {
                 // Excluded from captures, the window doesn't show in the shot, without having to
                 // leave the screen.
@@ -124,6 +192,12 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
                     // With a delay, get out of the way: the user wants to work with what's behind.
                     platform::minimize(hwnd);
                 }
+            }
+            #[cfg(target_os = "linux")]
+            if shared.window_visible.load(Ordering::SeqCst) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.request_repaint();
+                std::thread::sleep(Duration::from_millis(250));
             }
             // A moment for the system to apply the exclusion before the shot.
             std::thread::sleep(Duration::from_millis(80));
@@ -153,24 +227,61 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
                 })
             };
             *shared.pending.lock().unwrap() = Some((CaptureKind::FullScreen, shot));
+            shared.window_visible.store(true, Ordering::SeqCst);
+            #[cfg(not(target_os = "linux"))]
             if hwnd != 0 {
                 platform::exclude_from_capture(hwnd, false);
                 platform::show(hwnd);
             }
+            #[cfg(target_os = "linux")]
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
         } else {
+            #[cfg(not(target_os = "linux"))]
             let was_on_screen =
                 hwnd != 0 && platform::is_on_screen(hwnd) && !shared.cloaked.load(Ordering::SeqCst);
-            *shared.select_request.lock().unwrap() = Some((kind, title, was_on_screen));
-            if hwnd != 0 {
-                // Invisible while it changes size and loses its frame: without this the editor
-                // flashes on the screen before the selection layer is ready.
-                shared.cloaked.store(true, Ordering::SeqCst);
-                platform::cloak(hwnd, true);
+            #[cfg(target_os = "linux")]
+            let was_on_screen = shared.window_visible.load(Ordering::SeqCst);
+
+            #[cfg(not(target_os = "linux"))]
+            let backdrop: Option<SelectionBackdrop> = None;
+            #[cfg(target_os = "linux")]
+            let backdrop: Option<SelectionBackdrop> = {
+                if was_on_screen {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    ctx.request_repaint();
+                    // Wait for compositor hide animation so SnapKit never appears in the backdrop.
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                let cursor = shared.include_cursor.load(Ordering::Relaxed);
+                guarded(|| capture::grab_desktop_backdrop(cursor)).ok()
+            };
+
+            *shared.select_request.lock().unwrap() = Some((kind, title, was_on_screen, backdrop));
+            shared.window_visible.store(true, Ordering::SeqCst);
+            #[cfg(not(target_os = "linux"))]
+            {
+                if hwnd != 0 {
+                    // Invisible while it changes size and loses its frame: without this the editor
+                    // flashes on the screen before the selection layer is ready.
+                    shared.cloaked.store(true, Ordering::SeqCst);
+                    platform::cloak(hwnd, true);
+                }
+                // The window becomes the selection layer; if it was in the tray or minimized, it comes
+                // back.
+                if hwnd != 0 && !was_on_screen {
+                    platform::show(hwnd);
+                }
             }
-            // The window becomes the selection layer; if it was in the tray or minimized, it comes
-            // back.
-            if hwnd != 0 && !was_on_screen {
-                platform::show(hwnd);
+            #[cfg(target_os = "linux")]
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
         ctx.request_repaint();
@@ -197,6 +308,11 @@ struct Selecting {
     was_on_screen: bool,
     /// Quick annotation in progress, after the region was chosen.
     quick: Option<Quick>,
+    /// Pre-captured clean desktop image and its bounds (used on Linux where overlays cannot be
+    /// excluded from screen capture).
+    backdrop: Option<SelectionBackdrop>,
+    /// GPU texture of `backdrop`, painted behind the selection overlay.
+    backdrop_tex: Option<egui::TextureHandle>,
     /// When the selection started, so the layer appears even if something is delayed.
     started: Instant,
     /// Frames already drawn with the window covering every monitor.
@@ -525,6 +641,7 @@ impl App {
             _ => 0,
         };
         apply_window_theme(&cc.egui_ctx, hwnd, theme::by_name(&cfg.theme));
+        let start_hidden = std::env::args().any(|a| a == autostart::MINIMIZED_ARG);
         let shared = Arc::new(Shared {
             pending: Mutex::new(None),
             select_request: Mutex::new(None),
@@ -534,6 +651,7 @@ impl App {
             include_cursor: AtomicBool::new(cfg.include_cursor),
             hotkey_map: Mutex::new(Vec::new()),
             cloaked: AtomicBool::new(false),
+            window_visible: AtomicBool::new(!start_hidden),
             open_requested: AtomicBool::new(false),
             quit_requested: AtomicBool::new(false),
         });
@@ -555,7 +673,15 @@ impl App {
                     }
                     tray::TrayAction::Open => {
                         shared.open_requested.store(true, Ordering::SeqCst);
+                        shared.window_visible.store(true, Ordering::SeqCst);
+                        #[cfg(not(target_os = "linux"))]
                         platform::show(shared.hwnd);
+                        #[cfg(target_os = "linux")]
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
                         ctx.request_repaint();
                     }
                     tray::TrayAction::Quit => {
@@ -637,6 +763,7 @@ impl App {
         };
         // `--minimized` (Start with Windows): eframe shows the window after the first frame
         // whatever was asked, so it's kept cloaked, invisible, and hidden right after that.
+        #[cfg(not(target_os = "linux"))]
         if std::env::args().any(|a| a == autostart::MINIMIZED_ARG) && app.shared.hwnd != 0 {
             app.shared.cloaked.store(true, Ordering::SeqCst);
             platform::cloak(app.shared.hwnd, true);
@@ -1158,7 +1285,7 @@ impl App {
                         });
 
                         kit::section_card(ui, t!("Sistema", "System"), |ui| {
-                            let tray_ok = self.tray.is_some();
+                            let tray_ok = self.tray.is_some() && (!cfg!(target_os = "linux") || self.shared.hwnd != 0);
                             let mut close_to_tray = self.cfg.close_to_tray;
                             ui.add_enabled(
                                 tray_ok,
@@ -1178,6 +1305,8 @@ impl App {
                             let mut autostart = self.autostart;
                             let autostart_label = if cfg!(target_os = "macos") {
                                 t!("Abrir ao iniciar sessão (na barra de menus)", "Start at login (in the menu bar)")
+                            } else if cfg!(target_os = "linux") {
+                                t!("Iniciar com o sistema (na bandeja)", "Start with system (in the tray)")
                             } else {
                                 t!("Iniciar com o Windows (na bandeja)", "Start with Windows (in the tray)")
                             };
@@ -2536,6 +2665,7 @@ impl App {
 
     /// Saves the editor's image to the library, copies it and shows it in the main editor.
     fn adopt_editor(&mut self, ctx: &egui::Context, mut editor: editor::Editor, title: String) {
+        self.shared.window_visible.store(true, Ordering::SeqCst);
         self.flush_autosave(ctx);
         editor.commit_pending_text();
         let image = editor.image().clone();
@@ -3443,8 +3573,16 @@ impl App {
         self.shared.busy.store(false, Ordering::SeqCst);
         platform::exclude_from_capture(self.shared.hwnd, false);
         platform::set_tool_window(self.shared.hwnd, false);
+        #[cfg(target_os = "linux")]
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            if let Some(size) = self.normal_size {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        #[cfg(not(target_os = "linux"))]
         if let Some(r) = self.normal_rect {
             platform::set_window_rect(self.shared.hwnd, r);
         }
@@ -3462,9 +3600,15 @@ impl App {
         self.status = tf!("Capturando em {delay} s…", "Capturing in {delay} s…");
         let (shared, ctx) = (self.shared.clone(), ctx.clone());
         std::thread::spawn(move || {
+            #[cfg(not(target_os = "linux"))]
             if shared.hwnd != 0 {
                 platform::exclude_from_capture(shared.hwnd, true);
                 platform::minimize(shared.hwnd);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.request_repaint();
             }
             std::thread::sleep(Duration::from_secs(delay as u64));
             let current = platform::foreground_window_title_except(shared.hwnd);
@@ -3478,9 +3622,16 @@ impl App {
                 note: String::new(),
             });
             *shared.pending.lock().unwrap() = Some((CaptureKind::FullScreen, shot));
+            #[cfg(not(target_os = "linux"))]
             if shared.hwnd != 0 {
                 platform::exclude_from_capture(shared.hwnd, false);
                 platform::show(shared.hwnd);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                shared.window_visible.store(true, Ordering::SeqCst);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             ctx.request_repaint();
         });
@@ -3494,12 +3645,18 @@ impl App {
         let hwnd = self.shared.hwnd;
         let rect = ui.max_rect();
         let accent = self.accent();
-        let Some(Selecting { quick: Some(quick), .. }) = &mut self.selecting else { return };
+        let Some(Selecting { quick: Some(quick), backdrop, backdrop_tex, .. }) = &mut self.selecting else { return };
         // Conversion between interface points and screen pixels, to readjust the area.
         let fallback_scale = ctx.pixels_per_point();
         let desktop = platform::virtual_screen();
-        let (ox, oy, scale_x, scale_y) = match platform::client_rect_screen(hwnd) {
-            Some((cl, ct, cr, cb)) if rect.width() >= 1.0 && rect.height() >= 1.0 => (
+        let (ox, oy, scale_x, scale_y) = match (backdrop.as_ref(), platform::client_rect_screen(hwnd)) {
+            (Some((_, b)), _) if rect.width() >= 1.0 && rect.height() >= 1.0 => (
+                b.0,
+                b.1,
+                (b.2 - b.0) as f32 / rect.width(),
+                (b.3 - b.1) as f32 / rect.height(),
+            ),
+            (_, Some((cl, ct, cr, cb))) if rect.width() >= 1.0 && rect.height() >= 1.0 => (
                 cl,
                 ct,
                 (cr - cl) as f32 / rect.width(),
@@ -3544,7 +3701,11 @@ impl App {
                         (s.0 - a.0, s.1 - a.1)
                     }
                 };
-                if let Ok(image) = capture::grab_virtual((a.0, a.1, b.0, b.1), false) {
+                let grabbed = match backdrop.as_ref() {
+                    Some((img, bounds)) => crop_from_backdrop(img, *bounds, (a.0, a.1, b.0, b.1)),
+                    None => capture::grab_virtual((a.0, a.1, b.0, b.1), false),
+                };
+                if let Ok(image) = grabbed {
                     quick.area = px_to_screen((a.0, a.1, b.0, b.1));
                     quick.editor.commit_pending_text();
                     quick.editor.rebase(image, dx as f32, dy as f32);
@@ -3556,6 +3717,9 @@ impl App {
         // they don't end up in the windows behind.
         ui.allocate_rect(rect, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
+        if let Some(tex) = backdrop_tex.as_ref() {
+            painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
         let dim = Color32::from_black_alpha(110);
         for r in [
             Rect::from_min_max(rect.min, Pos2::new(rect.max.x, area.min.y)),
@@ -3778,6 +3942,11 @@ impl App {
     fn dismiss_selection(&mut self, ctx: &egui::Context) {
         let was_on_screen = self.selecting.as_ref().is_none_or(|s| s.was_on_screen);
         self.end_selection(ctx);
+        #[cfg(target_os = "linux")]
+        if !was_on_screen {
+            self.put_away(ctx);
+        }
+        #[cfg(not(target_os = "linux"))]
         self.settle_window(!was_on_screen);
     }
 
@@ -3810,7 +3979,7 @@ impl App {
         } else if !hidden {
             if restored {
                 self.restore_frames = 0;
-                self.put_away();
+                self.put_away(ctx);
                 // The frame restored by winit can show the window again right after the hide
                 // request; it stays invisible a moment longer, to be safe.
                 self.settle = Some(Settle { put_away, hidden: true, deadline: now + Duration::from_millis(300) });
@@ -3820,7 +3989,7 @@ impl App {
             platform::cloak(hwnd, false);
             self.settle = None;
         } else {
-            self.put_away();
+            self.put_away(ctx);
         }
         ctx.request_repaint();
     }
@@ -3843,18 +4012,33 @@ impl App {
     }
 
     /// Takes the window off the screen: to the tray, if there is one, or to the taskbar.
-    fn put_away(&self) {
-        let hwnd = self.shared.hwnd;
-        if !platform::is_on_screen(hwnd) {
+    fn put_away(&self, ctx: &egui::Context) {
+        self.shared.window_visible.store(false, Ordering::SeqCst);
+        #[cfg(target_os = "linux")]
+        {
+            if self.tray.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            ctx.request_repaint();
             return;
         }
-        if let Some(r) = self.normal_rect {
-            platform::set_window_rect(hwnd, r);
-        }
-        if self.tray.is_some() {
-            platform::hide(hwnd);
-        } else {
-            platform::minimize(hwnd);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ctx;
+            let hwnd = self.shared.hwnd;
+            if !platform::is_on_screen(hwnd) {
+                return;
+            }
+            if let Some(r) = self.normal_rect {
+                platform::set_window_rect(hwnd, r);
+            }
+            if self.tray.is_some() {
+                platform::hide(hwnd);
+            } else {
+                platform::minimize(hwnd);
+            }
         }
     }
 
@@ -3867,7 +4051,11 @@ impl App {
         let desktop = self.selecting.as_ref().map_or_else(platform::selection_area, |s| s.area);
         // Checked every frame: the system or winit can put the normal style back meanwhile.
         platform::set_tool_window(hwnd, true);
+        #[cfg(not(target_os = "linux"))]
         let covering = platform::window_rect(hwnd) == Some(desktop);
+        #[cfg(target_os = "linux")]
+        let covering = true;
+        #[cfg(not(target_os = "linux"))]
         if !covering {
             platform::set_window_rect(hwnd, desktop);
         }
@@ -3902,8 +4090,14 @@ impl App {
 
         // Conversion between interface points and screen pixels.
         let fallback_scale = ctx.pixels_per_point();
-        let (ox, oy, scale_x, scale_y) = match platform::client_rect_screen(hwnd) {
-            Some((cl, ct, cr, cb)) if rect.width() >= 1.0 && rect.height() >= 1.0 => (
+        let (ox, oy, scale_x, scale_y) = match (sel.backdrop.as_ref(), platform::client_rect_screen(hwnd)) {
+            (Some((_, b)), _) if rect.width() >= 1.0 && rect.height() >= 1.0 => (
+                b.0,
+                b.1,
+                (b.2 - b.0) as f32 / rect.width(),
+                (b.3 - b.1) as f32 / rect.height(),
+            ),
+            (_, Some((cl, ct, cr, cb))) if rect.width() >= 1.0 && rect.height() >= 1.0 => (
                 cl,
                 ct,
                 (cr - cl) as f32 / rect.width(),
@@ -4070,6 +4264,9 @@ impl App {
             }
         }
 
+        if let Some(tex) = &sel.backdrop_tex {
+            painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
         let dim = Color32::from_black_alpha(110);
         match drawn.or(drag_rect).or(hovered_window) {
             Some(s) => {
@@ -4187,7 +4384,13 @@ impl App {
             let loupe = Rect::from_min_size(min, egui::Vec2::splat(side));
             painter.rect_filled(loupe.expand(2.0), 3.0, Color32::from_gray(25));
             let mut center_rgb: Option<[u8; 3]> = None;
-            if let Some(pixels) = platform::grab_pixels(cx - CELLS / 2, cy - CELLS / 2, CELLS, CELLS) {
+            let loupe_pixels = match &sel.backdrop {
+                Some((img, bounds)) => {
+                    sample_backdrop_pixels(img, *bounds, cx - CELLS / 2, cy - CELLS / 2, CELLS, CELLS)
+                }
+                None => platform::grab_pixels(cx - CELLS / 2, cy - CELLS / 2, CELLS, CELLS),
+            };
+            if let Some(pixels) = loupe_pixels {
                 let center_idx = ((CELLS / 2) * CELLS + (CELLS / 2)) as usize;
                 center_rgb = pixels.get(center_idx).copied();
                 for (i, [r, g, b]) in pixels.into_iter().enumerate() {
@@ -4318,7 +4521,11 @@ impl App {
         if let Some(area) = quick_now {
             let (a, b) = (to_px(area.min), to_px(area.max));
             let cursor = self.shared.include_cursor.load(Ordering::Relaxed);
-            match capture::grab_virtual((a.0, a.1, b.0, b.1), cursor) {
+            let grabbed = match self.selecting.as_ref().and_then(|s| s.backdrop.as_ref()) {
+                Some((img, bounds)) => crop_from_backdrop(img, *bounds, (a.0, a.1, b.0, b.1)),
+                None => capture::grab_virtual((a.0, a.1, b.0, b.1), cursor),
+            };
+            match grabbed {
                 Ok(image) => {
                     let editor = editor::Editor::new(&ctx, image, self.accent());
                     if let Some(sel) = &mut self.selecting {
@@ -4388,7 +4595,11 @@ impl App {
                 Some(r) if delay == 0 => {
                     // Takes the shot right away: our layer still covers the screen, but doesn't
                     // show in captures.
-                    match capture::grab_virtual(r, cursor) {
+                    let grabbed = match self.selecting.as_ref().and_then(|s| s.backdrop.as_ref()) {
+                        Some((img, bounds)) => crop_from_backdrop(img, *bounds, r),
+                        None => capture::grab_virtual(r, cursor),
+                    };
+                    match grabbed {
                         Ok(image) if kind == CaptureKind::Region && self.cfg.quick_annotate => {
                             // Quick annotation: the capture stays where it was, ready for arrows.
                             let editor = editor::Editor::new(&ctx, image, self.accent());
@@ -5230,7 +5441,7 @@ impl eframe::App for App {
         if self.hide_after_start > 0 {
             self.hide_after_start -= 1;
             if self.hide_after_start == 0 {
-                self.put_away();
+                self.put_away(ctx);
                 self.shared.cloaked.store(false, Ordering::SeqCst);
                 platform::cloak(self.shared.hwnd, false);
             } else {
@@ -5241,10 +5452,35 @@ impl eframe::App for App {
             self.status = tf!("Não foi possível salvar na biblioteca: {e}", "Could not save to the library: {e}");
         }
         self.update_logic(ctx);
-        if let Some((kind, title, was_on_screen)) = self.shared.select_request.lock().unwrap().take() {
+        if let Some((kind, title, was_on_screen, backdrop)) = self.shared.select_request.lock().unwrap().take() {
             let hwnd = self.shared.hwnd;
             let windows = platform::visible_windows(hwnd);
-            self.selecting = Some(Selecting { kind, windows, title, drag_origin: None, drawn: None, adjust: None, was_on_screen, quick: None, started: Instant::now(), ready_frames: 0, area: platform::selection_area(), revealed: false });
+            let backdrop_tex = backdrop.as_ref().map(|(img, _)| {
+                ctx.load_texture(
+                    "selection_backdrop",
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [img.width() as usize, img.height() as usize],
+                        img.as_raw(),
+                    ),
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+            self.selecting = Some(Selecting {
+                kind,
+                windows,
+                title,
+                drag_origin: None,
+                drawn: None,
+                adjust: None,
+                was_on_screen,
+                quick: None,
+                backdrop,
+                backdrop_tex,
+                started: Instant::now(),
+                ready_frames: 0,
+                area: platform::selection_area(),
+                revealed: false,
+            });
             self.hide_after_start = 0;
             self.restore_frames = 0;
             self.settle = None;
@@ -5253,6 +5489,11 @@ impl eframe::App for App {
             platform::exclude_from_capture(hwnd, true);
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+            #[cfg(target_os = "linux")]
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.request_repaint();
@@ -5308,7 +5549,10 @@ impl eframe::App for App {
                 // Closing with the X only hides the window when there's a tray to bring it back.
                 self.flush_autosave(&ctx);
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                #[cfg(not(target_os = "linux"))]
                 platform::hide(self.shared.hwnd);
+                #[cfg(target_os = "linux")]
+                self.put_away(&ctx);
             } else {
                 self.shutdown(&ctx);
             }
@@ -5330,6 +5574,7 @@ impl eframe::App for App {
                 // Leaving the selection: the window is still coming back from the size of every
                 // monitor.
                 if platform::is_on_screen(self.shared.hwnd) {
+                    #[cfg(not(target_os = "linux"))]
                     if let Some(r) = self.normal_rect
                         && platform::window_rect(self.shared.hwnd) != Some(r)
                     {
@@ -5382,7 +5627,15 @@ fn spawn_instance_listener(shared: Arc<Shared>, ctx: egui::Context) {
             match request {
                 platform::InstanceRequest::Show => {
                     shared.open_requested.store(true, Ordering::SeqCst);
+                    shared.window_visible.store(true, Ordering::SeqCst);
+                    #[cfg(not(target_os = "linux"))]
                     platform::show(shared.hwnd);
+                    #[cfg(target_os = "linux")]
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                     ctx.request_repaint();
                 }
                 platform::InstanceRequest::Select => start_capture(CaptureKind::Region, shared.clone(), ctx.clone()),
@@ -5563,6 +5816,14 @@ fn main() -> eframe::Result {
 
     #[cfg(windows)]
     legacy::migrate();
+    #[cfg(target_os = "linux")]
+    let event_loop_builder: Option<eframe::EventLoopBuilderHook> =
+        std::env::var_os("DISPLAY").filter(|v| !v.is_empty()).map(|_| {
+            Box::new(|builder: &mut eframe::EventLoopBuilder<eframe::UserEvent>| {
+                use winit::platform::x11::EventLoopBuilderExtX11;
+                builder.with_x11();
+            }) as eframe::EventLoopBuilderHook
+        });
     let icon = egui::IconData { rgba: tray::icon_rgba(64), width: 64, height: 64 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -5575,6 +5836,8 @@ fn main() -> eframe::Result {
             .with_min_inner_size(NORMAL_MIN_SIZE),
         // With the default renderer (wgpu) the transparent window comes out black on Windows.
         renderer: eframe::Renderer::Glow,
+        #[cfg(target_os = "linux")]
+        event_loop_builder,
         ..Default::default()
     };
     let result = eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(App::new(cc)))));
@@ -5640,6 +5903,15 @@ fn fatal_box(detail: &str) {
              {detail}\n\n\
              Details / Detalhes: {ERROR_LOG}"
         )
+    } else if cfg!(target_os = "linux") {
+        format!(
+            "SnapKit could not start.\n\
+             If this keeps happening, check your OpenGL / graphics driver and system libraries.\n\n\
+             O SnapKit não conseguiu iniciar.\n\
+             Se isso se repetir, verifique o driver de vídeo (OpenGL) e as bibliotecas do sistema.\n\n\
+             {detail}\n\n\
+             Details / Detalhes: {ERROR_LOG}"
+        )
     } else {
         format!(
             "SnapKit could not start.\n\
@@ -5675,5 +5947,30 @@ mod tests {
         let r = apply_handle(start, 0, Pos2::new(205.0, 205.0), bounds);
         assert_eq!(r.max, Pos2::new(200.0, 200.0));
         assert_eq!(r.min, Pos2::new(200.0 - MIN_REGION, 200.0 - MIN_REGION));
+    }
+
+    #[test]
+    fn sample_backdrop_pixels_reads_exact_colors_and_clamps_edges() {
+        let mut img = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+        img.put_pixel(1, 2, image::Rgba([200, 150, 50, 255]));
+        let px = sample_backdrop_pixels(&img, (100, 200, 104, 204), 100, 201, 3, 3).unwrap();
+        assert_eq!(px.len(), 9);
+        // Row 1 of sample corresponds to y=202 -> img y=2; col 1 corresponds to x=101 -> img x=1.
+        assert_eq!(px[4], [200, 150, 50]);
+        assert_eq!(px[0], [10, 20, 30]);
+        // Edge clamping past bounds still returns valid pixels without panicking.
+        let clamped = sample_backdrop_pixels(&img, (0, 0, 4, 4), -2, -2, 3, 3).unwrap();
+        assert_eq!(clamped.len(), 9);
+        assert!(sample_backdrop_pixels(&img, (0, 0, 4, 4), 0, 0, 0, 3).is_none());
+    }
+
+    #[test]
+    fn crop_from_backdrop_extracts_clean_subrect_and_rejects_tiny_areas() {
+        let mut img = image::RgbaImage::from_pixel(20, 20, image::Rgba([0, 0, 0, 255]));
+        img.put_pixel(12, 13, image::Rgba([255, 128, 0, 255]));
+        let cropped = crop_from_backdrop(&img, (100, 200, 120, 220), (110, 210, 118, 216)).unwrap();
+        assert_eq!((cropped.width(), cropped.height()), (8, 6));
+        assert_eq!(cropped.get_pixel(2, 3).0, [255, 128, 0, 255]);
+        assert!(crop_from_backdrop(&img, (100, 200, 120, 220), (110, 210, 112, 216)).is_err());
     }
 }

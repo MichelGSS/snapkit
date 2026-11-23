@@ -66,9 +66,11 @@ pub fn find_models() -> Option<PathBuf> {
 const ONNXRUNTIME_LIB: &str = "onnxruntime.dll";
 #[cfg(target_os = "macos")]
 const ONNXRUNTIME_LIB: &str = "libonnxruntime.dylib";
+#[cfg(target_os = "linux")]
+const ONNXRUNTIME_LIB: &str = "libonnxruntime.so";
 
-/// `onnxruntime.dll`, if it exists. Always a full path: Windows has its own, older
-/// `onnxruntime.dll` in System32, which a bare file name could pick up.
+/// `onnxruntime.dll` (or `.dylib`/`.so`), if it exists. Always a full path: Windows has its own,
+/// older `onnxruntime.dll` in System32, which a bare file name could pick up.
 pub fn find_runtime() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(dir) = std::env::var_os("SNAPKIT_ONNXRUNTIME_DIR") {
@@ -79,7 +81,23 @@ pub fn find_runtime() -> Option<PathBuf> {
     }
     #[cfg(debug_assertions)]
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor").join("onnxruntime"));
-    candidates.into_iter().map(|d| d.join(ONNXRUNTIME_LIB)).find(|f| f.is_file())
+    if let Some(found) = candidates.into_iter().map(|d| d.join(ONNXRUNTIME_LIB)).find(|f| f.is_file()) {
+        return Some(found);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for sys in [
+            "/usr/lib/libonnxruntime.so",
+            "/usr/local/lib/libonnxruntime.so",
+            "/usr/lib64/libonnxruntime.so",
+        ] {
+            let p = Path::new(sys);
+            if p.is_file() {
+                return Some(p.to_path_buf());
+            }
+        }
+    }
+    None
 }
 
 /// Loads ONNX Runtime and creates its environment.
@@ -94,6 +112,11 @@ fn start_runtime() -> Result<Environment, String> {
         let message = t!(
             "motor neural não encontrado (libonnxruntime.dylib na pasta onnxruntime, ao lado do executável)",
             "neural engine not found (libonnxruntime.dylib in the onnxruntime folder, next to the executable)"
+        );
+        #[cfg(target_os = "linux")]
+        let message = t!(
+            "motor neural não encontrado (libonnxruntime.so na pasta onnxruntime ou no sistema)",
+            "neural engine not found (libonnxruntime.so in the onnxruntime folder or system libraries)"
         );
         message.to_owned()
     })?;

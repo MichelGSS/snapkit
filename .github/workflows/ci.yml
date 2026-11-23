@@ -45,3 +45,39 @@ jobs:
         run: |
           bash -n scripts/package-macos.sh
           if command -v shellcheck >/dev/null 2>&1; then shellcheck scripts/package-macos.sh; fi
+
+  # The Linux version isn't released yet; building and testing it on every push keeps Windows
+  # and macOS changes from breaking it.
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libclang-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libasound2-dev \
+            libssl-dev \
+            libfontconfig1-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxrandr-dev \
+            libxkbcommon-dev \
+            libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked

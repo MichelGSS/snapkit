@@ -1,5 +1,5 @@
 //! "Start with the system", for the current user only: an entry in `HKCU\...\Run` on Windows, a
-//! LaunchAgent in `~/Library/LaunchAgents` on macOS.
+//! LaunchAgent in `~/Library/LaunchAgents` on macOS, or an XDG autostart `.desktop` entry on Linux.
 
 /// Argument that makes the program open straight into the tray.
 pub const MINIMIZED_ARG: &str = "--minimized";
@@ -107,6 +107,46 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::path::PathBuf;
+
+    fn desktop_entry_path() -> Option<PathBuf> {
+        crate::platform::app_data_root().map(|d| d.join("autostart").join("snapkit.desktop"))
+    }
+
+    pub fn is_enabled() -> bool {
+        desktop_entry_path().is_some_and(|p| p.is_file())
+    }
+
+    pub fn set_enabled(enabled: bool) -> Result<(), String> {
+        let path = desktop_entry_path().ok_or_else(|| {
+            t!("pasta de configuração não encontrada", "configuration folder not found").to_owned()
+        })?;
+        if enabled {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&path, desktop_entry(&exe.to_string_lossy())).map_err(|e| e.to_string())
+        } else {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    /// XDG autostart entry: runs SnapKit at login, straight into the tray.
+    pub(super) fn desktop_entry(exe: &str) -> String {
+        let escaped = exe.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            "[Desktop Entry]\nType=Application\nName=SnapKit\nExec=\"{escaped}\" {}\nX-GNOME-Autostart-enabled=true\n",
+            super::MINIMIZED_ARG
+        )
+    }
+}
+
 pub use imp::{is_enabled, set_enabled};
 
 #[cfg(test)]
@@ -127,5 +167,13 @@ mod tests {
         assert!(plist.contains("<string>/Applications/Snap &amp; Kit.app/Contents/MacOS/snapkit</string>"));
         assert!(plist.contains("<string>--minimized</string>"));
         assert!(plist.contains(super::imp::LABEL));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xdg_desktop_entry_quotes_exe_and_passes_minimized() {
+        let entry = super::imp::desktop_entry("/usr/local/bin/snap kit");
+        assert!(entry.contains("Exec=\"/usr/local/bin/snap kit\" --minimized"));
+        assert!(entry.contains("X-GNOME-Autostart-enabled=true"));
     }
 }

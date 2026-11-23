@@ -137,9 +137,30 @@ fn open_stream(source: Source, ring: Ring) -> Result<cpal::Stream, String> {
                 )
                 .to_owned());
             }
-            let d = host.default_output_device().ok_or(t!("nenhum dispositivo de saída de som", "no sound output device"))?;
-            let c = d.default_output_config().map_err(|e| e.to_string())?;
-            (d, c)
+            #[cfg(target_os = "linux")]
+            {
+                let monitor = host.input_devices().ok().and_then(|mut devs| {
+                    devs.find(|d| {
+                        d.description()
+                            .map(|desc| desc.name().to_ascii_lowercase().contains("monitor"))
+                            .unwrap_or(false)
+                    })
+                });
+                if let Some(d) = monitor {
+                    let c = d.default_input_config().map_err(|e| e.to_string())?;
+                    (d, c)
+                } else {
+                    let d = host.default_output_device().ok_or(t!("nenhum dispositivo de saída de som", "no sound output device"))?;
+                    let c = d.default_output_config().map_err(|e| e.to_string())?;
+                    (d, c)
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let d = host.default_output_device().ok_or(t!("nenhum dispositivo de saída de som", "no sound output device"))?;
+                let c = d.default_output_config().map_err(|e| e.to_string())?;
+                (d, c)
+            }
         }
         Source::Microphone => {
             let d = host.default_input_device().ok_or(t!("nenhum microfone encontrado", "no microphone found"))?;

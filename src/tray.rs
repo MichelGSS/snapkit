@@ -224,6 +224,7 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
 }
 
 /// Tray icon with its menu, which can be rewritten (language, shortcut).
+#[cfg(not(target_os = "linux"))]
 pub struct Tray {
     _icon: TrayIcon,
     region: MenuItem,
@@ -232,19 +233,56 @@ pub struct Tray {
     quit: MenuItem,
 }
 
+#[cfg(target_os = "linux")]
+pub struct Tray {}
+
+#[cfg(target_os = "linux")]
+struct GtkTrayState {
+    _icon: TrayIcon,
+    region: MenuItem,
+    full: MenuItem,
+    open: MenuItem,
+    quit: MenuItem,
+}
+
+#[cfg(target_os = "linux")]
+std::thread_local! {
+    static GTK_TRAY: std::cell::RefCell<Option<GtkTrayState>> = const { std::cell::RefCell::new(None) };
+}
+
 impl Tray {
     /// Writes the menu items in the current language, with the capture shortcut next to it.
     pub fn relabel(&self, hotkey_label: &str) {
-        // Windows menus align what follows a tab to the right, like a shortcut. macOS menus don't,
-        // so the shortcut goes in parentheses there.
-        if cfg!(target_os = "macos") {
-            self.region.set_text(tf!("Capturar região ({hotkey_label})", "Capture region ({hotkey_label})"));
+        // Windows/Linux menus align what follows a tab to the right, like a shortcut. macOS menus
+        // don't, so the shortcut goes in parentheses there.
+        let region_text = if cfg!(target_os = "macos") {
+            tf!("Capturar região ({hotkey_label})", "Capture region ({hotkey_label})")
         } else {
-            self.region.set_text(tf!("Capturar região\t{hotkey_label}", "Capture region\t{hotkey_label}"));
+            tf!("Capturar região\t{hotkey_label}", "Capture region\t{hotkey_label}")
+        };
+        let full_text = t!("Capturar tela cheia", "Capture full screen").to_owned();
+        let open_text = t!("Abrir SnapKit", "Open SnapKit").to_owned();
+        let quit_text = t!("Sair", "Quit").to_owned();
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.region.set_text(region_text);
+            self.full.set_text(full_text);
+            self.open.set_text(open_text);
+            self.quit.set_text(quit_text);
         }
-        self.full.set_text(t!("Capturar tela cheia", "Capture full screen"));
-        self.open.set_text(t!("Abrir SnapKit", "Open SnapKit"));
-        self.quit.set_text(t!("Sair", "Quit"));
+        #[cfg(target_os = "linux")]
+        {
+            let _ = crate::platform::run_on_gtk(move || {
+                GTK_TRAY.with(|cell| {
+                    if let Some(state) = cell.borrow().as_ref() {
+                        state.region.set_text(region_text);
+                        state.full.set_text(full_text);
+                        state.open.set_text(open_text);
+                        state.quit.set_text(quit_text);
+                    }
+                });
+            });
+        }
     }
 }
 
@@ -255,29 +293,77 @@ pub fn build(
     hotkey_label: &str,
     on_action: Arc<dyn Fn(TrayAction) + Send + Sync>,
 ) -> Result<Tray, String> {
-    let menu = Menu::new();
-    let region = MenuItem::with_id(ID_REGION, "", true, None);
-    let full = MenuItem::with_id(ID_FULL, "", true, None);
-    let open = MenuItem::with_id(ID_OPEN, "", true, None);
-    let quit = MenuItem::with_id(ID_QUIT, "", true, None);
-    menu.append_items(&[
-        &region,
-        &full,
-        &PredefinedMenuItem::separator(),
-        &open,
-        &PredefinedMenuItem::separator(),
-        &quit,
-    ])
-    .map_err(|e| e.to_string())?;
-
-    let icon = Icon::from_rgba(icon_rgba(32), 32, 32).map_err(|e| e.to_string())?;
-    let icon = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_menu_on_left_click(false)
-        .with_tooltip("SnapKit")
-        .with_icon(icon)
-        .build()
+    #[cfg(not(target_os = "linux"))]
+    let tray = {
+        let menu = Menu::new();
+        let region = MenuItem::with_id(ID_REGION, "", true, None);
+        let full = MenuItem::with_id(ID_FULL, "", true, None);
+        let open = MenuItem::with_id(ID_OPEN, "", true, None);
+        let quit = MenuItem::with_id(ID_QUIT, "", true, None);
+        menu.append_items(&[
+            &region,
+            &full,
+            &PredefinedMenuItem::separator(),
+            &open,
+            &PredefinedMenuItem::separator(),
+            &quit,
+        ])
         .map_err(|e| e.to_string())?;
+
+        let icon = Icon::from_rgba(icon_rgba(32), 32, 32).map_err(|e| e.to_string())?;
+        let icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .with_tooltip("SnapKit")
+            .with_icon(icon)
+            .build()
+            .map_err(|e| e.to_string())?;
+        Tray { _icon: icon, region, full, open, quit }
+    };
+
+    #[cfg(target_os = "linux")]
+    let tray = {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        crate::platform::run_on_gtk(move || {
+            let res = (|| -> Result<GtkTrayState, String> {
+                let menu = Menu::new();
+                let region = MenuItem::with_id(ID_REGION, "", true, None);
+                let full = MenuItem::with_id(ID_FULL, "", true, None);
+                let open = MenuItem::with_id(ID_OPEN, "", true, None);
+                let quit = MenuItem::with_id(ID_QUIT, "", true, None);
+                menu.append_items(&[
+                    &region,
+                    &full,
+                    &PredefinedMenuItem::separator(),
+                    &open,
+                    &PredefinedMenuItem::separator(),
+                    &quit,
+                ])
+                .map_err(|e| e.to_string())?;
+
+                let icon = Icon::from_rgba(icon_rgba(32), 32, 32).map_err(|e| e.to_string())?;
+                let icon = TrayIconBuilder::new()
+                    .with_menu(Box::new(menu))
+                    .with_menu_on_left_click(false)
+                    .with_tooltip("SnapKit")
+                    .with_icon(icon)
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                Ok(GtkTrayState { _icon: icon, region, full, open, quit })
+            })();
+            match res {
+                Ok(state) => {
+                    GTK_TRAY.with(|cell| *cell.borrow_mut() = Some(state));
+                    let _ = tx.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        })?;
+        rx.recv().map_err(|_| "tray init channel closed".to_owned())??;
+        Tray {}
+    };
 
     let on_menu = on_action.clone();
     std::thread::spawn(move || {
@@ -299,7 +385,6 @@ pub fn build(
             }
         }
     });
-    let tray = Tray { _icon: icon, region, full, open, quit };
     tray.relabel(hotkey_label);
     Ok(tray)
 }

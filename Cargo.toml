@@ -2,7 +2,7 @@
 name = "snapkit"
 version = "0.7.0"
 edition = "2024"
-description = "Free, local and lightweight screen capture for Windows and macOS: annotations, scrolling capture, OCR and video"
+description = "Free, local and lightweight screen capture for Windows: annotations, scrolling capture, OCR and video"
 repository = "https://github.com/MichelGSS/snapkit"
 readme = "README.md"
 license = "MIT"
@@ -46,6 +46,13 @@ objc2-core-graphics = "0.3.2"
 objc2-foundation = "0.3.2"
 # Vision: the system's text recognition, the built-in OCR engine on macOS.
 objc2-vision = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+libc = "0.2"
+winit = { version = "0.30", default-features = false, features = ["x11"] }
+x11rb = "0.13"
+xcap = "0.9.10"
 
 # Dependencies optimized even in development: encoding PNGs and shrinking images
 # without optimization would make the library too slow to test.
