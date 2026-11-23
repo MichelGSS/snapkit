@@ -28,6 +28,7 @@ SnapKit is a screen capture and annotation tool for Windows, written in Rust wit
 
 ## Next
 
+- Complete and package the macOS and Linux versions (currently in development, not yet released).
 - Code-signed installer (Authenticode certificate) to avoid SmartScreen prompts.
 - Optional webcam picture-in-picture overlay during screen recordings.
 

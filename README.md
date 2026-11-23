@@ -236,7 +236,7 @@ Yes. In <b>Preferences</b>, set the global shortcut to <b>PrintScreen</b> with n
 <details>
 <summary><b>Does it work on macOS or Linux?</b></summary>
 <br>
-Not yet. SnapKit is released for Windows only. Versions for macOS and Linux are in development: the code already builds and is tested on macOS, but it isn't released. Contributions toward other platforms are welcome.
+Not yet. SnapKit is released for Windows only. Versions for macOS and Linux are in development: the code already builds and is tested on both macOS and Linux, but neither is released yet. Contributions toward other platforms are welcome.
 </details>
 
 <details>
@@ -272,7 +272,7 @@ You need [Rust](https://rustup.rs) (stable) and the Visual Studio Build Tools wi
 | `src/record.rs`, `src/video_editor.rs`, `src/audio.rs` | Video recording (FFmpeg), integrated filmstrip editor and audio |
 | `src/library.rs` | Capture library, persistent annotation layers, favorites and tags |
 | `src/i18n.rs` | English and Portuguese interface texts |
-| `src/platform/` | Operating system layer: Windows API calls and Per-Monitor V2 DPI handling (`windows.rs`); the macOS version in development (`macos.rs`) |
+| `src/platform/` | Operating system layer: Windows API calls and Per-Monitor V2 DPI handling (`windows.rs`), plus the macOS (`macos.rs`) and Linux (`linux.rs`) versions in development |
 | `src/icons.rs`, `src/ui.rs`, `src/theme.rs` | Rasterized vector icon set, reusable UI components and 9 color themes |
 | `src/tray.rs`, `src/config.rs`, `src/autostart.rs`, `src/update.rs` | App icon & tray, preferences, start with Windows and updates |
 

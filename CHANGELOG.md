@@ -6,7 +6,7 @@ All notable changes to SnapKit are listed here. The project follows [Semantic Ve
 
 ### Changed
 
-- **Groundwork for macOS and Linux versions**: the code that talks to the operating system now lives in one platform layer (`src/platform/`). Windows behavior is unchanged. A macOS version is in development and CI builds and tests it, but it isn't released yet.
+- **Groundwork for macOS and Linux versions**: the code that talks to the operating system now lives in one platform layer (`src/platform/`). Windows behavior is unchanged. Both macOS and Linux versions are in development and CI builds and tests them, but neither is released yet.
 
 ## [0.7.0] - 2026-11-19
 

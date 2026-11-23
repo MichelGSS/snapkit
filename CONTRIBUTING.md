@@ -61,7 +61,7 @@ Follow the [Microsoft Writing Style Guide](https://learn.microsoft.com/style-gui
 - **Every user-facing text in both languages.** Write it with the `t!` or `tf!` macro, Portuguese first and English second: `t!("Copiar", "Copy")`. See [`src/i18n.rs`](src/i18n.rs).
 - **Comments in English**, explaining why rather than what.
 - **Match the surrounding style.** The code isn't run through `cargo fmt`, so keep lines and layout consistent with the file you're editing.
-- **Operating system calls** go in the platform layer: [`src/platform/windows.rs`](src/platform/windows.rs) for Windows, [`src/platform/macos.rs`](src/platform/macos.rs) for the macOS version in development, each `unsafe` block with a `SAFETY:` comment. The rest of the code uses the shared API in [`src/platform/mod.rs`](src/platform/mod.rs).
+- **Operating system calls** go in the platform layer: [`src/platform/windows.rs`](src/platform/windows.rs) for Windows, [`src/platform/macos.rs`](src/platform/macos.rs) for macOS, and [`src/platform/linux.rs`](src/platform/linux.rs) for Linux, each `unsafe` block with a `SAFETY:` comment. The rest of the code uses the shared API in [`src/platform/mod.rs`](src/platform/mod.rs).
 - **Original work only.** Don't copy code, icons, texts or layouts from other screen capture products.
 
 ## License
