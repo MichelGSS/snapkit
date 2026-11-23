@@ -30,8 +30,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --locked
       - name: Test
         run: cargo test --locked
+      # The released app is universal: the Intel half has to compile too.
+      - name: Check the Intel build
+        run: cargo check --locked --target x86_64-apple-darwin --all-targets
+      - name: Check the packaging script
+        run: |
+          bash -n scripts/package-macos.sh
+          if command -v shellcheck >/dev/null 2>&1; then shellcheck scripts/package-macos.sh; fi

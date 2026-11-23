@@ -4,12 +4,12 @@
 
 | Item | Requirement |
 |---|---|
-| Operating system | Windows 10 version 2004 (build 19041) or later, or Windows 11 |
-| Architecture | 64-bit (x64) |
+| Operating system | Windows 10 version 2004 (build 19041) or later, or Windows 11; or macOS 12 Monterey or later |
+| Architecture | Windows: 64-bit (x64). macOS: Apple silicon or Intel (one universal app). |
 | Processor | Any 64-bit processor. No AVX2 needed. |
-| Graphics | OpenGL support (any current graphics driver). Needed for the transparent capture overlay. |
-| Disk space | About 200 MB for the program, plus your captures and recordings |
-| Permissions | A standard user account. No administrator rights needed. |
+| Graphics | OpenGL support (any current graphics driver; built into macOS). Needed for the transparent capture overlay. |
+| Disk space | About 200 MB for the program on Windows, plus your captures and recordings |
+| Permissions | A standard user account. No administrator rights needed. On macOS, **Screen Recording** for every capture, **Accessibility** for scrolling capture and **Microphone** to record your voice. |
 | Network | None. SnapKit works fully offline. It connects to GitHub only to check for updates, when you ask it to. |
 
 ## Size and resource use
@@ -45,6 +45,15 @@ The installed size breaks down as follows: FFmpeg about 110 MB, Tesseract about 
 - Video recording doesn't support a webcam overlay; trimming keeps one clip, from a start to an end time.
 - In remote sessions or virtual machines without OpenGL, SnapKit may not open.
 - Over Remote Desktop, the area around the selection can show black instead of the darkened screen. The capture itself isn't affected.
+
+### On macOS
+
+- The app is signed ad hoc, not with an Apple Developer ID, so the first launch needs **System Settings** > **Privacy & Security** > **Open Anyway**. After an update, macOS can forget the Screen Recording and Accessibility permissions: remove SnapKit from those lists and add it again.
+- SnapKit doesn't update itself: **Preferences** > **Updates** opens the release page, and you replace the app in **Applications**.
+- The selection layer covers one monitor at a time, the one under the pointer when the capture starts.
+- Video recording and text recognition aren't in the macOS download yet: they need FFmpeg, Tesseract and ONNX Runtime, which it doesn't include.
+- Recordings can't include system sound, only the microphone.
+- **Pin to screen** and dragging files from the library into other apps aren't available yet.
 
 ## Related
 

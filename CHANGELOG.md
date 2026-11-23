@@ -2,6 +2,25 @@
 
 All notable changes to SnapKit are listed here. The project follows [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+
+- **macOS port**: SnapKit now builds and runs on macOS 12 Monterey or later, as one universal app for Apple silicon and Intel Macs. A platform layer (`src/platform/`) keeps the Windows behavior unchanged and adds an AppKit and CoreGraphics implementation: capture that keeps every Retina pixel, the live selection layer, window detection, placement of SnapKit's windows, the region frame, copying files to the clipboard, a single running copy, and start at login through a LaunchAgent.
+- **macOS packages**: `scripts/package-macos.sh` builds `SnapKit.app` (signed ad hoc), `SnapKit-<version>-macos.dmg` with an **Applications** shortcut, `SnapKit-<version>-macos.zip` and their SHA-256 checksums. The release workflow publishes them next to the Windows files, and `SHA256SUMS.txt` lists every package.
+- **CI on macOS**: CI also builds and tests SnapKit on macOS, checks that the Intel build compiles, and checks the packaging script.
+
+### Changed
+
+- On macOS, **Preferences** > **Updates** finds new versions as on Windows, but opens the release page instead of installing them.
+
+### Known limitations on macOS
+
+- The first launch needs **System Settings** > **Privacy & Security** > **Open Anyway**, and macOS can forget the Screen Recording and Accessibility permissions after an update.
+- The selection layer covers one monitor at a time.
+- Video recording and text recognition aren't in the macOS download yet (FFmpeg, Tesseract and ONNX Runtime aren't bundled), and recordings can't include system sound.
+- **Pin to screen** and dragging files out of the library aren't available yet.
+
 ## [0.7.0] - 2026-11-19
 
 ### Added
@@ -86,6 +105,7 @@ First public release.
 - Nine color themes, a configurable global shortcut, tray icon and start with Windows.
 - Windows no longer flash on the screen when a capture starts or ends.
 
+[Unreleased]: https://github.com/MichelGSS/snapkit/compare/v0.7.0...HEAD
 [0.7.0]: https://github.com/MichelGSS/snapkit/releases/tag/v0.7.0
 [0.6.0]: https://github.com/MichelGSS/snapkit/releases/tag/v0.6.0
 [0.5.3]: https://github.com/MichelGSS/snapkit/releases/tag/v0.5.3

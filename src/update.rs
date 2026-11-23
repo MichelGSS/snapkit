@@ -5,6 +5,9 @@
 //! captures is sent: the request carries only SnapKit's name and version (`User-Agent`). An
 //! update is installed only after a click: the installer is downloaded, checked against the
 //! SHA-256 digest GitHub publishes for it, and run silently; it reopens SnapKit when it ends.
+//!
+//! On macOS there's no installer to run: the check still reports a newer version, and the
+//! button opens the release page, where the new `.dmg` is.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -23,7 +26,7 @@ pub struct Release {
     pub version: String,
     /// The release page, with the notes.
     pub page: String,
-    /// The installer, if the release has one.
+    /// The installer, if the release has one for this system (never on macOS).
     pub installer: Option<Asset>,
 }
 
@@ -67,7 +70,7 @@ fn parse_release(json: &str) -> Result<Release, String> {
     let installer = v["assets"].as_array().and_then(|assets| {
         assets.iter().find_map(|a| {
             let name = a["name"].as_str()?;
-            (name.starts_with("SnapKit-") && name.ends_with("-setup.exe")).then(|| Asset {
+            is_installer_name(name).then(|| Asset {
                 name: name.to_owned(),
                 url: a["browser_download_url"].as_str().unwrap_or_default().to_owned(),
                 size: a["size"].as_u64().unwrap_or(0),
@@ -76,6 +79,12 @@ fn parse_release(json: &str) -> Result<Release, String> {
         })
     });
     Ok(Release { version, page, installer })
+}
+
+/// Is `name` the release asset this copy of SnapKit can install by itself? Only the Windows
+/// installer (`SnapKit-<version>-setup.exe`); a macOS copy is updated by hand from the `.dmg`.
+fn is_installer_name(name: &str) -> bool {
+    cfg!(windows) && name.starts_with("SnapKit-") && name.ends_with("-setup.exe")
 }
 
 /// Is `candidate` a later version than `current`? Compares the numbers ("0.10.0" is later than
@@ -102,11 +111,19 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 
 /// Was SnapKit installed with the installer (as opposed to extracted from the zip)? Only then
 /// can it update itself; the portable copy opens the release page instead.
+#[cfg(windows)]
 pub fn is_installed() -> bool {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("unins000.exe").is_file()))
         .unwrap_or(false)
+}
+
+/// The macOS app doesn't update itself: the new version is installed by hand from the `.dmg` on
+/// the release page.
+#[cfg(not(windows))]
+pub fn is_installed() -> bool {
+    false
 }
 
 /// Downloads the installer to a temporary folder and checks it against its SHA-256 digest.
@@ -173,6 +190,9 @@ fn save_checked(mut reader: impl Read, path: &Path, expected: &str, size: u64) -
 /// Runs the downloaded installer silently. It closes SnapKit if it's still open, replaces the
 /// files keeping the preferences and the library, and opens SnapKit again (`/relaunch=1`).
 pub fn run_installer(path: &Path) -> Result<(), String> {
+    if !cfg!(windows) {
+        return Err(t!("a atualização automática só existe no Windows", "automatic updates are only available on Windows").to_owned());
+    }
     std::process::Command::new(path)
         .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/relaunch=1"])
         .spawn()
@@ -203,6 +223,7 @@ mod tests {
         assert!(!is_newer("garbage", "0.5.3"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn reads_a_github_release() {
         let json = r#"{
@@ -218,6 +239,28 @@ mod tests {
         let setup = release.installer.unwrap();
         assert_eq!((setup.url.as_str(), setup.size), ("https://x/setup", 20));
         assert_eq!(setup.sha256.as_deref(), Some("abcd"));
+        assert!(parse_release("{}").is_err());
+    }
+
+    /// On macOS the Windows installer is never picked, but a newer version is still detected.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_mac_release_has_no_installer() {
+        let json = r#"{
+            "tag_name": "v99.0.0",
+            "html_url": "https://github.com/MichelGSS/snapkit/releases/tag/v99.0.0",
+            "assets": [
+                {"name": "SnapKit-99.0.0-macos.dmg", "browser_download_url": "https://x/dmg", "size": 30, "digest": "sha256:bb"},
+                {"name": "SnapKit-99.0.0-setup.exe", "browser_download_url": "https://x/setup", "size": 20, "digest": "sha256:ABCD"}
+            ]
+        }"#;
+        let release = parse_release(json).unwrap();
+        assert_eq!(release.version, "99.0.0");
+        assert_eq!(release.page, "https://github.com/MichelGSS/snapkit/releases/tag/v99.0.0");
+        assert!(release.installer.is_none());
+        assert!(is_newer(&release.version, CURRENT));
+        assert!(!is_installed());
+        assert!(run_installer(Path::new("SnapKit-99.0.0-setup.exe")).is_err());
         assert!(parse_release("{}").is_err());
     }
 
@@ -252,6 +295,6 @@ mod tests {
         let release = latest().unwrap();
         println!("{release:?}");
         assert!(!release.version.is_empty());
-        assert!(release.installer.is_some_and(|a| a.sha256.is_some()));
+        assert!(!cfg!(windows) || release.installer.is_some_and(|a| a.sha256.is_some()));
     }
 }
