@@ -12,6 +12,10 @@
 //! elapsed time calls for, and fills whatever didn't arrive with silence (Windows delivers nothing
 //! from the system sound while no sound is playing). This way the file's length tracks real time,
 //! which lets it line up with the video.
+//!
+//! On macOS the system sound comes from a Core Audio tap (which `cpal` sets up for an input stream
+//! on an output device). Taps exist from macOS 14.6 on; on older versions that source is skipped
+//! with a warning and the recording goes on with the microphone, if requested.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -37,7 +41,7 @@ type Ring = Arc<Mutex<VecDeque<f32>>>;
 
 #[derive(Clone, Copy)]
 enum Source {
-    /// System output sound (WASAPI in "loopback" mode).
+    /// System output sound (WASAPI in "loopback" mode on Windows, a Core Audio tap on macOS).
     System,
     Microphone,
 }
@@ -111,11 +115,28 @@ fn trim(ring: &mut VecDeque<f32>) {
     }
 }
 
+/// Can this macOS record the system sound? Core Audio taps arrived in macOS 14.2 and `cpal`
+/// supports them from 14.6 on; before that only an extra audio driver could do it.
+#[cfg(target_os = "macos")]
+fn system_sound_supported() -> bool {
+    let v = objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion();
+    (v.majorVersion, v.minorVersion) >= (14, 6)
+}
+
 /// Opens the capture of one source; the converted samples go to `ring`.
 fn open_stream(source: Source, ring: Ring) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
     let (device, config) = match source {
         Source::System => {
+            // Checked before touching Core Audio: on older versions the tap classes don't exist.
+            #[cfg(target_os = "macos")]
+            if !system_sound_supported() {
+                return Err(t!(
+                    "o macOS só permite gravar o som do sistema a partir da versão 14.6",
+                    "macOS only allows recording the system sound from version 14.6 on"
+                )
+                .to_owned());
+            }
             let d = host.default_output_device().ok_or(t!("nenhum dispositivo de saída de som", "no sound output device"))?;
             let c = d.default_output_config().map_err(|e| e.to_string())?;
             (d, c)
@@ -134,7 +155,7 @@ fn open_stream(source: Source, ring: Ring) -> Result<cpal::Stream, String> {
     };
     let on_error = |_| {};
     // For the system sound: asking for an *input* stream on an *output* device is how WASAPI does
-    // loopback.
+    // loopback (and how `cpal` opens a Core Audio tap on macOS).
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => {
             device.build_input_stream(config.config(), move |data: &[f32], _: &_| push(data), on_error, None)

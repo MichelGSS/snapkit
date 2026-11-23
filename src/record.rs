@@ -1,9 +1,9 @@
 //! Screen video recording, done by the FFmpeg bundled with the program (`ffmpeg` folder next to the
 //! executable).
 //!
-//! During the recording FFmpeg captures only the image of the area (`gdigrab`), while SnapKit
-//! records the audio separately ([`crate::audio`]). When it stops, the two are joined into an MP4
-//! (H.264 + AAC). Recording everything live in the same process made the image drop frames.
+//! During the recording FFmpeg captures only the image of the area (`gdigrab` on Windows,
+//! `avfoundation` on macOS), while SnapKit records the audio separately ([`crate::audio`]). When
+//! it stops, the two are joined into an MP4 (H.264 + AAC). Recording everything live in the same process made the image drop frames.
 //!
 //! The alignment is done at the end: video and audio stop at the same moment, but the audio starts
 //! a little earlier (FFmpeg takes a few tenths of a second to start). The excess at the start of
@@ -26,6 +26,10 @@ pub struct Options {
     pub fps: u32,
     pub quality: crate::config::VideoQuality,
     pub draw_mouse: bool,
+    /// Marks the mouse clicks in the video. On Windows a window of SnapKit draws them
+    /// (`platform::ClickHalo`); on macOS FFmpeg draws them into the frames.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub highlight_clicks: bool,
 }
 
 impl Default for Options {
@@ -36,6 +40,7 @@ impl Default for Options {
             fps: 30,
             quality: crate::config::VideoQuality::High,
             draw_mouse: true,
+            highlight_clicks: false,
         }
     }
 }
@@ -63,14 +68,20 @@ fn ffmpeg_command(ffmpeg: &Path) -> Command {
     cmd
 }
 
-/// FFmpeg command line to record the image of `rect` to `out`.
+/// Bit rate in kbit/s for a `w`×`h` video: proportional to the area (~8 Mbit/s at 1920×1080),
+/// scaled by the quality preset.
+fn bitrate_kbps(w: i32, h: i32, quality: crate::config::VideoQuality) -> i64 {
+    let base_kbps = (w as i64 * h as i64) / 260;
+    ((base_kbps as f64 * quality.bitrate_factor()).round() as i64).clamp(1000, 35_000)
+}
+
+/// FFmpeg command line to record the image of `rect` to `out` (Windows, `gdigrab`).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn capture_args(rect: PxRect, options: Options, out: &Path) -> Vec<String> {
     // H.264 requires an even width and height.
     let (w, h) = ((rect.2 - rect.0) & !1, (rect.3 - rect.1) & !1);
     let fps = options.fps.clamp(10, 60);
-    // Bit rate proportional to the area (~8 Mbit/s at 1920×1080), scaled by quality preset.
-    let base_kbps = (w as i64 * h as i64) / 260;
-    let kbps = ((base_kbps as f64 * options.quality.bitrate_factor()).round() as i64).clamp(1000, 35_000);
+    let kbps = bitrate_kbps(w, h, options.quality);
     let draw_mouse = if options.draw_mouse { "1" } else { "0" };
     let mut a: Vec<String> = [
         "-y",
@@ -94,6 +105,164 @@ fn capture_args(rect: PxRect, options: Options, out: &Path) -> Vec<String> {
     add("-video_size", format!("{w}x{h}"));
     add("-i", "desktop".to_owned());
     add("-c:v", "libopenh264".to_owned());
+    add("-b:v", format!("{kbps}k"));
+    add("-pix_fmt", "yuv420p".to_owned());
+    add("-movflags", "+faststart".to_owned());
+    a.push(out.to_string_lossy().into_owned());
+    a
+}
+
+/// The FFmpeg command line that records `rect`: on Windows, straight from the desktop.
+#[cfg(not(target_os = "macos"))]
+fn capture_command(_ffmpeg: &Path, rect: PxRect, options: Options, out: &Path) -> Result<Vec<String>, String> {
+    Ok(capture_args(rect, options, out))
+}
+
+/// The FFmpeg command line that records `rect`: on macOS, the display that holds most of it,
+/// cropped to the area.
+#[cfg(target_os = "macos")]
+fn capture_command(ffmpeg: &Path, rect: PxRect, options: Options, out: &Path) -> Result<Vec<String>, String> {
+    let crop = screen_crop(rect, crate::platform::scale(), &screens())
+        .ok_or_else(|| t!("a área não está em nenhuma tela", "the area isn't on any display").to_owned())?;
+    Ok(avfoundation_args(crop, options, mac_encoder(ffmpeg), out))
+}
+
+/// A display as FFmpeg's `avfoundation` sees it.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Screen {
+    /// Position in `CGGetActiveDisplayList`, which is the N of FFmpeg's "Capture screen N".
+    index: usize,
+    /// Bounds in global points, top-left origin: (x, y, width, height).
+    bounds: (f64, f64, f64, f64),
+    /// The display's own pixels per point (2 on Retina screens, 1 on most external ones).
+    scale: f64,
+}
+
+/// What to record of one display, in that display's own pixels.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScreenCrop {
+    /// FFmpeg's number for the display ("Capture screen N").
+    screen: usize,
+    /// Size of the whole display.
+    frame: (u32, u32),
+    /// Area kept: (x, y, width, height), with even width and height.
+    area: (u32, u32, u32, u32),
+}
+
+#[cfg(target_os = "macos")]
+fn screens() -> Vec<Screen> {
+    crate::platform::displays()
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let b = objc2_core_graphics::CGDisplayBounds(id);
+            Screen {
+                index,
+                bounds: (b.origin.x, b.origin.y, b.size.width, b.size.height),
+                scale: crate::platform::display_scale(id),
+            }
+        })
+        .collect()
+}
+
+/// Finds the display that holds most of `rect` (screen pixels, `global_scale` pixels per point)
+/// and the part of `rect` on it, in the display's own pixels. FFmpeg records one display at a
+/// time, so an area that spans two keeps only the part on the display that holds most of it. A display with
+/// fewer pixels per point than `global_scale` gives a smaller video, with no pixels made up.
+#[cfg(target_os = "macos")]
+fn screen_crop(rect: PxRect, global_scale: f64, screens: &[Screen]) -> Option<ScreenCrop> {
+    let g = global_scale.max(1e-6);
+    let (l, t, r, b) = (rect.0 as f64 / g, rect.1 as f64 / g, rect.2 as f64 / g, rect.3 as f64 / g);
+    let mut best: Option<(Screen, (f64, f64, f64, f64))> = None;
+    let mut best_area = 0.0;
+    for s in screens {
+        let (bx, by, bw, bh) = s.bounds;
+        let part = (l.max(bx), t.max(by), r.min(bx + bw), b.min(by + bh));
+        let area = (part.2 - part.0).max(0.0) * (part.3 - part.1).max(0.0);
+        if area > best_area {
+            best_area = area;
+            best = Some((*s, part));
+        }
+    }
+    let (s, (x0, y0, x1, y1)) = best?;
+    let px = |v: f64| (v * s.scale).round().max(0.0) as u32;
+    let frame = (px(s.bounds.2), px(s.bounds.3));
+    let (left, top) = (px(x0 - s.bounds.0).min(frame.0), px(y0 - s.bounds.1).min(frame.1));
+    let (right, bottom) = (px(x1 - s.bounds.0).min(frame.0), px(y1 - s.bounds.1).min(frame.1));
+    // H.264 requires an even width and height.
+    let (w, h) = (right.saturating_sub(left) & !1, bottom.saturating_sub(top) & !1);
+    (w >= 2 && h >= 2).then_some(ScreenCrop { screen: s.index, frame, area: (left, top, w, h) })
+}
+
+/// H.264 encoders for the screen recording on macOS, best first: the hardware one keeps the CPU
+/// free (and frames from being dropped); the others are software fallbacks.
+#[cfg(target_os = "macos")]
+const MAC_ENCODERS: [&str; 3] = ["h264_videotoolbox", "libopenh264", "libx264"];
+
+/// Picks the best encoder from FFmpeg's `-encoders` listing (lines like
+/// ` V....D h264_videotoolbox    VideoToolbox H.264 Encoder`).
+#[cfg(target_os = "macos")]
+fn pick_encoder(listing: &str) -> &'static str {
+    MAC_ENCODERS
+        .into_iter()
+        .find(|name| listing.lines().any(|l| l.split_whitespace().nth(1) == Some(*name)))
+        .unwrap_or(MAC_ENCODERS[0])
+}
+
+/// The encoder the bundled FFmpeg offers, asked once per run.
+#[cfg(target_os = "macos")]
+fn mac_encoder(ffmpeg: &Path) -> &'static str {
+    static CHOSEN: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    CHOSEN.get_or_init(|| {
+        ffmpeg_command(ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| pick_encoder(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or(MAC_ENCODERS[0])
+    })
+}
+
+/// FFmpeg command line to record `crop` to `out` (macOS, `avfoundation`).
+#[cfg(target_os = "macos")]
+fn avfoundation_args(crop: ScreenCrop, options: Options, encoder: &str, out: &Path) -> Vec<String> {
+    let fps = options.fps.clamp(10, 60);
+    let (x, y, w, h) = crop.area;
+    let (fw, fh) = crop.frame;
+    let kbps = bitrate_kbps(w as i32, h as i32, options.quality);
+    let flag = |on: bool| if on { "1" } else { "0" }.to_owned();
+    let mut a: Vec<String> = ["-y", "-hide_banner", "-loglevel", "error", "-thread_queue_size", "1024", "-f", "avfoundation"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut add = |key: &str, value: String| a.extend([key.to_owned(), value]);
+    add("-capture_cursor", flag(options.draw_mouse));
+    add("-capture_mouse_clicks", flag(options.highlight_clicks));
+    // A format every display offers; asking for one it doesn't makes FFmpeg complain and pick
+    // another.
+    add("-pixel_format", "uyvy422".to_owned());
+    add("-framerate", fps.to_string());
+    add("-i", format!("Capture screen {}:none", crop.screen));
+    // The crop is written relative to the frame FFmpeg delivers (iw×ih): with the expected size
+    // the values come out exact, and if a macOS version delivers the display at another size the
+    // same area is still the one kept.
+    add(
+        "-vf",
+        format!("crop=trunc(iw*{w}/{fw}/2)*2:trunc(ih*{h}/{fh}/2)*2:trunc(iw*{x}/{fw}):trunc(ih*{y}/{fh})"),
+    );
+    add("-c:v", encoder.to_owned());
+    match encoder {
+        // Real-time hint; and the software path of VideoToolbox when there's no hardware encoder
+        // (virtual machines).
+        "h264_videotoolbox" => {
+            add("-realtime", "1".to_owned());
+            add("-allow_sw", "1".to_owned());
+        }
+        "libx264" => add("-preset", "veryfast".to_owned()),
+        _ => {}
+    }
     add("-b:v", format!("{kbps}k"));
     add("-pix_fmt", "yuv420p".to_owned());
     add("-movflags", "+faststart".to_owned());
@@ -164,6 +333,7 @@ impl Recorder {
         let path = dir.join(format!("{name}.mp4"));
         let video_part = dir.join(format!("{name}.video.mp4"));
         let audio_part = dir.join(format!("{name}.audio.wav"));
+        let args = capture_command(&ffmpeg, rect, options, &video_part)?;
 
         // Audio that fails doesn't stop the recording: it goes on without that source, with a
         // warning.
@@ -174,7 +344,7 @@ impl Recorder {
         };
 
         let child = ffmpeg_command(&ffmpeg)
-            .args(capture_args(rect, options, &video_part))
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1357,6 +1527,70 @@ Input #0, mov,mp4, from 'silent.mp4':
         assert!(!description.contains("Audio:"), "{description}");
         assert!(fps(&description) > 25.0, "{description}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Retina laptop (1512×982 points at 2×) with a 1080p display at 1× to its right.
+    #[cfg(target_os = "macos")]
+    const SCREENS: [Screen; 2] = [
+        Screen { index: 0, bounds: (0.0, 0.0, 1512.0, 982.0), scale: 2.0 },
+        Screen { index: 1, bounds: (1512.0, 0.0, 1920.0, 1080.0), scale: 1.0 },
+    ];
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_crop_uses_the_display_own_pixels() {
+        // On the Retina display, screen pixels and display pixels are the same; odd sizes become even.
+        let c = screen_crop((100, 50, 901, 651), 2.0, &SCREENS).unwrap();
+        assert_eq!(c, ScreenCrop { screen: 0, frame: (3024, 1964), area: (100, 50, 800, 600) });
+        // On the 1× display the same screen pixels hold half as many display pixels.
+        let c = screen_crop((3124, 200, 3924, 801), 2.0, &SCREENS).unwrap();
+        assert_eq!(c, ScreenCrop { screen: 1, frame: (1920, 1080), area: (50, 100, 400, 300) });
+        // An area across both displays keeps the part on the one that holds most of it.
+        let c = screen_crop((2724, 0, 3224, 400), 2.0, &SCREENS).unwrap();
+        assert_eq!(c, ScreenCrop { screen: 0, frame: (3024, 1964), area: (2724, 0, 300, 400) });
+        let c = screen_crop((2924, 0, 3624, 400), 2.0, &SCREENS).unwrap();
+        assert_eq!(c, ScreenCrop { screen: 1, frame: (1920, 1080), area: (0, 0, 300, 200) });
+        // Outside every display, or a sliver.
+        assert_eq!(screen_crop((-500, -500, -100, -100), 2.0, &SCREENS), None);
+        assert_eq!(screen_crop((3023, 0, 3025, 400), 2.0, &SCREENS), None);
+        // A Mac with only 1× displays: screen pixels are points.
+        let one = [Screen { index: 0, bounds: (0.0, 0.0, 1920.0, 1080.0), scale: 1.0 }];
+        assert_eq!(screen_crop((10, 20, 330, 260), 1.0, &one).unwrap().area, (10, 20, 320, 240));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_capture_records_the_display_and_crops_the_area() {
+        let crop = ScreenCrop { screen: 1, frame: (1920, 1080), area: (50, 100, 400, 300) };
+        let a = avfoundation_args(crop, Options::default(), "h264_videotoolbox", Path::new("out.mp4")).join(" ");
+        assert!(a.contains("-thread_queue_size 1024 -f avfoundation -capture_cursor 1 -capture_mouse_clicks 0"), "{a}");
+        assert!(a.contains("-pixel_format uyvy422 -framerate 30 -i Capture screen 1:none"), "{a}");
+        assert!(
+            a.contains("-vf crop=trunc(iw*400/1920/2)*2:trunc(ih*300/1080/2)*2:trunc(iw*50/1920):trunc(ih*100/1080)"),
+            "{a}"
+        );
+        assert!(a.contains("-c:v h264_videotoolbox -realtime 1 -allow_sw 1 -b:v 1000k -pix_fmt yuv420p"), "{a}");
+        assert!(a.ends_with("-movflags +faststart out.mp4"), "{a}");
+
+        let options = Options { fps: 90, draw_mouse: false, highlight_clicks: true, ..Options::default() };
+        let full = ScreenCrop { screen: 0, frame: (3024, 1964), area: (0, 0, 1920, 1080) };
+        let b = avfoundation_args(full, options, "libx264", Path::new("b.mp4")).join(" ");
+        assert!(b.contains("-capture_cursor 0 -capture_mouse_clicks 1") && b.contains("-framerate 60"), "{b}");
+        assert!(b.contains("-i Capture screen 0:none"), "{b}");
+        assert!(b.contains("-c:v libx264 -preset veryfast -b:v 7975k"), "{b}");
+        let c = avfoundation_args(full, Options::default(), "libopenh264", Path::new("c.mp4")).join(" ");
+        assert!(c.contains("-c:v libopenh264 -b:v 7975k"), "{c}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_prefers_the_hardware_encoder() {
+        let listing = "Encoders:\n V..... = Video\n ------\n V....D libx264              libx264 H.264 / AVC (codec h264)\n V....D libopenh264          OpenH264 H.264 / AVC (codec h264)\n V....D h264_videotoolbox    VideoToolbox H.264 Encoder (codec h264)\n";
+        assert_eq!(pick_encoder(listing), "h264_videotoolbox");
+        let software = listing.replace("h264_videotoolbox", "hevc_videotoolbox");
+        assert_eq!(pick_encoder(&software), "libopenh264");
+        assert_eq!(pick_encoder(" V....D libx264  libx264 H.264\n"), "libx264");
+        assert_eq!(pick_encoder(""), "h264_videotoolbox");
     }
 
     #[test]

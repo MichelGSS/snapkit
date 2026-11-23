@@ -2950,6 +2950,7 @@ impl App {
                 fps: self.cfg.video_fps,
                 quality: self.cfg.video_quality,
                 draw_mouse: self.cfg.video_cursor,
+                highlight_clicks: self.cfg.video_highlight_clicks,
             };
             match record::Session::start(rect, options, self.library.dir(), stem) {
                 Ok(session) => {

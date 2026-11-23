@@ -46,7 +46,7 @@ use super::{InstanceRequest, PxRect};
 // ---------------------------------------------------------------------------------------------
 // Displays and coordinates
 
-fn displays() -> Vec<CGDirectDisplayID> {
+pub(crate) fn displays() -> Vec<CGDirectDisplayID> {
     let mut ids = [0 as CGDirectDisplayID; 32];
     let mut count = 0u32;
     // SAFETY: the buffer holds 32 ids, the number passed; `count` is a valid u32 to write to.
@@ -55,7 +55,7 @@ fn displays() -> Vec<CGDirectDisplayID> {
 }
 
 /// Pixels per point of one display (2 on Retina screens).
-fn display_scale(id: CGDirectDisplayID) -> f64 {
+pub(crate) fn display_scale(id: CGDirectDisplayID) -> f64 {
     let width = CGDisplayBounds(id).size.width;
     let mode = CGDisplayCopyDisplayMode(id);
     let pixels = CGDisplayMode::pixel_width(mode.as_deref());
