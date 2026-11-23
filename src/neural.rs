@@ -85,11 +85,17 @@ pub fn find_runtime() -> Option<PathBuf> {
 /// Loads ONNX Runtime and creates its environment.
 fn start_runtime() -> Result<Environment, String> {
     let dll = find_runtime().ok_or_else(|| {
-        t!(
+        #[cfg(windows)]
+        let message = t!(
             "motor neural não encontrado (pasta onnxruntime ao lado do snapkit.exe)",
             "neural engine not found (the onnxruntime folder next to snapkit.exe)"
-        )
-        .to_owned()
+        );
+        #[cfg(target_os = "macos")]
+        let message = t!(
+            "motor neural não encontrado (libonnxruntime.dylib na pasta onnxruntime, ao lado do executável)",
+            "neural engine not found (libonnxruntime.dylib in the onnxruntime folder, next to the executable)"
+        );
+        message.to_owned()
     })?;
     ort::init_from(&dll).map_err(|e| e.to_string())?.build().map_err(|e| e.to_string())
 }

@@ -44,6 +44,8 @@ objc2-app-kit = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
 objc2-foundation = "0.3.2"
+# Vision: the system's text recognition, the built-in OCR engine on macOS.
+objc2-vision = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }
 
 # Dependencies optimized even in development: encoding PNGs and shrinking images
 # without optimization would make the library too slow to test.

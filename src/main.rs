@@ -15,6 +15,8 @@ mod legacy;
 mod library;
 mod neural;
 mod ocr;
+#[cfg(target_os = "macos")]
+mod ocr_vision;
 #[cfg_attr(target_os = "macos", path = "pin_macos.rs")]
 mod pin;
 mod record;

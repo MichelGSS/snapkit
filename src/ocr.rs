@@ -8,7 +8,11 @@
 //!    which Tesseract can't, but loses capitals and indentation in code. It's used on request, and
 //!    also as a fallback if Tesseract is missing or fails.
 //!
-//! Neither uses the internet. Both return fragments with their positions, and the final text is
+//! On macOS the system's own engine, **Vision** (`crate::ocr_vision`), comes first for printed
+//! text and needs no folder; Tesseract and the neural engine are still used when their folders
+//! exist: as fallbacks, and the neural engine for handwriting.
+//!
+//! None uses the internet. All return fragments with their positions, and the final text is
 //! rebuilt here from them: words at the same height become a line, and indentation and wide gaps
 //! are reproduced with spaces. This preserves the shape of code and tables, which the engines alone
 //! scramble.
@@ -20,7 +24,7 @@ use image::RgbaImage;
 /// How far back from the chunk limit to look for a plain line to cut at.
 const SPLIT_SEARCH: u32 = 400;
 /// Tiny images read poorly; small areas get a margin up to this size.
-const MIN_SIDE: u32 = 64;
+pub(crate) const MIN_SIDE: u32 = 64;
 /// Words with confidence below this (0–100) are usually icons read as letters.
 const MIN_CONFIDENCE: f32 = 30.0;
 
@@ -28,14 +32,17 @@ const MIN_CONFIDENCE: f32 = 30.0;
 pub enum Engine {
     Tesseract,
     Neural,
+    /// Apple's Vision framework, part of macOS.
+    #[cfg(target_os = "macos")]
+    Vision,
 }
 
 /// What the user wants to read.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
-    /// Printed or screen text: Tesseract, with the neural engine as a fallback.
+    /// Printed or screen text: Tesseract (Vision on macOS), with the others as fallbacks.
     Printed,
-    /// Handwriting or decorative lettering: neural engine.
+    /// Handwriting or decorative lettering: neural engine (on macOS, Vision without it).
     Handwriting,
 }
 
@@ -44,8 +51,16 @@ impl Engine {
         match self {
             Engine::Tesseract => "Tesseract",
             Engine::Neural => t!("motor neural", "neural engine"),
+            #[cfg(target_os = "macos")]
+            Engine::Vision => "Apple Vision",
         }
     }
+
+    /// The engine that reads printed text when nothing goes wrong.
+    #[cfg(not(target_os = "macos"))]
+    pub const PRINTED: Engine = Engine::Tesseract;
+    #[cfg(target_os = "macos")]
+    pub const PRINTED: Engine = Engine::Vision;
 }
 
 /// Recognizes the text in the image and says which engine was used. Must be called off the
@@ -53,25 +68,38 @@ impl Engine {
 pub fn recognize(img: &RgbaImage, mode: Mode) -> Result<(String, Engine), String> {
     if img.width() == 0 || img.height() == 0 {
         let engine = match mode {
-            Mode::Printed => Engine::Tesseract,
+            Mode::Printed => Engine::PRINTED,
             Mode::Handwriting => Engine::Neural,
         };
         return Ok((String::new(), engine));
     }
-    let mut tess_err = None;
+    // The error of the last engine that failed, reported if no other one can read the image.
+    let mut last_err = None;
+    #[cfg(target_os = "macos")]
+    if mode == Mode::Printed {
+        match crate::ocr_vision::recognize(img) {
+            Ok(words) => return Ok((layout(&words), Engine::Vision)),
+            Err(e) => last_err = Some(e),
+        }
+    }
     if mode == Mode::Printed
         && let Some(res) = find_tesseract().map(|dir| tesseract_words(&dir, img))
     {
         match res {
             Ok(words) => return Ok((layout(&words), Engine::Tesseract)),
             // Without Tesseract, or with it failing, the neural engine can still read the image.
-            Err(e) => tess_err = Some(e),
+            Err(e) => last_err = Some(e),
         }
     }
     let dir = match crate::neural::find_models() {
         Some(dir) => dir,
         None => {
-            if let Some(e) = tess_err {
+            // Without the neural models, Vision still reads a fair amount of handwriting.
+            #[cfg(target_os = "macos")]
+            if mode == Mode::Handwriting {
+                return crate::ocr_vision::recognize(img).map(|words| (layout(&words), Engine::Vision));
+            }
+            if let Some(e) = last_err {
                 return Err(e);
             }
             return Err(match mode {
@@ -88,8 +116,17 @@ pub fn recognize(img: &RgbaImage, mode: Mode) -> Result<(String, Engine), String
             });
         }
     };
+    let lines = crate::neural::recognize(&dir, img);
+    // A neural engine that can't start (no ONNX Runtime, for instance) still leaves Vision.
+    #[cfg(target_os = "macos")]
+    let lines = match lines {
+        Err(e) if mode == Mode::Handwriting => {
+            return crate::ocr_vision::recognize(img).map(|words| (layout(&words), Engine::Vision)).map_err(|_| e);
+        }
+        lines => lines,
+    };
     // Each line read goes in as a single fragment; the layout takes care of order and indentation.
-    let words: Vec<Word> = crate::neural::recognize(&dir, img)?
+    let words: Vec<Word> = lines?
         .into_iter()
         .map(|l| Word { x: l.x, y: l.y, w: l.w, h: l.h, text: l.text })
         .collect();
@@ -113,11 +150,18 @@ pub fn recognize_boxes(img: &RgbaImage) -> Result<Vec<WordBox>, String> {
     if img.width() == 0 || img.height() == 0 {
         return Ok(Vec::new());
     }
-    let mut tess_err = None;
+    // The error of the last engine that failed, reported if no other one can read the image.
+    #[cfg(not(target_os = "macos"))]
+    let mut last_err = None;
+    #[cfg(target_os = "macos")]
+    let mut last_err = match crate::ocr_vision::recognize(img) {
+        Ok(words) => return Ok(words),
+        Err(e) => Some(e),
+    };
     if let Some(dir) = find_tesseract() {
         match tesseract_words_in_image_coords(&dir, img) {
             Ok(words) => return Ok(words),
-            Err(e) => tess_err = Some(e),
+            Err(e) => last_err = Some(e),
         }
     }
     if let Some(dir) = crate::neural::find_models() {
@@ -127,7 +171,7 @@ pub fn recognize_boxes(img: &RgbaImage) -> Result<Vec<WordBox>, String> {
             .map(|l| WordBox { x: l.x, y: l.y, w: l.w, h: l.h, text: l.text })
             .collect());
     }
-    if let Some(e) = tess_err {
+    if let Some(e) = last_err {
         return Err(e);
     }
     Err(t!(
@@ -674,7 +718,7 @@ fn layout(words: &[Word]) -> String {
 
 /// Prepares the image for OCR: light background, text enlarged `scale` times, a guaranteed minimum
 /// size and a width within `max`.
-fn prepare(img: &RgbaImage, scale: u32, max: u32) -> RgbaImage {
+pub(crate) fn prepare(img: &RgbaImage, scale: u32, max: u32) -> RgbaImage {
     if img.width() == 0 || img.height() == 0 {
         return img.clone();
     }
@@ -944,7 +988,7 @@ three");
         let text = layout(&tesseract_words(&dir, &sample()).unwrap());
         assert_sample_text(&text);
         assert!(text.contains("espaço"), "the Portuguese model must read the cedilla: {text:?}");
-        assert_eq!(recognize(&sample(), Mode::Printed).unwrap().1, Engine::Tesseract, "Tesseract has priority");
+        assert_eq!(recognize(&sample(), Mode::Printed).unwrap().1, Engine::PRINTED, "the default engine has priority");
     }
 
     /// Uses the models in `vendor/ocr-neural`.
