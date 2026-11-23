@@ -16,7 +16,6 @@
   <a href="https://github.com/MichelGSS/snapkit/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/MichelGSS/snapkit/ci.yml?branch=main&style=flat-square&label=CI"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2F81F7?style=flat-square"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square">
-  <img alt="macOS 12 or later" src="https://img.shields.io/badge/macOS-12%2B-555555?style=flat-square">
   <img alt="Written in Rust" src="https://img.shields.io/badge/made%20with-Rust-B7410E?style=flat-square">
 </p>
 
@@ -171,37 +170,7 @@ Prefer a portable app? Download `SnapKit-<version>-windows-x64.zip`, extract it 
 > [!NOTE]
 > The installer isn't code-signed yet, so Windows SmartScreen may show **Windows protected your PC**. Select **More info** > **Run anyway**, check the SHA-256 checksums on the release page, or [build SnapKit from source](docs/how-to/build-from-source.md).
 
-**Requirements:** Windows 10 version 2004 or later, or Windows 11, 64-bit; or macOS 12 Monterey or later. See [System requirements and limits](docs/reference/requirements-and-limits.md).
-
-### On macOS
-
-The macOS version is new. It's a universal app for Apple silicon and Intel Macs, and it needs macOS 12 Monterey or later.
-
-1. **Download** `SnapKit-<version>-macos.dmg` from the [latest release](https://github.com/MichelGSS/snapkit/releases/latest). The same app is also in `SnapKit-<version>-macos.zip`.
-2. **Open** the disk image and drag **SnapKit** to **Applications**.
-3. **Open SnapKit** from **Applications**. The first time, macOS blocks it, because SnapKit is signed ad hoc and not notarized by Apple (it has no Apple Developer ID). Open **System Settings** > **Privacy & Security**, select **Open Anyway** next to the message about SnapKit, and confirm with **Open**. On macOS 12 to 14 you can instead Control-click SnapKit in Finder and select **Open**.
-4. **Allow Screen Recording** when macOS asks, then quit and reopen SnapKit. Without it, captures show only the desktop wallpaper and the menu bar.
-5. **Press Option+Shift+S** (Alt is the Option key on a Mac) and drag over anything on your screen.
-
-| Permission | What needs it | Where to turn it on |
-|---|---|---|
-| **Screen Recording** | Every capture | **System Settings** > **Privacy & Security** > **Screen Recording** |
-| **Accessibility** | Scrolling capture, which scrolls the page for you | **System Settings** > **Privacy & Security** > **Accessibility** |
-| **Input Monitoring** | Enter in step capture, and Esc to stop a scrolling capture | **System Settings** > **Privacy & Security** > **Input Monitoring** |
-| **Microphone** | Your voice in a recording | macOS asks the first time |
-| **System audio recording** | Computer sound in a recording (macOS 14.6 or later) | macOS asks the first time |
-
-> [!IMPORTANT]
-> Because the app is signed ad hoc, macOS treats each new version as a different app and can forget its permissions. After an update, if captures show only the wallpaper or scrolling capture doesn't scroll, open that permission in **System Settings** > **Privacy & Security**, remove SnapKit with the **–** button, then add it again and turn it on.
-
-SnapKit doesn't update itself on macOS. **Preferences** > **Updates** still tells you when there's a new version; **Open the download page** takes you to it, and you replace the app in **Applications** with the new one. Your preferences and library are kept.
-
-**Known limitations on macOS:**
-
-- The selection layer covers one monitor at a time: the one under the pointer when the capture starts. Move the pointer to another monitor before you press the shortcut to capture it.
-- Video recording isn't in the macOS download yet: it needs FFmpeg, which the app doesn't include. To build it in yourself, run `scripts/fetch-ffmpeg-macos.sh` before `scripts/package-macos.sh`.
-- Text recognition uses Apple's built-in Vision engine, so it needs nothing extra.
-- Recordings include system sound only on macOS 14.6 or later; on older versions, only the microphone.
+**Requirements:** Windows 10 version 2004 or later, or Windows 11, 64-bit. See [System requirements and limits](docs/reference/requirements-and-limits.md).
 
 ### Shortcuts to remember
 
@@ -267,7 +236,7 @@ Yes. In <b>Preferences</b>, set the global shortcut to <b>PrintScreen</b> with n
 <details>
 <summary><b>Does it work on macOS or Linux?</b></summary>
 <br>
-macOS, yes: macOS 12 Monterey or later, on Apple silicon and Intel. The port is new and some features aren't there yet; see <a href="#on-macos">On macOS</a>. Linux isn't supported. Contributions toward it are welcome.
+Not yet. SnapKit is released for Windows only. Versions for macOS and Linux are in development: the code already builds and is tested on macOS, but it isn't released. Contributions toward other platforms are welcome.
 </details>
 
 <details>
@@ -303,7 +272,7 @@ You need [Rust](https://rustup.rs) (stable) and the Visual Studio Build Tools wi
 | `src/record.rs`, `src/video_editor.rs`, `src/audio.rs` | Video recording (FFmpeg), integrated filmstrip editor and audio |
 | `src/library.rs` | Capture library, persistent annotation layers, favorites and tags |
 | `src/i18n.rs` | English and Portuguese interface texts |
-| `src/platform/` | Operating system layer: Windows API calls and Per-Monitor V2 DPI handling (`windows.rs`), AppKit and CoreGraphics (`macos.rs`) |
+| `src/platform/` | Operating system layer: Windows API calls and Per-Monitor V2 DPI handling (`windows.rs`); the macOS version in development (`macos.rs`) |
 | `src/icons.rs`, `src/ui.rs`, `src/theme.rs` | Rasterized vector icon set, reusable UI components and 9 color themes |
 | `src/tray.rs`, `src/config.rs`, `src/autostart.rs`, `src/update.rs` | App icon & tray, preferences, start with Windows and updates |
 

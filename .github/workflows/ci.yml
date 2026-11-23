@@ -5,7 +5,7 @@ name: CI
 
 on:
   push:
-    branches: [main, macos]
+    branches: [main]
   pull_request:
 
 permissions:
@@ -23,8 +23,9 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-  # Apple Silicon runner. There is no screen permission there, so the tests that photograph the
-  # screen only check that nothing crashes.
+  # The macOS version isn't released yet; building and testing it on every push keeps Windows
+  # changes from breaking it. Apple Silicon runner. There is no screen permission there, so the
+  # tests that photograph the screen only check that nothing crashes.
   build-macos:
     runs-on: macos-latest
     steps:
