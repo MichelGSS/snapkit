@@ -14,7 +14,6 @@
 //! scramble.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use image::RgbaImage;
 
@@ -496,7 +495,9 @@ fn find_tesseract() -> Option<PathBuf> {
     // During development the binaries are in `vendor/tesseract` (see scripts/fetch-tesseract.ps1).
     #[cfg(debug_assertions)]
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor").join("tesseract"));
-    candidates.into_iter().find(|d| d.join("tesseract.exe").is_file() && d.join("tessdata").is_dir())
+    candidates
+        .into_iter()
+        .find(|d| d.join(crate::platform::exe_name("tesseract")).is_file() && d.join("tessdata").is_dir())
 }
 
 /// Languages installed in `tessdata`, with Portuguese and English first: "por+eng".
@@ -521,8 +522,6 @@ fn tesseract_languages(dir: &Path) -> String {
 }
 
 fn tesseract_words(dir: &Path, img: &RgbaImage) -> Result<Vec<Word>, String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     // Scaling 3× helps Tesseract the most with screen text; the cap avoids giant images.
     let scale = if img.width() * 3 <= 9000 {
         3
@@ -544,7 +543,7 @@ fn tesseract_words(dir: &Path, img: &RgbaImage) -> Result<Vec<Word>, String> {
         let tile = image::imageops::crop_imm(&prepared, 0, top, prepared.width(), bottom - top).to_image();
         let path = std::env::temp_dir().join(format!("snapkit-ocr-{}-{run_id}-{index}.png", std::process::id()));
         tile.save(&path).map_err(|e| e.to_string())?;
-        let output = Command::new(dir.join("tesseract.exe"))
+        let output = crate::platform::background_command(dir.join(crate::platform::exe_name("tesseract")))
             .arg(&path)
             .arg("stdout")
             .args(["-l", &langs])
@@ -553,7 +552,6 @@ fn tesseract_words(dir: &Path, img: &RgbaImage) -> Result<Vec<Word>, String> {
             .args(["--psm", "11"])
             .args(["-c", "tessedit_create_tsv=1"])
             .env("TESSDATA_PREFIX", dir.join("tessdata"))
-            .creation_flags(CREATE_NO_WINDOW)
             .output();
         let _ = std::fs::remove_file(&path);
         let output = output.map_err(|e| e.to_string())?;

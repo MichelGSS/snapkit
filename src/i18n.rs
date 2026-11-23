@@ -27,12 +27,21 @@ impl Lang {
         }
     }
 
-    /// Windows language: Portuguese if the system interface is in Portuguese, English otherwise.
+    /// System language: Portuguese if the system interface is in Portuguese, English otherwise.
+    #[cfg(windows)]
     pub fn system() -> Lang {
         // SAFETY: a function with no arguments that only reads the user's settings.
         let id = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
         // The low 10 bits are the primary language; 0x16 is Portuguese (Brazil and Portugal).
         if id & 0x3ff == 0x16 { Lang::Portuguese } else { Lang::English }
+    }
+
+    /// System language: Portuguese if it's the user's first preferred language, English otherwise.
+    #[cfg(target_os = "macos")]
+    pub fn system() -> Lang {
+        let first = objc2_foundation::NSLocale::preferredLanguages().firstObject();
+        // Codes like "pt-BR", "pt-PT" or "pt".
+        if first.is_some_and(|code| code.to_string().starts_with("pt")) { Lang::Portuguese } else { Lang::English }
     }
 }
 

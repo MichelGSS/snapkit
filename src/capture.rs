@@ -1,9 +1,10 @@
 //! Screen capture: photographs the monitor under the cursor, in physical pixels.
 
 use image::RgbaImage;
+#[cfg(windows)]
 use xcap::Monitor;
 
-use crate::win::{self, PxRect};
+use crate::platform::{self, PxRect};
 
 /// A photo of one monitor, with what's needed to pick a window in it.
 pub struct Shot {
@@ -20,26 +21,40 @@ pub struct Shot {
 ///
 /// `own_hwnd` is our window, left out of the window list.
 pub fn capture_monitor_at_cursor(own_hwnd: isize, include_cursor: bool) -> Result<Shot, String> {
-    let (cx, cy) = win::cursor_pos();
-    let title = win::foreground_window_title();
-    let monitor = Monitor::from_point(cx, cy)
-        .or_else(|_| primary_monitor())
-        .map_err(|e| tf!("nenhum monitor encontrado: {e}", "no monitor found: {e}"))?;
-    let (ox, oy) = (monitor.x().unwrap_or(0), monitor.y().unwrap_or(0));
+    let (cx, cy) = platform::cursor_pos();
+    let title = platform::foreground_window_title();
     // The cursor is read before the photo, to stay as close as possible to what was on screen.
-    let cursor = if include_cursor { win::cursor_image() } else { None };
-    let mut image = monitor
-        .capture_image()
-        .map_err(|e| tf!("falha ao capturar a tela: {e}", "could not capture the screen: {e}"))?;
+    let cursor = if include_cursor { platform::cursor_image() } else { None };
+    let (mut image, (ox, oy)) = photograph_monitor_at((cx, cy))?;
     if let Some((cursor_img, (x, y))) = cursor {
         image::imageops::overlay(&mut image, &cursor_img, (x - ox) as i64, (y - oy) as i64);
     }
     let (w, h) = (image.width() as i32, image.height() as i32);
-    let windows = win::visible_windows(own_hwnd)
+    let windows = platform::visible_windows(own_hwnd)
         .into_iter()
         .filter_map(|r| clip_to_image((r.0 - ox, r.1 - oy, r.2 - ox, r.3 - oy), w, h))
         .collect();
     Ok(Shot { image, windows, title, note: String::new() })
+}
+
+/// Photo of the monitor that contains the point, and the screen position of its top-left corner.
+#[cfg(windows)]
+fn photograph_monitor_at(p: (i32, i32)) -> Result<(RgbaImage, (i32, i32)), String> {
+    let monitor = Monitor::from_point(p.0, p.1)
+        .or_else(|_| primary_monitor())
+        .map_err(|e| tf!("nenhum monitor encontrado: {e}", "no monitor found: {e}"))?;
+    let origin = (monitor.x().unwrap_or(0), monitor.y().unwrap_or(0));
+    let image = monitor
+        .capture_image()
+        .map_err(|e| tf!("falha ao capturar a tela: {e}", "could not capture the screen: {e}"))?;
+    Ok((image, origin))
+}
+
+#[cfg(target_os = "macos")]
+fn photograph_monitor_at(p: (i32, i32)) -> Result<(RgbaImage, (i32, i32)), String> {
+    let rect = platform::monitor_rect_at(p);
+    let image = platform::capture_px(rect).map_err(|e| tf!("falha ao capturar a tela: {e}", "could not capture the screen: {e}"))?;
+    Ok((image, (rect.0, rect.1)))
 }
 
 /// Photographs only the rectangle `rect` (screen coordinates), without the cursor.
@@ -61,7 +76,18 @@ pub fn grab_virtual(rect: PxRect, include_cursor: bool) -> Result<RgbaImage, Str
         return Err(t!("área pequena demais", "area too small").to_owned());
     }
     // The cursor is read before the photo, to stay as close as possible to what was on screen.
-    let cursor = if include_cursor { win::cursor_image() } else { None };
+    let cursor = if include_cursor { platform::cursor_image() } else { None };
+    let mut out = photograph_area(rect)?;
+    if let Some((cursor_img, (x, y))) = cursor {
+        image::imageops::overlay(&mut out, &cursor_img, (x - rect.0) as i64, (y - rect.1) as i64);
+    }
+    Ok(out)
+}
+
+/// Photo of exactly `rect`, joining the monitors it crosses.
+#[cfg(windows)]
+fn photograph_area(rect: PxRect) -> Result<RgbaImage, String> {
+    let (w, h) = (rect.2 - rect.0, rect.3 - rect.1);
     let mut out = RgbaImage::from_pixel(w as u32, h as u32, image::Rgba([0, 0, 0, 255]));
     let mut found = false;
     for monitor in Monitor::all().map_err(|e| tf!("nenhum monitor encontrado: {e}", "no monitor found: {e}"))? {
@@ -88,12 +114,20 @@ pub fn grab_virtual(rect: PxRect, include_cursor: bool) -> Result<RgbaImage, Str
     if !found {
         return Err(t!("nenhum monitor na área escolhida", "no monitor in the chosen area").to_owned());
     }
-    if let Some((cursor_img, (x, y))) = cursor {
-        image::imageops::overlay(&mut out, &cursor_img, (x - rect.0) as i64, (y - rect.1) as i64);
-    }
     Ok(out)
 }
 
+/// Photo of exactly `rect`: CoreGraphics composes the monitors it crosses by itself.
+#[cfg(target_os = "macos")]
+fn photograph_area(rect: PxRect) -> Result<RgbaImage, String> {
+    let all = platform::virtual_screen();
+    if overlap(rect, all).is_none() {
+        return Err(t!("nenhum monitor na área escolhida", "no monitor in the chosen area").to_owned());
+    }
+    platform::capture_px(rect).map_err(|e| tf!("falha ao capturar a tela: {e}", "could not capture the screen: {e}"))
+}
+
+#[cfg(windows)]
 fn primary_monitor() -> xcap::XCapResult<Monitor> {
     let monitors = Monitor::all()?;
     monitors
@@ -157,7 +191,7 @@ mod tests {
 
     #[test]
     fn grab_virtual_returns_exactly_the_requested_area() {
-        let all = win::virtual_screen();
+        let all = platform::virtual_screen();
         assert!(grab_virtual((all.0, all.1, all.0 + 2, all.1 + 2), false).is_err(), "area too small");
         if crate::in_ci() {
             return;

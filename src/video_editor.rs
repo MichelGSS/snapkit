@@ -1449,7 +1449,7 @@ impl VideoEditor {
                 ))
                 .clicked()
                 {
-                    let _ = std::process::Command::new("explorer").arg(&self.path).spawn();
+                    crate::platform::open(&self.path);
                 }
             });
         });

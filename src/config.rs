@@ -1,4 +1,5 @@
-//! User preferences, saved to `%APPDATA%\SnapKit\config.json`.
+//! User preferences, saved to `%APPDATA%\SnapKit\config.json` (Windows) or
+//! `~/Library/Application Support/SnapKit/config.json` (macOS).
 
 use std::path::PathBuf;
 
@@ -226,7 +227,7 @@ impl Default for Config {
 
 impl Config {
     fn path() -> Option<PathBuf> {
-        Some(PathBuf::from(std::env::var_os("APPDATA")?).join("SnapKit").join("config.json"))
+        Some(crate::platform::data_dir()?.join("config.json"))
     }
 
     /// Loads the preferences; a missing file becomes the default. A file that can't be read is

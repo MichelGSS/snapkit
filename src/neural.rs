@@ -61,6 +61,12 @@ pub fn find_models() -> Option<PathBuf> {
     candidates.into_iter().find(|d| d.join("det.onnx").is_file() && d.join("rec.onnx").is_file())
 }
 
+/// File name of the ONNX Runtime library on this system.
+#[cfg(windows)]
+const ONNXRUNTIME_LIB: &str = "onnxruntime.dll";
+#[cfg(target_os = "macos")]
+const ONNXRUNTIME_LIB: &str = "libonnxruntime.dylib";
+
 /// `onnxruntime.dll`, if it exists. Always a full path: Windows has its own, older
 /// `onnxruntime.dll` in System32, which a bare file name could pick up.
 pub fn find_runtime() -> Option<PathBuf> {
@@ -73,7 +79,7 @@ pub fn find_runtime() -> Option<PathBuf> {
     }
     #[cfg(debug_assertions)]
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor").join("onnxruntime"));
-    candidates.into_iter().map(|d| d.join("onnxruntime.dll")).find(|f| f.is_file())
+    candidates.into_iter().map(|d| d.join(ONNXRUNTIME_LIB)).find(|f| f.is_file())
 }
 
 /// Loads ONNX Runtime and creates its environment.

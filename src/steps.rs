@@ -11,7 +11,7 @@ use image::RgbaImage;
 
 use crate::capture;
 use crate::render::{Op, StepGlyph, StepShape};
-use crate::win::{self, PxRect};
+use crate::platform::{self, PxRect};
 
 /// Limit of shots per session: a guide longer than this becomes too heavy an image.
 pub const MAX_STEPS: usize = 40;
@@ -74,7 +74,7 @@ impl Recorder {
         let shots = Arc::new(Mutex::new(Vec::new()));
         let (stop_flag, list) = (stop.clone(), shots.clone());
         let thread = std::thread::spawn(move || {
-            let read = || [win::left_button_down(), win::right_button_down(), win::enter_down()];
+            let read = || [platform::left_button_down(), platform::right_button_down(), platform::enter_down()];
             // Whatever is already pressed when it starts doesn't count: the click on Start, for
             // example.
             let mut was = read();
@@ -89,17 +89,13 @@ impl Recorder {
                     [_, _, true] => Trigger::Enter,
                     _ => continue,
                 };
-                let at = win::cursor_pos();
-                // SAFETY: read-only query of the active window handle.
-                let fg = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } as isize;
-                let on_panel = win::window_rect(own_hwnd).is_some_and(|panel| contains(panel, at))
-                    || (trigger == Trigger::Enter && own_hwnd != 0 && fg == own_hwnd);
+                let at = platform::cursor_pos();
+                let on_panel = platform::window_rect(own_hwnd).is_some_and(|panel| contains(panel, at))
+                    || (trigger == Trigger::Enter && platform::is_foreground(own_hwnd));
                 // A click has to land in the area; Enter counts when the cursor or active window
                 // overlaps the area.
-                let fg_in_area = fg != 0
-                    && win::window_rect(fg).is_some_and(|w| {
-                        w.0 < rect.2 && w.2 > rect.0 && w.1 < rect.3 && w.3 > rect.1
-                    });
+                let fg_in_area = platform::foreground_window_rect()
+                    .is_some_and(|w| w.0 < rect.2 && w.2 > rect.0 && w.1 < rect.3 && w.3 > rect.1);
                 let in_area = if trigger == Trigger::Enter {
                     contains(rect, at) || fg_in_area
                 } else {

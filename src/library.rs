@@ -98,8 +98,7 @@ pub struct Library {
 impl Library {
     /// Default folder: the user's `Pictures\SnapKit`.
     pub fn default_dir() -> PathBuf {
-        let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
-        home.join("Pictures").join("SnapKit")
+        crate::platform::pictures_dir().join("SnapKit")
     }
 
     /// Opens the library, dropping from the index the entries whose file is gone and adding the

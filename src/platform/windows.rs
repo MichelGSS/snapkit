@@ -7,6 +7,8 @@
 use std::ffi::c_void;
 
 use image::RgbaImage;
+
+use super::{InstanceRequest, PxRect};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_CLOAKED,
@@ -42,9 +44,6 @@ pub fn error_box(title: &str, text: &str) {
     // SAFETY: both strings are null-terminated and outlive the call.
     unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR) };
 }
-
-/// Rectangle in pixels: (left, top, right, bottom).
-pub type PxRect = (i32, i32, i32, i32);
 
 pub fn cursor_pos() -> (i32, i32) {
     let mut p = POINT { x: 0, y: 0 };
@@ -474,17 +473,6 @@ pub fn end_with_us(child: &std::process::Child) {
     }
 }
 
-/// What a second copy of SnapKit asks the one already running to do.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum InstanceRequest {
-    /// Show its window.
-    Show,
-    /// Start a region capture.
-    Select,
-    /// Close cleanly (used by the installer and uninstaller).
-    Quit,
-}
-
 /// The right to be the only SnapKit running with these preferences, plus the signals that a
 /// second copy uses to talk to it.
 pub struct Instance {
@@ -615,6 +603,42 @@ impl Instance {
         }
         false
     }
+}
+
+/// Handle of our main window, from what winit reports.
+pub fn window_id(handle: raw_window_handle::RawWindowHandle) -> isize {
+    match handle {
+        raw_window_handle::RawWindowHandle::Win32(h) => h.hwnd.get(),
+        _ => 0,
+    }
+}
+
+/// Area the selection layer covers: every monitor.
+pub fn selection_area() -> PxRect {
+    virtual_screen()
+}
+
+/// Rectangle of the foreground window, if there is one.
+pub fn foreground_window_rect() -> Option<PxRect> {
+    // SAFETY: read-only query of the active window handle.
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_null() { None } else { window_rect(fg as isize) }
+}
+
+/// Is `hwnd` the window receiving the keyboard?
+pub fn is_foreground(hwnd: isize) -> bool {
+    // SAFETY: read-only query of the active window handle.
+    hwnd != 0 && unsafe { GetForegroundWindow() } as isize == hwnd
+}
+
+/// Windows needs no permission to synthesize scrolling.
+pub fn ensure_input_permission() -> bool {
+    true
+}
+
+/// Windows needs no permission to capture the screen.
+pub fn ensure_screen_permission() -> bool {
+    true
 }
 
 /// Visible top-level windows, from the frontmost to the backmost.

@@ -356,10 +356,7 @@ impl AudioPlayer {
         muted: Arc<AtomicBool>,
     ) -> Option<Self> {
         use std::io::Read;
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use std::process::Stdio;
 
         let stop = Arc::new(AtomicBool::new(false));
         let ring: Ring = Arc::new(Mutex::new(VecDeque::with_capacity(RATE as usize * 4)));
@@ -501,9 +498,8 @@ impl AudioPlayer {
             "-".to_owned(),
         ]);
 
-        let mut cmd = Command::new(ffmpeg);
-        cmd.creation_flags(CREATE_NO_WINDOW)
-            .args(&args)
+        let mut cmd = crate::platform::background_command(ffmpeg);
+        cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -512,7 +508,7 @@ impl AudioPlayer {
             let _ = output_thread.join();
             return None;
         };
-        crate::win::end_with_us(&child);
+        crate::platform::end_with_us(&child);
 
         let Some(mut stdout) = child.stdout.take() else {
             let _ = child.kill();

@@ -10,7 +10,6 @@
 //! the audio is dropped when joining.
 
 use std::io::{Read, Write};
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,9 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::audio::AudioRecording;
-use crate::win::PxRect;
-
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+use crate::platform::PxRect;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Options {
@@ -43,7 +40,7 @@ impl Default for Options {
     }
 }
 
-/// Path of the bundled `ffmpeg.exe`, if it exists.
+/// Path of the bundled `ffmpeg` (`ffmpeg.exe` on Windows), if it exists.
 pub fn find_ffmpeg() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(dir) = std::env::var_os("SNAPKIT_FFMPEG_DIR") {
@@ -54,15 +51,15 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
     }
     #[cfg(debug_assertions)]
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor").join("ffmpeg"));
-    candidates.into_iter().map(|d| d.join("ffmpeg.exe")).find(|p| p.is_file())
+    candidates.into_iter().map(|d| d.join(crate::platform::exe_name("ffmpeg"))).find(|p| p.is_file())
 }
 
 fn ffmpeg_command(ffmpeg: &Path) -> Command {
-    let mut cmd = Command::new(ffmpeg);
+    let mut cmd = crate::platform::background_command(ffmpeg);
     // Bundled `ffmpeg.exe` embeds `<dpiAwareness>PerMonitorV2</dpiAwareness>` in its manifest;
     // clearing `__COMPAT_LAYER` ensures an inherited `HighDpiAware` AppCompat shim never downgrades
     // it to single-monitor System DPI on mixed-scaling multi-monitor setups.
-    cmd.creation_flags(CREATE_NO_WINDOW).env_remove("__COMPAT_LAYER");
+    cmd.env_remove("__COMPAT_LAYER");
     cmd
 }
 
@@ -135,10 +132,9 @@ fn media_duration(ffmpeg: &Path, file: &Path) -> Option<Duration> {
     parse_duration(&String::from_utf8_lossy(&output.stderr))
 }
 
-/// Recordings folder: the user's `Videos\SnapKit`.
+/// Recordings folder: the user's `Videos\SnapKit` (`Movies/SnapKit` on macOS).
 pub fn videos_dir() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
-    home.join("Videos").join("SnapKit")
+    crate::platform::movies_dir().join("SnapKit")
 }
 
 /// A recording in progress.
@@ -185,7 +181,7 @@ impl Recorder {
             .spawn();
         match child {
             Ok(mut child) => {
-                crate::win::end_with_us(&child);
+                crate::platform::end_with_us(&child);
                 // Drain stderr in the background so a full pipe buffer can never block FFmpeg.
                 let stderr_reader = child.stderr.take().map(|mut stderr| {
                     std::thread::spawn(move || {
@@ -596,7 +592,7 @@ pub fn extract_frame_fast(
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        crate::win::end_with_us(&child);
+        crate::platform::end_with_us(&child);
         let mut stdout = child.stdout.take()?;
         let mut buf = vec![0u8; need];
         let ok = stdout.read_exact(&mut buf).is_ok();
@@ -707,7 +703,7 @@ impl FrameStream {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| tf!("não foi possível iniciar o FFmpeg: {e}", "could not start FFmpeg: {e}"))?;
-        crate::win::end_with_us(&child);
+        crate::platform::end_with_us(&child);
 
         let stderr_reader = child.stderr.take().map(|mut stderr| {
             std::thread::spawn(move || {

@@ -9,10 +9,13 @@ mod config;
 mod editor;
 mod export;
 mod icons;
+// The old name only existed on Windows.
+#[cfg(windows)]
 mod legacy;
 mod library;
 mod neural;
 mod ocr;
+#[cfg_attr(target_os = "macos", path = "pin_macos.rs")]
 mod pin;
 mod record;
 mod render;
@@ -23,7 +26,7 @@ mod tray;
 mod ui;
 mod update;
 mod video_editor;
-mod win;
+mod platform;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::collections::HashMap;
@@ -35,7 +38,7 @@ use egui::{Color32, ColorImage, CornerRadius, Margin, Pos2, Rect, Sense, Stroke,
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use image::RgbaImage;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use raw_window_handle::HasWindowHandle;
 
 use config::{Config, HotkeyCfg};
 use icons::Icon;
@@ -95,17 +98,17 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let hwnd = shared.hwnd;
         // Read before anything of ours takes the focus.
-        let mut title = win::foreground_window_title_except(hwnd);
+        let mut title = platform::foreground_window_title_except(hwnd);
         if matches!(kind, CaptureKind::FullScreen | CaptureKind::AllScreens) {
             let delay = shared.delay_secs.load(Ordering::Relaxed);
             let cursor = shared.include_cursor.load(Ordering::Relaxed);
             if hwnd != 0 {
                 // Excluded from captures, the window doesn't show in the shot, without having to
                 // leave the screen.
-                win::exclude_from_capture(hwnd, true);
-                if delay > 0 && win::is_on_screen(hwnd) {
+                platform::exclude_from_capture(hwnd, true);
+                if delay > 0 && platform::is_on_screen(hwnd) {
                     // With a delay, get out of the way: the user wants to work with what's behind.
-                    win::minimize(hwnd);
+                    platform::minimize(hwnd);
                 }
             }
             // A moment for the system to apply the exclusion before the shot.
@@ -114,7 +117,7 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
                 std::thread::sleep(Duration::from_secs(delay as u64));
             }
             if delay > 0 || title.is_empty() {
-                let current = win::foreground_window_title_except(hwnd);
+                let current = platform::foreground_window_title_except(hwnd);
                 if !current.is_empty() {
                     title = current;
                 }
@@ -127,7 +130,7 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
                     s
                 })
             } else {
-                let all = win::virtual_screen();
+                let all = platform::virtual_screen();
                 guarded(|| capture::grab_virtual(all, cursor)).map(|image| capture::Shot {
                     image,
                     windows: Vec::new(),
@@ -137,23 +140,23 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
             };
             *shared.pending.lock().unwrap() = Some((CaptureKind::FullScreen, shot));
             if hwnd != 0 {
-                win::exclude_from_capture(hwnd, false);
-                win::show(hwnd);
+                platform::exclude_from_capture(hwnd, false);
+                platform::show(hwnd);
             }
         } else {
             let was_on_screen =
-                hwnd != 0 && win::is_on_screen(hwnd) && !shared.cloaked.load(Ordering::SeqCst);
+                hwnd != 0 && platform::is_on_screen(hwnd) && !shared.cloaked.load(Ordering::SeqCst);
             *shared.select_request.lock().unwrap() = Some((kind, title, was_on_screen));
             if hwnd != 0 {
                 // Invisible while it changes size and loses its frame: without this the editor
                 // flashes on the screen before the selection layer is ready.
                 shared.cloaked.store(true, Ordering::SeqCst);
-                win::cloak(hwnd, true);
+                platform::cloak(hwnd, true);
             }
             // The window becomes the selection layer; if it was in the tray or minimized, it comes
             // back.
             if hwnd != 0 && !was_on_screen {
-                win::show(hwnd);
+                platform::show(hwnd);
             }
         }
         ctx.request_repaint();
@@ -164,7 +167,7 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
 struct Selecting {
     kind: CaptureKind,
     /// Windows visible when the selection started, in screen coordinates, front to back.
-    windows: Vec<win::PxRect>,
+    windows: Vec<platform::PxRect>,
     /// Title of the window that was in the foreground, for searching the library.
     title: String,
     /// Where the mouse button went down. Kept here because, in the frame in which the button is
@@ -184,7 +187,9 @@ struct Selecting {
     started: Instant,
     /// Frames already drawn with the window covering every monitor.
     ready_frames: u8,
-    /// The layer has already been shown (the window starts invisible; see `win::cloak`).
+    /// Screen area the layer covers: every monitor on Windows, the one under the cursor on macOS.
+    area: platform::PxRect,
+    /// The layer has already been shown (the window starts invisible; see `platform::cloak`).
     revealed: bool,
 }
 
@@ -365,7 +370,7 @@ struct App {
     normal_size: Option<egui::Vec2>,
     normal_pos: Option<(i32, i32)>,
     /// Rectangle of the window in normal use, in screen pixels, to restore it after the selection.
-    normal_rect: Option<win::PxRect>,
+    normal_rect: Option<platform::PxRect>,
     /// Frames still left reapplying `normal_rect` after leaving the selection.
     restore_frames: u8,
     /// The window is invisible, returning from the selection: at the end, it reappears or leaves
@@ -385,23 +390,23 @@ struct App {
 
 /// State of the small floating panel of the panoramic capture.
 struct PanoUi {
-    rect: win::PxRect,
+    rect: platform::PxRect,
     title: String,
     session: Option<scroll::PanoramicSession>,
     /// Frame around the area, visible while the panel exists.
-    _frame: Option<win::RegionFrame>,
+    _frame: Option<platform::RegionFrame>,
     /// Frames left before positioning the panel (the window is still leaving full screen).
     setup_frames: u8,
 }
 
 /// State of the floating panel of the step-by-step capture.
 struct StepsUi {
-    rect: win::PxRect,
+    rect: platform::PxRect,
     title: String,
     /// `None` until the user presses Start.
     recorder: Option<steps::Recorder>,
     /// Frame around the area, visible while the panel exists.
-    _frame: Option<win::RegionFrame>,
+    _frame: Option<platform::RegionFrame>,
     setup_frames: u8,
 }
 
@@ -418,7 +423,7 @@ enum VideoJobDone {
 }
 
 struct VideoUi {
-    rect: win::PxRect,
+    rect: platform::PxRect,
     title: String,
     recorder: Option<record::Session>,
     /// A recording that becomes a GIF when it stops.
@@ -426,9 +431,9 @@ struct VideoUi {
     /// Active countdown deadline before recording starts automatically.
     countdown_until: Option<Instant>,
     /// Animated click ripple overlay while recording is active and unpaused.
-    halo: Option<win::ClickHalo>,
+    halo: Option<platform::ClickHalo>,
     /// Frame around the area, visible while the panel exists.
-    _frame: Option<win::RegionFrame>,
+    _frame: Option<platform::RegionFrame>,
     setup_frames: u8,
 }
 
@@ -439,7 +444,7 @@ const VIDEO_HUD_SIZE: egui::Vec2 = egui::vec2(760.0, 84.0);
 /// Turns the window into a small panel, always on top and excluded from captures, and places it
 /// next to the area `rect`. Called every frame until `setup_frames` reaches zero: the window is
 /// still leaving full screen and only accepts the position a few frames later.
-fn hud_setup(ctx: &egui::Context, hwnd: isize, rect: win::PxRect, size: egui::Vec2, setup_frames: &mut u8) {
+fn hud_setup(ctx: &egui::Context, hwnd: isize, rect: platform::PxRect, size: egui::Vec2, setup_frames: &mut u8) {
     if *setup_frames == 0 {
         return;
     }
@@ -447,16 +452,16 @@ fn hud_setup(ctx: &egui::Context, hwnd: isize, rect: win::PxRect, size: egui::Ve
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-        win::exclude_from_capture(hwnd, true);
+        platform::exclude_from_capture(hwnd, true);
     }
     *setup_frames -= 1;
     if *setup_frames == 0 {
         // Right below the area; if it doesn't fit, above; as a last resort, at the bottom of the
         // monitor.
         let center = ((rect.0 + rect.2) / 2, (rect.1 + rect.3) / 2);
-        let scale = win::dpi_scale_at(center);
+        let scale = platform::dpi_scale_at(center);
         let (w, h) = ((size.x * scale) as i32, (size.y * scale) as i32 + 48);
-        let work = win::work_area_at(center).unwrap_or((rect.0, rect.1, rect.2, rect.3 + h + 24));
+        let work = platform::work_area_at(center).unwrap_or((rect.0, rect.1, rect.2, rect.3 + h + 24));
         let x = (center.0 - w / 2).clamp(work.0, (work.2 - w).max(work.0));
         let y = if rect.3 + 12 + h <= work.3 {
             rect.3 + 12
@@ -465,7 +470,7 @@ fn hud_setup(ctx: &egui::Context, hwnd: isize, rect: win::PxRect, size: egui::Ve
         } else {
             work.3 - h - 12
         };
-        win::set_window_pos(hwnd, (x, y));
+        platform::set_window_pos(hwnd, (x, y));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
     }
     ctx.request_repaint();
@@ -477,7 +482,7 @@ const RIGHT_GROUP_WIDTH: f32 = 600.0;
 fn apply_window_theme(ctx: &egui::Context, hwnd: isize, theme: &theme::Theme) {
     theme::apply(ctx, theme);
     let pal = theme::palette(theme);
-    win::apply_titlebar_theme(
+    platform::apply_titlebar_theme(
         hwnd,
         pal.dark,
         [pal.bg_chrome.r(), pal.bg_chrome.g(), pal.bg_chrome.b()],
@@ -491,7 +496,7 @@ impl App {
         i18n::set(cfg.language.unwrap_or_else(i18n::Lang::system));
         theme::install_fonts(&cc.egui_ctx);
         let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+            Ok(handle) => platform::window_id(handle),
             _ => 0,
         };
         apply_window_theme(&cc.egui_ctx, hwnd, theme::by_name(&cfg.theme));
@@ -525,7 +530,7 @@ impl App {
                     }
                     tray::TrayAction::Open => {
                         shared.open_requested.store(true, Ordering::SeqCst);
-                        win::show(shared.hwnd);
+                        platform::show(shared.hwnd);
                         ctx.request_repaint();
                     }
                     tray::TrayAction::Quit => {
@@ -541,7 +546,7 @@ impl App {
         // The size it was created with, until the user moves or resizes it. Without it, a capture
         // made before the window was ever shown (started in the tray) would leave it the size of
         // every monitor.
-        let normal_rect = win::window_rect(shared.hwnd);
+        let normal_rect = platform::window_rect(shared.hwnd);
         let mut app = Self {
             shared,
             hotkey_draft: cfg.hotkey.clone(),
@@ -603,10 +608,13 @@ impl App {
         // whatever was asked, so it's kept cloaked, invisible, and hidden right after that.
         if std::env::args().any(|a| a == autostart::MINIMIZED_ARG) && app.shared.hwnd != 0 {
             app.shared.cloaked.store(true, Ordering::SeqCst);
-            win::cloak(app.shared.hwnd, true);
+            platform::cloak(app.shared.hwnd, true);
             app.hide_after_start = 2;
             cc.egui_ctx.request_repaint();
         }
+        // macOS: without the Screen Recording permission captures only show the wallpaper. The
+        // first time, the system asks; on Windows there's nothing to ask.
+        platform::ensure_screen_permission();
         RUNNING.store(true, Ordering::SeqCst);
         app
     }
@@ -698,7 +706,7 @@ impl App {
 
     fn sync_titlebar(&self) {
         let pal = theme::palette(self.theme());
-        win::apply_titlebar_theme(
+        platform::apply_titlebar_theme(
             self.shared.hwnd,
             pal.dark,
             [pal.bg_chrome.r(), pal.bg_chrome.g(), pal.bg_chrome.b()],
@@ -1522,7 +1530,7 @@ impl App {
 
     fn copy_library_files_to_clipboard(&mut self, files: &[String]) {
         let paths: Vec<std::path::PathBuf> = files.iter().map(|f| self.library.path(f)).collect();
-        match win::copy_files_to_clipboard(&paths) {
+        match platform::copy_files_to_clipboard(&paths) {
             Ok(()) => {
                 self.status = if paths.len() == 1 {
                     t!(
@@ -1773,7 +1781,7 @@ impl App {
                     .clicked()
                 {
                     let _ = std::fs::create_dir_all(self.library.dir());
-                    let _ = std::process::Command::new("explorer").arg(self.library.dir()).spawn();
+                    platform::open(self.library.dir());
                 }
             });
         });
@@ -2188,9 +2196,7 @@ impl App {
                     if entry.is_video()
                         && ui.button(t!("Abrir no player", "Open in player")).clicked()
                     {
-                        let _ = std::process::Command::new("explorer")
-                            .arg(self.library.path(&entry.file))
-                            .spawn();
+                        platform::open(self.library.path(&entry.file));
                         ui.close();
                     }
                     let fav_label = if entry.favorite {
@@ -2222,10 +2228,7 @@ impl App {
                         ui.close();
                     }
                     if ui.button(t!("Mostrar na pasta", "Show in folder")).clicked() {
-                        let _ = std::process::Command::new("explorer")
-                            .arg("/select,")
-                            .arg(self.library.path(&entry.file))
-                            .spawn();
+                        platform::reveal(&self.library.path(&entry.file));
                         ui.close();
                     }
                     if ui.button(t!("Mover para a Lixeira", "Move to Recycle Bin")).clicked() {
@@ -2294,7 +2297,7 @@ impl App {
             }
         });
         if let Some(drag_paths) = to_drag {
-            let _ = win::start_file_drag(&drag_paths);
+            let _ = platform::start_file_drag(&drag_paths);
         }
         // Delete removes the selected capture, with the mouse over the library. It doesn't apply
         // while typing in the search, nor when the key is meant for an annotation selected in the
@@ -2477,7 +2480,7 @@ impl App {
         self.flush_autosave(ctx);
         editor.commit_pending_text();
         let image = editor.image().clone();
-        let file = self.library.add(win::local_time(), title, image.width(), image.height());
+        let file = self.library.add(platform::local_time(), title, image.width(), image.height());
         self.current_file = Some(file.clone());
         // The image saved below already includes what has been annotated so far.
         self.saved_revision = editor.revision();
@@ -2521,7 +2524,7 @@ impl App {
         }
         self.library.register_existing_file(
             file.clone(),
-            win::local_time(),
+            platform::local_time(),
             title,
             width,
             height,
@@ -2569,7 +2572,7 @@ impl App {
         }
         self.library.register_existing_file(
             file.clone(),
-            win::local_time(),
+            platform::local_time(),
             title,
             width,
             height,
@@ -2593,7 +2596,7 @@ impl App {
     fn start_scroll(
         &mut self,
         ctx: &egui::Context,
-        rect: win::PxRect,
+        rect: platform::PxRect,
         direction: scroll::Direction,
         title: String,
     ) {
@@ -2607,11 +2610,11 @@ impl App {
             // Gives the window time to leave full screen before minimizing.
             std::thread::sleep(Duration::from_millis(250));
             if shared.hwnd != 0 {
-                win::minimize(shared.hwnd);
+                platform::minimize(shared.hwnd);
             }
             std::thread::sleep(Duration::from_millis(450));
             // Frame around the area while the scrolling happens.
-            let frame = win::RegionFrame::show(rect);
+            let frame = platform::RegionFrame::show(rect);
             let result = guarded(|| scroll::run(rect, direction));
             drop(frame);
             let result = result.map(|(image, note)| capture::Shot {
@@ -2623,28 +2626,28 @@ impl App {
             // Delivered as "full screen": the image is already finished, with no selection step.
             *shared.pending.lock().unwrap() = Some((CaptureKind::FullScreen, result));
             if shared.hwnd != 0 {
-                win::show(shared.hwnd);
+                platform::show(shared.hwnd);
             }
             ctx.request_repaint();
         });
     }
 
     /// Turns the window into a small, always visible panel to control the panoramic capture.
-    fn start_panoramic(&mut self, rect: win::PxRect, title: String) {
+    fn start_panoramic(&mut self, rect: platform::PxRect, title: String) {
         self.shared.busy.store(true, Ordering::SeqCst);
         self.pano = Some(PanoUi {
             rect,
             title,
             session: None,
-            _frame: win::RegionFrame::show(rect),
+            _frame: platform::RegionFrame::show(rect),
             setup_frames: 6,
         });
     }
 
     /// Turns the window into a small panel to control the video recording.
-    fn start_video(&mut self, rect: win::PxRect, as_gif: bool, title: String) {
+    fn start_video(&mut self, rect: platform::PxRect, as_gif: bool, title: String) {
         self.shared.busy.store(true, Ordering::SeqCst);
-        let frame = win::RegionFrame::show(rect);
+        let frame = platform::RegionFrame::show(rect);
         self.video = Some(VideoUi {
             rect,
             title,
@@ -2866,7 +2869,7 @@ impl App {
         }
 
         if start_now {
-            let now = win::local_time();
+            let now = platform::local_time();
             let file = self.library.reserve_name(now, "mp4");
             let stem = file.strip_suffix(".mp4").unwrap_or(&file);
             let options = record::Options {
@@ -2882,7 +2885,7 @@ impl App {
                     if let Some(video) = &mut self.video {
                         video.countdown_until = None;
                         video.recorder = Some(session);
-                        video.halo = show_halo.then(|| win::ClickHalo::show(rect, hwnd));
+                        video.halo = show_halo.then(|| platform::ClickHalo::show(rect, hwnd));
                     }
                 }
                 Err(e) => {
@@ -2943,7 +2946,7 @@ impl App {
                 Ok(()) => {
                     if was_paused {
                         if self.cfg.video_highlight_clicks {
-                            video.halo = Some(win::ClickHalo::show(rect, hwnd));
+                            video.halo = Some(platform::ClickHalo::show(rect, hwnd));
                         }
                     } else {
                         video.halo = None;
@@ -3026,10 +3029,7 @@ impl App {
                 self.adopt_gif(ctx, file, path, title);
             }
             Ok(VideoJobDone::ExportedExternal { path }) => {
-                let _ = std::process::Command::new("explorer")
-                    .arg("/select,")
-                    .arg(&path)
-                    .spawn();
+                platform::reveal(&path);
                 self.status = tf!(
                     "Vídeo exportado em {}",
                     "Video exported to {}",
@@ -3066,7 +3066,7 @@ impl App {
             video_editor::VideoAction::SaveClipToLibrary { opts } => {
                 let Some(ve) = &self.video_editor else { return };
                 let src = ve.path().to_path_buf();
-                let file = self.library.reserve_name(win::local_time(), "mp4");
+                let file = self.library.reserve_name(platform::local_time(), "mp4");
                 let out = self.library.path(&file);
                 let title = if base_title.is_empty() {
                     t!("Trecho de vídeo", "Video clip").to_owned()
@@ -3121,7 +3121,7 @@ impl App {
             video_editor::VideoAction::ExportGifToLibrary { opts } => {
                 let Some(ve) = &self.video_editor else { return };
                 let src = ve.path().to_path_buf();
-                let file = self.library.reserve_name(win::local_time(), "gif");
+                let file = self.library.reserve_name(platform::local_time(), "gif");
                 let out = self.library.path(&file);
                 let title = if base_title.is_empty() {
                     "GIF".to_owned()
@@ -3177,22 +3177,22 @@ impl App {
         self.steps = None;
         self.restore_frames = 0;
         self.shared.busy.store(false, Ordering::SeqCst);
-        win::exclude_from_capture(self.shared.hwnd, false);
+        platform::exclude_from_capture(self.shared.hwnd, false);
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(NORMAL_MIN_SIZE));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
             self.normal_size.unwrap_or(egui::vec2(900.0, 600.0)),
         ));
         if let Some(pos) = self.normal_pos {
-            win::set_window_pos(self.shared.hwnd, pos);
+            platform::set_window_pos(self.shared.hwnd, pos);
         }
         self.sync_titlebar();
     }
 
     /// Turns the window into a small panel to control the step-by-step capture.
-    fn start_steps(&mut self, rect: win::PxRect, title: String) {
+    fn start_steps(&mut self, rect: platform::PxRect, title: String) {
         self.shared.busy.store(true, Ordering::SeqCst);
-        let frame = win::RegionFrame::show(rect);
+        let frame = platform::RegionFrame::show(rect);
         self.steps = Some(StepsUi { rect, title, recorder: None, _frame: frame, setup_frames: 6 });
     }
 
@@ -3347,15 +3347,15 @@ impl App {
     fn end_selection(&mut self, ctx: &egui::Context) {
         if self.selecting.take().is_some_and(|s| !s.revealed) {
             self.shared.cloaked.store(false, Ordering::SeqCst);
-            win::cloak(self.shared.hwnd, false);
+            platform::cloak(self.shared.hwnd, false);
         }
         self.shared.busy.store(false, Ordering::SeqCst);
-        win::exclude_from_capture(self.shared.hwnd, false);
-        win::set_tool_window(self.shared.hwnd, false);
+        platform::exclude_from_capture(self.shared.hwnd, false);
+        platform::set_tool_window(self.shared.hwnd, false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
         if let Some(r) = self.normal_rect {
-            win::set_window_rect(self.shared.hwnd, r);
+            platform::set_window_rect(self.shared.hwnd, r);
         }
         self.sync_titlebar();
         // The frame comes back a few frames later; the rectangle is reapplied until then.
@@ -3364,7 +3364,7 @@ impl App {
     }
 
     /// Photographs `rect` after the configured delay, with the window out of the way.
-    fn capture_after_delay(&mut self, ctx: &egui::Context, rect: win::PxRect, mut title: String, delay: u32, cursor: bool) {
+    fn capture_after_delay(&mut self, ctx: &egui::Context, rect: platform::PxRect, mut title: String, delay: u32, cursor: bool) {
         if self.shared.busy.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -3372,11 +3372,11 @@ impl App {
         let (shared, ctx) = (self.shared.clone(), ctx.clone());
         std::thread::spawn(move || {
             if shared.hwnd != 0 {
-                win::exclude_from_capture(shared.hwnd, true);
-                win::minimize(shared.hwnd);
+                platform::exclude_from_capture(shared.hwnd, true);
+                platform::minimize(shared.hwnd);
             }
             std::thread::sleep(Duration::from_secs(delay as u64));
-            let current = win::foreground_window_title_except(shared.hwnd);
+            let current = platform::foreground_window_title_except(shared.hwnd);
             if !current.is_empty() {
                 title = current;
             }
@@ -3388,8 +3388,8 @@ impl App {
             });
             *shared.pending.lock().unwrap() = Some((CaptureKind::FullScreen, shot));
             if shared.hwnd != 0 {
-                win::exclude_from_capture(shared.hwnd, false);
-                win::show(shared.hwnd);
+                platform::exclude_from_capture(shared.hwnd, false);
+                platform::show(shared.hwnd);
             }
             ctx.request_repaint();
         });
@@ -3406,8 +3406,8 @@ impl App {
         let Some(Selecting { quick: Some(quick), .. }) = &mut self.selecting else { return };
         // Conversion between interface points and screen pixels, to readjust the area.
         let fallback_scale = ctx.pixels_per_point();
-        let desktop = win::virtual_screen();
-        let (ox, oy, scale_x, scale_y) = match win::client_rect_screen(hwnd) {
+        let desktop = platform::virtual_screen();
+        let (ox, oy, scale_x, scale_y) = match platform::client_rect_screen(hwnd) {
             Some((cl, ct, cr, cb)) if rect.width() >= 1.0 && rect.height() >= 1.0 => (
                 cl,
                 ct,
@@ -3415,7 +3415,7 @@ impl App {
                 (cb - ct) as f32 / rect.height(),
             ),
             _ => {
-                let (ox, oy) = win::client_origin(hwnd).unwrap_or((desktop.0, desktop.1));
+                let (ox, oy) = platform::client_origin(hwnd).unwrap_or((desktop.0, desktop.1));
                 (ox, oy, fallback_scale, fallback_scale)
             }
         };
@@ -3425,7 +3425,7 @@ impl App {
                 oy + ((p.y - rect.min.y) * scale_y).round() as i32,
             )
         };
-        let px_to_screen = |r: win::PxRect| {
+        let px_to_screen = |r: platform::PxRect| {
             Rect::from_min_max(
                 rect.min + egui::vec2((r.0 - ox) as f32 / scale_x, (r.1 - oy) as f32 / scale_y),
                 rect.min + egui::vec2((r.2 - ox) as f32 / scale_x, (r.3 - oy) as f32 / scale_y),
@@ -3625,7 +3625,7 @@ impl App {
         }
     }
 
-    fn finish_quick(&mut self, ctx: &egui::Context, action: QuickAction, px_rect: win::PxRect) {
+    fn finish_quick(&mut self, ctx: &egui::Context, action: QuickAction, px_rect: platform::PxRect) {
         let Some(sel) = self.selecting.as_mut() else { return };
         let title = sel.title.clone();
         let Some(quick) = sel.quick.take() else { return };
@@ -3698,7 +3698,7 @@ impl App {
             return;
         }
         self.shared.cloaked.store(true, Ordering::SeqCst);
-        win::cloak(self.shared.hwnd, true);
+        platform::cloak(self.shared.hwnd, true);
         self.settle = Some(Settle { put_away, hidden: false, deadline: Instant::now() + Duration::from_millis(600) });
     }
 
@@ -3713,7 +3713,7 @@ impl App {
         if !put_away {
             if restored {
                 self.shared.cloaked.store(false, Ordering::SeqCst);
-                win::cloak(hwnd, false);
+                platform::cloak(hwnd, false);
                 self.settle = None;
             }
         } else if !hidden {
@@ -3726,7 +3726,7 @@ impl App {
             }
         } else if now >= deadline {
             self.shared.cloaked.store(false, Ordering::SeqCst);
-            win::cloak(hwnd, false);
+            platform::cloak(hwnd, false);
             self.settle = None;
         } else {
             self.put_away();
@@ -3737,16 +3737,16 @@ impl App {
     /// Takes the window off the screen: to the tray, if there is one, or to the taskbar.
     fn put_away(&self) {
         let hwnd = self.shared.hwnd;
-        if !win::is_on_screen(hwnd) {
+        if !platform::is_on_screen(hwnd) {
             return;
         }
         if let Some(r) = self.normal_rect {
-            win::set_window_rect(hwnd, r);
+            platform::set_window_rect(hwnd, r);
         }
         if self.tray.is_some() {
-            win::hide(hwnd);
+            platform::hide(hwnd);
         } else {
-            win::minimize(hwnd);
+            platform::minimize(hwnd);
         }
     }
 
@@ -3756,12 +3756,12 @@ impl App {
         // The window has to cover every monitor. It loses its frame a few frames after the request,
         // and the system can change its size in the meantime; that's why the check runs every
         // frame.
-        let desktop = win::virtual_screen();
+        let desktop = self.selecting.as_ref().map_or_else(platform::selection_area, |s| s.area);
         // Checked every frame: the system or winit can put the normal style back meanwhile.
-        win::set_tool_window(hwnd, true);
-        let covering = win::window_rect(hwnd) == Some(desktop);
+        platform::set_tool_window(hwnd, true);
+        let covering = platform::window_rect(hwnd) == Some(desktop);
         if !covering {
-            win::set_window_rect(hwnd, desktop);
+            platform::set_window_rect(hwnd, desktop);
         }
         // The window started invisible: it appears once it has been drawn a few times at the right
         // size, so the switch doesn't flicker.
@@ -3769,7 +3769,7 @@ impl App {
             sel.ready_frames = if covering { sel.ready_frames + 1 } else { 0 };
             if sel.ready_frames >= 3 || sel.started.elapsed() > Duration::from_millis(500) {
                 self.shared.cloaked.store(false, Ordering::SeqCst);
-                win::cloak(hwnd, false);
+                platform::cloak(hwnd, false);
                 sel.revealed = true;
             }
         }
@@ -3794,7 +3794,7 @@ impl App {
 
         // Conversion between interface points and screen pixels.
         let fallback_scale = ctx.pixels_per_point();
-        let (ox, oy, scale_x, scale_y) = match win::client_rect_screen(hwnd) {
+        let (ox, oy, scale_x, scale_y) = match platform::client_rect_screen(hwnd) {
             Some((cl, ct, cr, cb)) if rect.width() >= 1.0 && rect.height() >= 1.0 => (
                 cl,
                 ct,
@@ -3802,7 +3802,7 @@ impl App {
                 (cb - ct) as f32 / rect.height(),
             ),
             _ => {
-                let (ox, oy) = win::client_origin(hwnd).unwrap_or((desktop.0, desktop.1));
+                let (ox, oy) = platform::client_origin(hwnd).unwrap_or((desktop.0, desktop.1));
                 (ox, oy, fallback_scale, fallback_scale)
             }
         };
@@ -3812,7 +3812,7 @@ impl App {
                 oy + ((p.y - rect.min.y) * scale_y).round() as i32,
             )
         };
-        let px_to_screen = |r: win::PxRect| {
+        let px_to_screen = |r: platform::PxRect| {
             Rect::from_min_max(
                 rect.min + egui::vec2((r.0 - ox) as f32 / scale_x, (r.1 - oy) as f32 / scale_y),
                 rect.min + egui::vec2((r.2 - ox) as f32 / scale_x, (r.3 - oy) as f32 / scale_y),
@@ -4079,7 +4079,7 @@ impl App {
             let loupe = Rect::from_min_size(min, egui::Vec2::splat(side));
             painter.rect_filled(loupe.expand(2.0), 3.0, Color32::from_gray(25));
             let mut center_rgb: Option<[u8; 3]> = None;
-            if let Some(pixels) = win::grab_pixels(cx - CELLS / 2, cy - CELLS / 2, CELLS, CELLS) {
+            if let Some(pixels) = platform::grab_pixels(cx - CELLS / 2, cy - CELLS / 2, CELLS, CELLS) {
                 let center_idx = ((CELLS / 2) * CELLS + (CELLS / 2)) as usize;
                 center_rgb = pixels.get(center_idx).copied();
                 for (i, [r, g, b]) in pixels.into_iter().enumerate() {
@@ -4120,7 +4120,7 @@ impl App {
         }
 
         // Esc cancels the whole capture; the Redo button reopens the region drawing.
-        let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape)) || win::escape_pressed();
+        let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape)) || platform::escape_pressed();
 
         // Confirmation bar of the armed region.
         let mut bar = None;
@@ -4351,7 +4351,7 @@ impl App {
                             {
                                 start_capture(CaptureKind::FullScreen, self.shared.clone(), ctx.clone());
                             }
-                            if win::monitor_count() > 1 {
+                            if platform::monitor_count() > 1 {
                                 let all_label = self.button_with_shortcut(
                                     t!("Todas as telas", "All screens"),
                                     config::CaptureShortcutMode::AllScreens,
@@ -4497,9 +4497,7 @@ impl App {
                                     ))
                                     .clicked()
                                     {
-                                        let _ = std::process::Command::new("explorer")
-                                            .arg(ve.path())
-                                            .spawn();
+                                        platform::open(ve.path());
                                     }
                                     let can_grab = !self.video_job_running && ve.current_frame().is_some();
                                     if ui
@@ -5112,14 +5110,14 @@ impl eframe::App for App {
             self.hide_after_start = 0;
             self.settle = None;
             self.shared.cloaked.store(false, Ordering::SeqCst);
-            win::cloak(self.shared.hwnd, false);
+            platform::cloak(self.shared.hwnd, false);
         }
         if self.hide_after_start > 0 {
             self.hide_after_start -= 1;
             if self.hide_after_start == 0 {
                 self.put_away();
                 self.shared.cloaked.store(false, Ordering::SeqCst);
-                win::cloak(self.shared.hwnd, false);
+                platform::cloak(self.shared.hwnd, false);
             } else {
                 ctx.request_repaint();
             }
@@ -5130,14 +5128,14 @@ impl eframe::App for App {
         self.update_logic(ctx);
         if let Some((kind, title, was_on_screen)) = self.shared.select_request.lock().unwrap().take() {
             let hwnd = self.shared.hwnd;
-            let windows = win::visible_windows(hwnd);
-            self.selecting = Some(Selecting { kind, windows, title, drag_origin: None, drawn: None, adjust: None, was_on_screen, quick: None, started: Instant::now(), ready_frames: 0, revealed: false });
+            let windows = platform::visible_windows(hwnd);
+            self.selecting = Some(Selecting { kind, windows, title, drag_origin: None, drawn: None, adjust: None, was_on_screen, quick: None, started: Instant::now(), ready_frames: 0, area: platform::selection_area(), revealed: false });
             self.hide_after_start = 0;
             self.restore_frames = 0;
             self.settle = None;
             // Excluded from captures: the shot of the chosen area comes out without our layer on
             // top.
-            win::exclude_from_capture(hwnd, true);
+            platform::exclude_from_capture(hwnd, true);
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
@@ -5150,7 +5148,7 @@ impl eframe::App for App {
         self.hide_after_start = 0;
         self.settle = None;
         self.shared.cloaked.store(false, Ordering::SeqCst);
-        win::cloak(self.shared.hwnd, false);
+        platform::cloak(self.shared.hwnd, false);
         match shot {
             Err(e) => self.status = e,
             Ok(shot) => {
@@ -5195,7 +5193,7 @@ impl eframe::App for App {
                 // Closing with the X only hides the window when there's a tray to bring it back.
                 self.flush_autosave(&ctx);
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                win::hide(self.shared.hwnd);
+                platform::hide(self.shared.hwnd);
             } else {
                 self.shutdown(&ctx);
             }
@@ -5216,24 +5214,24 @@ impl eframe::App for App {
             if self.restore_frames > 0 {
                 // Leaving the selection: the window is still coming back from the size of every
                 // monitor.
-                if win::is_on_screen(self.shared.hwnd) {
+                if platform::is_on_screen(self.shared.hwnd) {
                     if let Some(r) = self.normal_rect
-                        && win::window_rect(self.shared.hwnd) != Some(r)
+                        && platform::window_rect(self.shared.hwnd) != Some(r)
                     {
-                        win::set_window_rect(self.shared.hwnd, r);
+                        platform::set_window_rect(self.shared.hwnd, r);
                     }
                     self.restore_frames -= 1;
                     ctx.request_repaint();
                 }
             } else if !fullscreen
-                && win::is_on_screen(self.shared.hwnd)
+                && platform::is_on_screen(self.shared.hwnd)
                 && let Some(size) = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size())
                 && size.x >= NORMAL_MIN_SIZE.x
                 && size.y >= NORMAL_MIN_SIZE.y
             {
                 self.normal_size = Some(size);
-                self.normal_pos = win::window_pos(self.shared.hwnd);
-                self.normal_rect = win::window_rect(self.shared.hwnd);
+                self.normal_pos = platform::window_pos(self.shared.hwnd);
+                self.normal_rect = platform::window_rect(self.shared.hwnd);
             }
             if self.save_requested && self.restore_frames == 0 {
                 self.save_requested = false;
@@ -5254,13 +5252,13 @@ fn spawn_instance_listener(shared: Arc<Shared>, ctx: egui::Context) {
     std::thread::spawn(move || {
         while let Some(request) = instance.wait() {
             match request {
-                win::InstanceRequest::Show => {
+                platform::InstanceRequest::Show => {
                     shared.open_requested.store(true, Ordering::SeqCst);
-                    win::show(shared.hwnd);
+                    platform::show(shared.hwnd);
                     ctx.request_repaint();
                 }
-                win::InstanceRequest::Select => start_capture(CaptureKind::Region, shared.clone(), ctx.clone()),
-                win::InstanceRequest::Quit => {
+                platform::InstanceRequest::Select => start_capture(CaptureKind::Region, shared.clone(), ctx.clone()),
+                platform::InstanceRequest::Quit => {
                     shared.quit_requested.store(true, Ordering::SeqCst);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     ctx.request_repaint();
@@ -5377,7 +5375,7 @@ fn copy_text(text: &str) -> Result<(), String> {
 }
 
 fn main() -> eframe::Result {
-    win::enable_per_monitor_dpi();
+    platform::enable_per_monitor_dpi();
     // Self-test mode: `snapkit --test-capture output.png` captures the screen and exits.
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 3 && args[1] == "--test-capture" {
@@ -5408,31 +5406,32 @@ fn main() -> eframe::Result {
     let start_hidden = args.iter().any(|a| a == autostart::MINIMIZED_ARG);
     let key = instance_key();
     if args.iter().any(|a| a == "--quit") {
-        win::Instance::send(&key, win::InstanceRequest::Quit);
+        platform::Instance::send(&key, platform::InstanceRequest::Quit);
         return Ok(());
     }
     // Only one SnapKit per set of preferences. A second copy (from the Start menu while this one
     // is in the tray, say) would fight over the shortcut and the library index; it passes its
     // request on and leaves.
-    match win::Instance::claim(&key) {
+    match platform::Instance::claim(&key) {
         Some(instance) => {
             let _ = INSTANCE.set(instance);
         }
         None => {
             let request = if args.iter().any(|a| a == "--select") {
-                Some(win::InstanceRequest::Select)
+                Some(platform::InstanceRequest::Select)
             } else if start_hidden {
                 None
             } else {
-                Some(win::InstanceRequest::Show)
+                Some(platform::InstanceRequest::Show)
             };
             if let Some(request) = request {
-                win::Instance::send(&key, request);
+                platform::Instance::send(&key, request);
             }
             return Ok(());
         }
     }
 
+    #[cfg(windows)]
     legacy::migrate();
     let icon = egui::IconData { rgba: tray::icon_rgba(64), width: 64, height: 64 };
     let options = eframe::NativeOptions {
@@ -5459,7 +5458,7 @@ fn main() -> eframe::Result {
 }
 
 /// This copy's claim to be the only SnapKit running (see `main`).
-static INSTANCE: OnceLock<win::Instance> = OnceLock::new();
+static INSTANCE: OnceLock<platform::Instance> = OnceLock::new();
 
 /// Set once the interface is up: from then on, a fatal error isn't a failure to start.
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -5468,7 +5467,7 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// used for the documentation screenshots, can run alongside. A fixed hash (FNV-1a), the same in
 /// every version, so an old and a new SnapKit still recognize each other.
 fn instance_key() -> String {
-    let dir = std::env::var("APPDATA").unwrap_or_default().to_lowercase();
+    let dir = platform::profile_id().to_lowercase();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in dir.bytes() {
         hash ^= byte as u64;
@@ -5480,10 +5479,10 @@ fn instance_key() -> String {
 /// Appends a line to `%APPDATA%\SnapKit\error.log`, so a failure can be reported later.
 fn log_error(detail: &str) {
     use std::io::Write;
-    let Some(dir) = std::env::var_os("APPDATA").map(|d| std::path::PathBuf::from(d).join("SnapKit")) else { return };
+    let Some(dir) = platform::data_dir() else { return };
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("error.log")) {
-        let (y, mo, d, h, mi, s) = win::local_time();
+        let (y, mo, d, h, mi, s) = platform::local_time();
         let _ = writeln!(f, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} SnapKit {}: {detail}", env!("CARGO_PKG_VERSION"));
     }
 }
@@ -5514,7 +5513,7 @@ fn fatal_box(detail: &str) {
              Details / Detalhes: %APPDATA%\\SnapKit\\error.log"
         )
     };
-    win::error_box(APP_NAME, &text);
+    platform::error_box(APP_NAME, &text);
 }
 
 #[cfg(test)]

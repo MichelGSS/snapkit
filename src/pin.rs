@@ -37,7 +37,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, CS_DBLCLKS,
 };
 
-use crate::win::{self, PxRect};
+use crate::platform::{self, PxRect};
 
 const BORDER_PX: i32 = 2;
 const MIN_PIN_SIDE: i32 = 48;
@@ -110,8 +110,8 @@ pub fn spawn(image: RgbaImage, accent_rgb: [u8; 3], at_rect: Option<PxRect>) -> 
     std::thread::spawn(move || {
         let mut state = Box::new(PinState::new(image, accent_rgb));
         let (mut win_w, mut win_h) = state.window_size();
-        let cursor = win::cursor_pos();
-        let work = win::work_area_at(cursor).unwrap_or((0, 0, 1920, 1080));
+        let cursor = platform::cursor_pos();
+        let work = platform::work_area_at(cursor).unwrap_or((0, 0, 1920, 1080));
         let max_w = ((work.2 - work.0) * 85 / 100).max(MIN_PIN_SIDE + BORDER_PX * 2);
         let max_h = ((work.3 - work.1) * 85 / 100).max(MIN_PIN_SIDE + BORDER_PX * 2);
         if at_rect.is_none() && (win_w > max_w || win_h > max_h) {

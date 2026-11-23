@@ -183,7 +183,7 @@ pub fn run_installer(path: &Path) -> Result<(), String> {
 /// Opens a web page in the default browser.
 pub fn open_page(url: &str) {
     if url.starts_with("https://") {
-        let _ = std::process::Command::new("explorer").arg(url).spawn();
+        crate::platform::open(url);
     }
 }
 

@@ -22,7 +22,7 @@ use std::time::Duration;
 use image::RgbaImage;
 
 use crate::capture;
-use crate::win::{self, PxRect};
+use crate::platform::{self, PxRect};
 
 /// Safety limits for endless pages.
 const MAX_FRAMES: usize = 80;
@@ -304,10 +304,10 @@ impl Axis {
     /// Turns the wheel to move forward (`forward`) or back along the axis.
     fn step(self, notches: i32, forward: bool) {
         match (self, forward) {
-            (Axis::Vertical, true) => win::wheel(-notches),
-            (Axis::Vertical, false) => win::wheel(notches),
-            (Axis::Horizontal, true) => win::hwheel(notches),
-            (Axis::Horizontal, false) => win::hwheel(-notches),
+            (Axis::Vertical, true) => platform::wheel(-notches),
+            (Axis::Vertical, false) => platform::wheel(notches),
+            (Axis::Horizontal, true) => platform::hwheel(notches),
+            (Axis::Horizontal, false) => platform::hwheel(-notches),
         }
     }
 
@@ -335,7 +335,7 @@ fn grab_stable(rect: PxRect) -> Result<RgbaImage, String> {
 fn scroll_to_start(rect: PxRect, axis: Axis) -> Result<bool, String> {
     let mut before = capture::grab_rect(rect)?;
     for _ in 0..60 {
-        if win::escape_pressed() {
+        if platform::escape_pressed() {
             return Ok(false);
         }
         axis.step(10, false);
@@ -366,7 +366,7 @@ fn strip_inner(rect: PxRect, axis: Axis) -> Result<(RgbaImage, String, bool), St
     let mut still = 0;
 
     for _ in 0..MAX_FRAMES {
-        if win::escape_pressed() {
+        if platform::escape_pressed() {
             reason = t!("interrompida com Esc", "stopped with Esc").to_owned();
             stopped_by_esc = true;
             break;
@@ -451,12 +451,12 @@ fn both_axes(rect: PxRect) -> Result<(RgbaImage, String), String> {
 /// Automatic capture: scrolls the area `rect` (screen coordinates) in the requested direction, from
 /// the start, and returns the stitched image and why the capture stopped.
 pub fn run(rect: PxRect, direction: Direction) -> Result<(RgbaImage, String), String> {
-    let original_cursor = win::cursor_pos();
+    let original_cursor = platform::cursor_pos();
     let center = ((rect.0 + rect.2) / 2, (rect.1 + rect.3) / 2);
     // The mouse wheel goes to the window under the cursor; bringing it to the front keeps another
     // window from covering the area in the middle of the capture.
-    win::focus_window_at(center);
-    win::set_cursor_pos(center);
+    platform::focus_window_at(center);
+    platform::set_cursor_pos(center);
     std::thread::sleep(Duration::from_millis(200));
 
     let result = (|| {
@@ -476,7 +476,7 @@ pub fn run(rect: PxRect, direction: Direction) -> Result<(RgbaImage, String), St
             Direction::Both => both_axes(rect),
         }
     })();
-    win::set_cursor_pos(original_cursor);
+    platform::set_cursor_pos(original_cursor);
     result
 }
 
