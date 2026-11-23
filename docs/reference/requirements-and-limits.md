@@ -9,7 +9,7 @@
 | Processor | Any 64-bit processor. No AVX2 needed. |
 | Graphics | OpenGL support (any current graphics driver; built into macOS). Needed for the transparent capture overlay. |
 | Disk space | About 200 MB for the program on Windows, plus your captures and recordings |
-| Permissions | A standard user account. No administrator rights needed. On macOS, **Screen Recording** for every capture, **Accessibility** for scrolling capture and **Microphone** to record your voice. |
+| Permissions | A standard user account. No administrator rights needed. On macOS, **Screen Recording** for every capture, **Accessibility** for scrolling capture, **Input Monitoring** for some keys during step and scrolling capture, and **Microphone** to record your voice. |
 | Network | None. SnapKit works fully offline. It connects to GitHub only to check for updates, when you ask it to. |
 
 ## Size and resource use
@@ -51,9 +51,10 @@ The installed size breaks down as follows: FFmpeg about 110 MB, Tesseract about 
 - The app is signed ad hoc, not with an Apple Developer ID, so the first launch needs **System Settings** > **Privacy & Security** > **Open Anyway**. After an update, macOS can forget the Screen Recording and Accessibility permissions: remove SnapKit from those lists and add it again.
 - SnapKit doesn't update itself: **Preferences** > **Updates** opens the release page, and you replace the app in **Applications**.
 - The selection layer covers one monitor at a time, the one under the pointer when the capture starts.
-- Video recording and text recognition aren't in the macOS download yet: they need FFmpeg, Tesseract and ONNX Runtime, which it doesn't include.
-- Recordings can't include system sound, only the microphone.
-- **Pin to screen** and dragging files from the library into other apps aren't available yet.
+- Video recording isn't in the macOS download yet: it needs FFmpeg, which the app doesn't include (`scripts/fetch-ffmpeg-macos.sh` fetches it when you build the app yourself).
+- Text recognition uses Apple's built-in Vision engine.
+- Recordings include system sound only on macOS 14.6 or later; on older versions, only the microphone.
+- Enter in step capture, and Esc during a scrolling capture, need the **Input Monitoring** permission.
 
 ## Related
 

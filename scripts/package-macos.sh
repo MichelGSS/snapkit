@@ -164,6 +164,8 @@ cat >"$app/Contents/Info.plist" <<PLIST
     <string>SnapKit needs to record the screen to take screenshots and record videos.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>SnapKit uses the microphone only when you turn it on for a video recording.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>SnapKit records the computer's sound only when you turn it on for a video recording.</string>
 </dict>
 </plist>
 PLIST

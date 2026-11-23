@@ -906,10 +906,17 @@ impl App {
                     Some(Icon::ExternalOpen),
                     t!("Abrir a página de download", "Open the download page"),
                 )
-                .on_hover_text(t!(
-                    "Esta cópia é a portátil (zip): baixe o zip novo e extraia por cima.",
-                    "This is the portable copy (zip): download the new zip and extract it over this one."
-                ))
+                .on_hover_text(if cfg!(target_os = "macos") {
+                    t!(
+                        "Baixe o .dmg novo e substitua o SnapKit em Aplicativos.",
+                        "Download the new .dmg and replace SnapKit in Applications."
+                    )
+                } else {
+                    t!(
+                        "Esta cópia é a portátil (zip): baixe o zip novo e extraia por cima.",
+                        "This is the portable copy (zip): download the new zip and extract it over this one."
+                    )
+                })
                 .clicked()
                 {
                     page = Some(release.page.clone());

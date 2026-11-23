@@ -9,6 +9,7 @@ All notable changes to SnapKit are listed here. The project follows [Semantic Ve
 - **macOS port**: SnapKit now builds and runs on macOS 12 Monterey or later, as one universal app for Apple silicon and Intel Macs. A platform layer (`src/platform/`) keeps the Windows behavior unchanged and adds an AppKit and CoreGraphics implementation: capture that keeps every Retina pixel, the live selection layer, window detection, placement of SnapKit's windows, the region frame, copying files to the clipboard, a single running copy, and start at login through a LaunchAgent.
 - **macOS packages**: `scripts/package-macos.sh` builds `SnapKit.app` (signed ad hoc), `SnapKit-<version>-macos.dmg` with an **Applications** shortcut, `SnapKit-<version>-macos.zip` and their SHA-256 checksums. The release workflow publishes them next to the Windows files, and `SHA256SUMS.txt` lists every package.
 - **CI on macOS**: CI also builds and tests SnapKit on macOS, checks that the Intel build compiles, and checks the packaging script.
+- **On macOS**: Pin to screen as native windows; text recognition with Apple's Vision engine (no extra download); video and GIF recording through FFmpeg `avfoundation` with the hardware encoder and click highlighting (`scripts/fetch-ffmpeg-macos.sh` fetches FFmpeg); dragging files from the library into Finder; Command-key shortcuts with Mac symbols; the Dock icon leaves while SnapKit waits in the menu bar.
 
 ### Changed
 
@@ -18,8 +19,7 @@ All notable changes to SnapKit are listed here. The project follows [Semantic Ve
 
 - The first launch needs **System Settings** > **Privacy & Security** > **Open Anyway**, and macOS can forget the Screen Recording and Accessibility permissions after an update.
 - The selection layer covers one monitor at a time.
-- Video recording and text recognition aren't in the macOS download yet (FFmpeg, Tesseract and ONNX Runtime aren't bundled), and recordings can't include system sound.
-- **Pin to screen** and dragging files out of the library aren't available yet.
+- Video recording isn't in the macOS download yet (FFmpeg isn't bundled), and recordings include system sound only on macOS 14.6 or later.
 
 ## [0.7.0] - 2026-11-19
 

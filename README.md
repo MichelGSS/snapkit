@@ -187,7 +187,9 @@ The macOS version is new. It's a universal app for Apple silicon and Intel Macs,
 |---|---|---|
 | **Screen Recording** | Every capture | **System Settings** > **Privacy & Security** > **Screen Recording** |
 | **Accessibility** | Scrolling capture, which scrolls the page for you | **System Settings** > **Privacy & Security** > **Accessibility** |
+| **Input Monitoring** | Enter in step capture, and Esc to stop a scrolling capture | **System Settings** > **Privacy & Security** > **Input Monitoring** |
 | **Microphone** | Your voice in a recording | macOS asks the first time |
+| **System audio recording** | Computer sound in a recording (macOS 14.6 or later) | macOS asks the first time |
 
 > [!IMPORTANT]
 > Because the app is signed ad hoc, macOS treats each new version as a different app and can forget its permissions. After an update, if captures show only the wallpaper or scrolling capture doesn't scroll, open that permission in **System Settings** > **Privacy & Security**, remove SnapKit with the **–** button, then add it again and turn it on.
@@ -197,10 +199,9 @@ SnapKit doesn't update itself on macOS. **Preferences** > **Updates** still tell
 **Known limitations on macOS:**
 
 - The selection layer covers one monitor at a time: the one under the pointer when the capture starts. Move the pointer to another monitor before you press the shortcut to capture it.
-- Video recording and text recognition aren't in the macOS download yet: they need FFmpeg, Tesseract and ONNX Runtime, which it doesn't include.
-- Recordings can't include system sound, only the microphone.
-- **Pin to screen** isn't available yet.
-- You can't drag files from the library into other apps yet. Copy them instead, and paste them in Finder or another app.
+- Video recording isn't in the macOS download yet: it needs FFmpeg, which the app doesn't include. To build it in yourself, run `scripts/fetch-ffmpeg-macos.sh` before `scripts/package-macos.sh`.
+- Text recognition uses Apple's built-in Vision engine, so it needs nothing extra.
+- Recordings include system sound only on macOS 14.6 or later; on older versions, only the microphone.
 
 ### Shortcuts to remember
 
