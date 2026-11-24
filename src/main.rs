@@ -3999,14 +3999,16 @@ impl App {
         #[cfg(target_os = "linux")]
         {
             let _ = put_away;
-            return;
         }
-        if self.shared.hwnd == 0 {
-            return;
+        #[cfg(not(target_os = "linux"))]
+        {
+            if self.shared.hwnd == 0 {
+                return;
+            }
+            self.shared.cloaked.store(true, Ordering::SeqCst);
+            platform::cloak(self.shared.hwnd, true);
+            self.settle = Some(Settle { put_away, hidden: false, deadline: Instant::now() + Duration::from_millis(600) });
         }
-        self.shared.cloaked.store(true, Ordering::SeqCst);
-        platform::cloak(self.shared.hwnd, true);
-        self.settle = Some(Settle { put_away, hidden: false, deadline: Instant::now() + Duration::from_millis(600) });
     }
 
     /// Follows the return from the selection, every frame, until the window can reappear or leave

@@ -258,7 +258,6 @@ pub fn spawn(image: RgbaImage, accent_rgb: [u8; 3], at_rect: Option<PxRect>) -> 
                             }
                         });
                         menu.append(&close_item);
-                        menu.attach_to_widget(win, None);
                         {
                             let state = state.clone();
                             menu.connect_deactivate(move |_| {
