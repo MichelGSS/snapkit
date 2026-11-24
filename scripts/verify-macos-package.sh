@@ -60,7 +60,7 @@ while IFS= read -r -d '' f; do
     if is_macho "$f"; then
         macho_count=$((macho_count + 1))
         lipo "$f" -verify_arch arm64 x86_64 || die "$f is not universal (arm64 + x86_64): $(lipo -archs "$f" 2>/dev/null || true)"
-        deps="$(otool -L "$f")"
+        deps="$(otool -L "$f" | grep -E '^[[:space:]]' || true)"
         for forbidden in /opt/homebrew /usr/local /Users/; do
             if printf '%s\n' "$deps" | grep -q "$forbidden"; then
                 die "$f links against forbidden path ($forbidden): $deps"
