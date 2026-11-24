@@ -1,10 +1,10 @@
 # Builds the portable zip, Inno Setup installer, and SHA256SUMS.txt on Windows, uploading workflow
 # artifacts on manual dispatch and publishing a GitHub Release on v* tags.
 #
-# The universal macOS app (.dmg and .zip, signed ad hoc) isn't released yet. Its build runs on
-# manual dispatch (artifacts only) and joins tagged releases only when the repository variable
-# RELEASE_MACOS is "true"; then publish-macos adds the macOS files and a combined SHA256SUMS.txt
-# once both builds have passed.
+# The universal macOS app (.dmg and .zip, signed ad hoc) and Linux packages (.deb and .tar.gz)
+# run on manual dispatch (artifacts only) and join tagged releases when the repository variables
+# RELEASE_MACOS and RELEASE_LINUX are "true"; then publish-extra adds those files and a combined
+# SHA256SUMS.txt once all enabled builds have passed.
 name: Release
 
 on:

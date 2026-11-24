@@ -15,9 +15,18 @@ $work = Join-Path ([IO.Path]::GetTempPath()) "snapkit-ffmpeg-$PID"
 
 New-Item -ItemType Directory -Force "$work\dl" | Out-Null
 try {
-    winget download --id BtbN.FFmpeg.LGPL.9.0 -d "$work\dl" `
-        --accept-source-agreements --accept-package-agreements | Out-Null
-    $zip = (Get-ChildItem "$work\dl\*.zip" | Select-Object -First 1).FullName
+    $zip = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Get-ChildItem "$work\dl\*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+        winget download --id BtbN.FFmpeg.LGPL.9.0 -d "$work\dl" `
+            --accept-source-agreements --accept-package-agreements | Out-Null
+        $zip = (Get-ChildItem "$work\dl\*.zip" | Select-Object -First 1).FullName
+        if ($zip) { break }
+        if ($attempt -lt 3) {
+            Write-Warning "winget did not download FFmpeg (attempt $attempt/3); retrying..."
+            Start-Sleep -Seconds 5
+        }
+    }
     if (-not $zip) { throw 'winget did not download FFmpeg' }
     Copy-Item $zip "$work\ffmpeg.zip"
     Expand-Archive "$work\ffmpeg.zip" "$work\x" -Force

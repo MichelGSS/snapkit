@@ -16,11 +16,15 @@
   <a href="https://github.com/MichelGSS/snapkit/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/MichelGSS/snapkit/ci.yml?branch=main&style=flat-square&label=CI"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2F81F7?style=flat-square"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square">
+  <img alt="macOS 12+ Universal" src="https://img.shields.io/badge/macOS-12%2B%20Universal-000000?style=flat-square">
+  <img alt="Linux x86_64" src="https://img.shields.io/badge/Linux-x86__64-FCC624?style=flat-square&logoColor=000">
   <img alt="Written in Rust" src="https://img.shields.io/badge/made%20with-Rust-B7410E?style=flat-square">
 </p>
 
 <p align="center">
   <a href="https://github.com/MichelGSS/snapkit/releases/latest"><b>⬇️ Download</b></a>
+  &nbsp;·&nbsp;
+  <a href="https://snapkitapp.xyz/"><b>🌐 Website</b></a>
   &nbsp;·&nbsp;
   <a href="docs/README.md"><b>📖 User guide</b></a>
   &nbsp;·&nbsp;
@@ -55,7 +59,7 @@
   <tr>
     <td width="50%" valign="top">
       <h3>🪶 Lightweight</h3>
-      One native app written in Rust. A 67 MB installer, about 100 MB of memory while idle, no background services and no updater running behind your back.
+      One native app written in Rust for Windows, macOS, and Linux. Around 100 MB of memory while idle, no Electron runtime, no background services, and no updater running behind your back.
     </td>
     <td width="50%" valign="top">
       <h3>📝 Made for documentation</h3>
@@ -82,7 +86,7 @@ Press **Alt+Shift+S**, drag over what you need, annotate it right where it is, a
 
 ## 🎨 Clean, modern interface
 
-Built with crisp **Inter** typography, custom vector icons, a collapsible tool rail, elevated library cards and a themed Windows title bar that adapts to every color preset.
+Built with crisp **Inter** typography, custom vector icons, a collapsible tool rail, elevated library cards and adaptive 9-theme palettes (with automatic title bar tinting on Windows).
 
 <table>
   <tr>
@@ -128,12 +132,12 @@ Built with crisp **Inter** typography, custom vector icons, a collapsible tool r
 </td>
     <td valign="top">
 
-- **OCR** with Tesseract (English and Portuguese) that keeps indentation, plus a **neural engine** for handwriting
+- **OCR**: Tesseract (English and Portuguese) + neural handwriting engine on Windows & Linux, and Apple's built-in **Vision** framework on macOS, keeping code indentation intact
 - **Multi-format export**: save as **PNG, JPEG, WebP, BMP** or **PDF** (including multi-page PDFs and stitched images)
 - **Screen recording** to MP4 (`15–60` FPS) with system sound, microphone and optional click highlights
 - **Video editor**: visual filmstrip, live audio preview with waveform, trim, crop, speed (`0.5×–2×`) and **GIF** export
 - **Library** of images, MP4s and GIFs with editable layers, favorites (`★`), tags, search and drag-and-drop
-- **Modern desktop UI**: embedded **Inter** typography, crisp vector icons, collapsible tool rail, themed Windows title bar, English & Portuguese, **9 themes**, and tray icon
+- **Modern desktop UI**: embedded **Inter** typography, crisp vector icons, collapsible tool rail, themed title bar (Windows), English & Portuguese, **9 themes**, and tray / menu bar icon
 
 </td>
   </tr>
@@ -161,16 +165,39 @@ Your captures are plain PNG files in your **Pictures** folder and your recording
 
 ## 🚀 Get started
 
-1. **Download** `SnapKit-<version>-setup.exe` from the [latest release](https://github.com/MichelGSS/snapkit/releases/latest).
+Download the package for your system from the [latest release](https://github.com/MichelGSS/snapkit/releases/latest) or [snapkitapp.xyz](https://snapkitapp.xyz/):
+
+### Windows
+
+1. **Download** `SnapKit-<version>-setup.exe` (or the portable `SnapKit-<version>-windows-x64.zip`).
 2. **Install** it. It installs for your user only and doesn't ask for administrator rights.
 3. **Press Alt+Shift+S** and drag over anything on your screen.
 
-Prefer a portable app? Download `SnapKit-<version>-windows-x64.zip`, extract it and run `snapkit.exe`.
-
 > [!NOTE]
-> The installer isn't code-signed yet, so Windows SmartScreen may show **Windows protected your PC**. Select **More info** > **Run anyway**, check the SHA-256 checksums on the release page, or [build SnapKit from source](docs/how-to/build-from-source.md).
+> The installer isn't code-signed yet, so Windows SmartScreen may show **Windows protected your PC**. Select **More info** > **Run anyway**, verify the `SHA256SUMS.txt` checksums on the release page, or [build SnapKit from source](docs/how-to/build-from-source.md).
 
-**Requirements:** Windows 10 version 2004 or later, or Windows 11, 64-bit. See [System requirements and limits](docs/reference/requirements-and-limits.md).
+### macOS (Universal: Apple Silicon & Intel)
+
+1. **Download** `SnapKit-<version>-macos.dmg` (or `SnapKit-<version>-macos.zip`), which includes both `arm64` and `x86_64` binaries plus universal FFmpeg and uses macOS's built-in Vision OCR.
+2. **Drag `SnapKit.app`** into **Applications**.
+3. **First launch:** because the app is signed ad-hoc (not Apple-notarized yet), right-click `SnapKit.app` > **Open** (or allow it in **System Settings > Privacy & Security > Open Anyway**).
+
+| Permission | Needed for |
+|---|---|
+| **Screen Recording** | Capturing screens, scrolling, steps, and video |
+| **Accessibility** | Global shortcuts, scrolling capture, and step-by-step clicks |
+
+### Linux (x86_64 — X11 & Wayland)
+
+- **Debian / Ubuntu (`.deb`):**
+  ```bash
+  sudo apt install ./SnapKit-<version>-linux-amd64.deb
+  ```
+- **Portable archive (`.tar.gz`):** extract `SnapKit-<version>-linux-x86_64.tar.gz` and run `./snapkit` (or `./install-desktop.sh` to add a launcher entry).
+
+For video recording and OCR on Linux, make sure `ffmpeg` and `tesseract-ocr` (`tesseract-ocr-eng`, `tesseract-ocr-por`) are installed on your system.
+
+See [System requirements and limits](docs/reference/requirements-and-limits.md) for details on all platforms.
 
 ### Shortcuts to remember
 
@@ -218,7 +245,7 @@ The only connection SnapKit can make is the update check: it asks GitHub for the
 <details>
 <summary><b>Where are my screenshots saved?</b></summary>
 <br>
-Every capture is saved as a PNG in <code>Pictures\SnapKit</code>, and recordings go to <code>Videos\SnapKit</code>. Preferences live in <code>%APPDATA%\SnapKit</code>. See <a href="docs/reference/files-and-folders.md">Files and folders</a>.
+Every capture is saved as a PNG in <code>Pictures/SnapKit</code>, and recordings go to <code>Videos/SnapKit</code> (<code>Movies/SnapKit</code> on macOS). Preferences live in <code>%APPDATA%\SnapKit</code> on Windows, <code>~/Library/Application Support/SnapKit</code> on macOS, and <code>~/.config/SnapKit</code> on Linux. See <a href="docs/reference/files-and-folders.md">Files and folders</a>.
 </details>
 
 <details>
@@ -236,24 +263,24 @@ Yes. In <b>Preferences</b>, set the global shortcut to <b>PrintScreen</b> with n
 <details>
 <summary><b>Does it work on macOS or Linux?</b></summary>
 <br>
-Not yet. SnapKit is released for Windows only. Versions for macOS and Linux are in development: the code already builds and is tested on both macOS and Linux, but neither is released yet. Contributions toward other platforms are welcome.
+Yes! SnapKit ships native packages for <b>Windows</b> (10/11 x64), <b>macOS</b> (12+ Universal Apple Silicon &amp; Intel <code>.dmg</code> / <code>.zip</code>), and <b>Linux</b> (x86_64 <code>.deb</code> / <code>.tar.gz</code>, X11 and Wayland).
 </details>
 
 <details>
 <summary><b>Which languages does the interface support?</b></summary>
 <br>
-English and Portuguese. SnapKit follows your Windows language the first time and you can switch it anytime in <b>Preferences</b>.
+English and Portuguese. SnapKit follows your system language the first time and you can switch it anytime in <b>Preferences</b>.
 </details>
 
 ## 🧑‍💻 Build from source
 
-```powershell
+```bash
 git clone https://github.com/MichelGSS/snapkit.git
 cd snapkit
 cargo run
 ```
 
-You need [Rust](https://rustup.rs) (stable) and the Visual Studio Build Tools with the C++ workload. OCR and video use third-party binaries that the scripts in `scripts\` download. See [Build SnapKit from source](docs/how-to/build-from-source.md).
+You need [Rust](https://rustup.rs) (stable) plus the C++ build tools / platform libraries for your OS. See [Build SnapKit from source](docs/how-to/build-from-source.md).
 
 <details>
 <summary><b>Code map</b></summary>
@@ -263,18 +290,18 @@ You need [Rust](https://rustup.rs) (stable) and the Visual Studio Build Tools wi
 |---|---|
 | `src/main.rs` | Main window, selection overlay, floating panels, preferences |
 | `src/capture.rs` | Monitor capture and window list |
-| `src/pin.rs` | Pin to screen: floating always-on-top reference windows |
+| `src/pin.rs`, `src/pin_macos.rs`, `src/pin_linux.rs` | Pin to screen: floating always-on-top reference windows (Win32, AppKit, GTK3) |
 | `src/editor.rs`, `src/render.rs` | Annotation editor, multi-selection, alignment and image rendering |
 | `src/export.rs` | PNG, JPEG, WebP, BMP and multi-page PDF export |
 | `src/scroll.rs` | Scrolling and panoramic capture: motion detection and stitching |
 | `src/steps.rs` | Step-by-step capture |
-| `src/ocr.rs`, `src/neural.rs` | Text recognition: Tesseract, neural engine, layout and auto-redaction |
+| `src/ocr.rs`, `src/neural.rs`, `src/ocr_vision.rs` | Text recognition: Tesseract, neural engine, Apple Vision (macOS), layout and auto-redaction |
 | `src/record.rs`, `src/video_editor.rs`, `src/audio.rs` | Video recording (FFmpeg), integrated filmstrip editor and audio |
 | `src/library.rs` | Capture library, persistent annotation layers, favorites and tags |
 | `src/i18n.rs` | English and Portuguese interface texts |
-| `src/platform/` | Operating system layer: Windows API calls and Per-Monitor V2 DPI handling (`windows.rs`), plus the macOS (`macos.rs`) and Linux (`linux.rs`) versions in development |
+| `src/platform/` | Operating system layer: `windows.rs` (Win32/Per-Monitor V2 DPI), `macos.rs` (AppKit/CoreGraphics), and `linux.rs` (X11/Wayland/GTK3) |
 | `src/icons.rs`, `src/ui.rs`, `src/theme.rs` | Rasterized vector icon set, reusable UI components and 9 color themes |
-| `src/tray.rs`, `src/config.rs`, `src/autostart.rs`, `src/update.rs` | App icon & tray, preferences, start with Windows and updates |
+| `src/tray.rs`, `src/config.rs`, `src/autostart.rs`, `src/update.rs` | App icon & tray, preferences, autostart and updates |
 
 </details>
 
@@ -290,7 +317,7 @@ If SnapKit saves you time, a ⭐ on GitHub helps other people find it.
 
 ## 🙏 Built with
 
-SnapKit stands on the shoulders of great open-source projects: [egui](https://github.com/emilk/egui), [Tesseract](https://github.com/tesseract-ocr/tesseract), [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) models on [ONNX Runtime](https://github.com/microsoft/onnxruntime), [FFmpeg](https://ffmpeg.org), [tiny-skia](https://github.com/RazrFalcon/tiny-skia) and [xcap](https://github.com/nashaofu/xcap). The full list is in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+SnapKit stands on the shoulders of great open-source projects: [egui](https://github.com/emilk/egui), [Tesseract](https://github.com/tesseract-ocr/tesseract), [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) models on [ONNX Runtime](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime), [FFmpeg](https://ffmpeg.org), [tiny-skia](https://github.com/RazrFalcon/tiny-skia), [xcap](https://github.com/nashaofu/xcap), plus native Apple Vision on macOS and GTK3 / x11rb on Linux. The full list is in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## 📄 License
 

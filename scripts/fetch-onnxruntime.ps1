@@ -10,9 +10,9 @@
 
 $ErrorActionPreference = 'Stop'
 $version = '1.31.1'
-$sha256 = '5869e26bb25314375f2d5ef1877e3ea06b1543d6c710e6e4a1ec2f7177ab4b2c'
-$name = "onnxruntime-win-x64-$version"
-$url = "https://github.com/microsoft/onnxruntime/releases/download/v$version/$name.zip"
+$sha256 = '6871ccbc97f3d5bdb4095a1dcec33aa78d56f6ed8de5980ef5fa1d9f2e7c679a'
+$name = "microsoft.ml.onnxruntime.$version"
+$url = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$version/$name.nupkg"
 
 $root = Split-Path -Parent $PSScriptRoot
 $dest = Join-Path $root 'vendor\onnxruntime'
@@ -24,14 +24,14 @@ try {
     $ProgressPreference = 'SilentlyContinue'
     Invoke-WebRequest $url -OutFile $zip -UseBasicParsing
     $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-    if ($hash -ne $sha256) { throw "unexpected SHA-256 for $name.zip: $hash" }
+    if ($hash -ne $sha256) { throw "unexpected SHA-256 for $name.nupkg: $hash" }
     Expand-Archive $zip "$work\x" -Force
 
     if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
     New-Item -ItemType Directory -Force $dest | Out-Null
-    Copy-Item "$work\x\$name\lib\onnxruntime.dll" $dest
-    Copy-Item "$work\x\$name\LICENSE" "$dest\LICENSE.txt"
-    Copy-Item "$work\x\$name\ThirdPartyNotices.txt" $dest
+    Copy-Item "$work\x\runtimes\win-x64\native\onnxruntime.dll" $dest
+    Copy-Item "$work\x\LICENSE" "$dest\LICENSE.txt"
+    Copy-Item "$work\x\ThirdPartyNotices.txt" $dest
     Get-ChildItem $dest | ForEach-Object { '{0}  {1:N1} MB' -f $_.Name, ($_.Length / 1MB) }
 }
 finally {

@@ -22,30 +22,34 @@ body:
     id: version
     attributes:
       label: SnapKit version
-      description: Shown in the installer file name, or in Settings > Apps > Installed apps.
-      placeholder: 0.7.0
+      description: Shown in the installer file name, Preferences, or package metadata.
+      placeholder: 0.8.0
     validations:
       required: true
   - type: input
-    id: windows
+    id: os
     attributes:
-      label: Windows version
-      placeholder: Windows 11 24H2
+      label: Operating system
+      placeholder: Windows 11 24H2 / macOS 15.2 (Apple Silicon) / Ubuntu 24.04 (X11 or Wayland)
     validations:
       required: true
   - type: input
     id: monitors
     attributes:
       label: Monitors and scaling
-      description: How many monitors, and the scaling of each one (Settings > System > Display).
+      description: How many monitors, and the resolution and scaling for each monitor.
       placeholder: "2 monitors: 2560×1440 at 125%, 1920×1080 at 100%"
   - type: dropdown
     id: package
     attributes:
       label: Package
       options:
-        - Installer
-        - Portable zip
+        - Windows installer (.exe)
+        - Windows portable zip
+        - macOS disk image (.dmg)
+        - macOS portable zip
+        - Linux Debian/Ubuntu package (.deb)
+        - Linux portable archive (.tar.gz)
         - Built from source
   - type: textarea
     id: screenshots

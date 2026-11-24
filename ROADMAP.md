@@ -1,13 +1,13 @@
 # SnapKit roadmap
 
-SnapKit is a screen capture and annotation tool for Windows, written in Rust with egui.
+SnapKit is a screen capture and annotation tool for Windows, macOS, and Linux, written in Rust with egui.
 
 ## Project principles
 
 - **Local by default.** No accounts, servers or telemetry; the internet is used only when the user checks for updates.
 - **Original work.** No code, icons, texts or layouts copied from other products.
 - **Lightweight.** One native process, no background services.
-- **Windows first.** Other platforms may come later.
+- **Cross-platform native.** Native system APIs on Windows (Win32), macOS (AppKit/Vision), and Linux (X11/Wayland/GTK3).
 
 ## Done
 
@@ -23,13 +23,13 @@ SnapKit is a screen capture and annotation tool for Windows, written in Rust wit
 | Export | PNG, JPEG, WebP, BMP, single- and multi-page PDF 1.4, and vertical/horizontal image stitching |
 | Video | MP4 with system sound and microphone, configurable FPS (15–60), quality presets, cursor toggle, animated click highlights, countdown, pause, integrated visual filmstrip editor (60 FPS live preview with synchronized audio & waveform overlay, trim, area crop, speed `0.5×–2×`, mute, resolution scaling, frame-to-editor capture), GIF export |
 | Library | Unified image, video (MP4) and GIF library with persistent editable annotation layers, favorites (`★`), custom titles and searchable tags, thumbnails, media filters, duration badges, multi-selection (`Ctrl+Click`/`Shift+Click`), batch PDF/export/delete/copy, native drag-and-drop (`CF_HDROP`), Recycle Bin |
-| Interface | English and Portuguese, nine themes, quick-start workspace cards, tray, start with Windows |
-| Distribution | Installer, portable zip, opt-in SHA-256 verified updates, automated CI & tagged release builds (`SHA256SUMS.txt`), MIT license, third-party notices |
+| Interface | English and Portuguese, nine themes, quick-start workspace cards, tray, autostart |
+| Cross-platform | Windows (10/11 x64), macOS (12+ Universal Apple Silicon & Intel `.dmg`/`.zip` with Apple Vision OCR & universal FFmpeg), and Linux (x86_64 `.deb`/`.tar.gz` for X11 & Wayland) |
+| Distribution | Installers and portable packages, opt-in SHA-256 verified updates, automated CI & tagged release builds (`SHA256SUMS.txt`), MIT license, third-party notices |
 
 ## Next
 
-- Complete and package the macOS and Linux versions (currently in development, not yet released).
-- Code-signed installer (Authenticode certificate) to avoid SmartScreen prompts.
+- Code-signed packages: Authenticode certificate (Windows) and Apple Developer ID notarization (macOS) to eliminate OS security prompts.
 - Optional webcam picture-in-picture overlay during screen recordings.
 
 ## Known limitations

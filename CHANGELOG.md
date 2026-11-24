@@ -4,9 +4,18 @@ All notable changes to SnapKit are listed here. The project follows [Semantic Ve
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-23
+
+### Added
+
+- **macOS Universal release (`SnapKit-0.8.0-macos.dmg` and `.zip`)**: native Apple Silicon (`arm64`) and Intel (`x86_64`) app bundle with bundled universal FFmpeg, Apple Vision built-in OCR (printed text, handwriting, and Auto-redact), AppKit floating pins (`Cmd+C`, Retina scaling, natural scrolling), menu bar tray, and automated bundle verification (`scripts/verify-macos-package.sh`).
+- **Linux x86_64 release (`SnapKit-0.8.0-linux-amd64.deb` and `.tar.gz`)**: X11 and Wayland desktop integration (`xcap`, `x11rb` + XFixes cursor, GTK3 floating pins and recording frame, AppIndicator tray, `.desktop` entry and hicolor icons, `flock` single-instance lock, clipboard persistence, and `--self-check`).
+- **Multi-platform CI and release pipeline**: automated builds, tests, and packaging for Windows, macOS, and Linux publishing a unified `SHA256SUMS.txt`.
+
 ### Changed
 
-- **Groundwork for macOS and Linux versions**: the code that talks to the operating system now lives in one platform layer (`src/platform/`). Windows behavior is unchanged. Both macOS and Linux versions are in development and CI builds and tests them, but neither is released yet.
+- Unified OS-specific code under `src/platform/` (`windows.rs`, `macos.rs`, `linux.rs`).
+- Switched Windows ONNX Runtime fetcher (`scripts/fetch-onnxruntime.ps1`) to Microsoft's official NuGet package (`Microsoft.ML.OnnxRuntime` 1.31.1) and added retries to `scripts/fetch-ffmpeg.ps1`.
 
 ## [0.7.0] - 2026-11-19
 
@@ -92,7 +101,8 @@ First public release.
 - Nine color themes, a configurable global shortcut, tray icon and start with Windows.
 - Windows no longer flash on the screen when a capture starts or ends.
 
-[Unreleased]: https://github.com/MichelGSS/snapkit/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/MichelGSS/snapkit/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/MichelGSS/snapkit/releases/tag/v0.8.0
 [0.7.0]: https://github.com/MichelGSS/snapkit/releases/tag/v0.7.0
 [0.6.0]: https://github.com/MichelGSS/snapkit/releases/tag/v0.6.0
 [0.5.3]: https://github.com/MichelGSS/snapkit/releases/tag/v0.5.3

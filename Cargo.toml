@@ -1,8 +1,8 @@
 [package]
 name = "snapkit"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
-description = "Free, local and lightweight screen capture for Windows: annotations, scrolling capture, OCR and video"
+description = "Free, local and lightweight screen capture for Windows, macOS and Linux: annotations, scrolling capture, OCR and video"
 repository = "https://github.com/MichelGSS/snapkit"
 readme = "README.md"
 license = "MIT"

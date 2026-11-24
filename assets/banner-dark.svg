@@ -82,13 +82,11 @@
   <text x="294" y="214" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="27" fill="#a9afbc">Capture, annotate and document your screen.</text>
 
   <g font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="19" font-weight="600" fill="#d7dbe3">
-    <rect x="294" y="244" width="132" height="40" rx="20" fill="#262a33" stroke="#FF8A4C" stroke-opacity="0.55"/>
-    <text x="360" y="270" text-anchor="middle">100% local</text>
-    <rect x="438" y="244" width="152" height="40" rx="20" fill="#262a33" stroke="#FF8A4C" stroke-opacity="0.55"/>
-    <text x="514" y="270" text-anchor="middle">Free &amp; MIT</text>
-    <rect x="602" y="244" width="154" height="40" rx="20" fill="#262a33" stroke="#FF8A4C" stroke-opacity="0.55"/>
-    <text x="679" y="270" text-anchor="middle">Lightweight</text>
-    <rect x="768" y="244" width="110" height="40" rx="20" fill="#262a33" stroke="#FF8A4C" stroke-opacity="0.55"/>
-    <text x="823" y="270" text-anchor="middle">Windows</text>
+    <rect x="294" y="244" width="128" height="40" rx="20" fill="#262a33" stroke="#FF8A4C" stroke-opacity="0.55"/>
+    <text x="358" y="270" text-anchor="middle">100% local</text>
+    <rect x="434" y="244" width="138" height="40" rx="20" fill="#262a33" stroke="#FF8A4C" stroke-opacity="0.55"/>
+    <text x="503" y="270" text-anchor="middle">Free &amp; MIT</text>
+    <rect x="584" y="244" width="258" height="40" rx="20" fill="#262a33" stroke="#FF8A4C" stroke-opacity="0.55"/>
+    <text x="713" y="270" text-anchor="middle">Windows · macOS · Linux</text>
   </g>
 </svg>

@@ -4,12 +4,12 @@
 
 | Item | Requirement |
 |---|---|
-| Operating system | Windows 10 version 2004 (build 19041) or later, or Windows 11 |
-| Architecture | 64-bit (x64) |
+| Operating system | **Windows** 10 version 2004 (build 19041) or later, or Windows 11 · **macOS** 12 Monterey or later · **Linux** x86_64 (X11 or Wayland desktop with GTK 3 & AppIndicator) |
+| Architecture | **Windows & Linux:** 64-bit (`x86_64`) · **macOS:** Universal (`arm64` Apple Silicon & `x86_64` Intel) |
 | Processor | Any 64-bit processor. No AVX2 needed. |
-| Graphics | OpenGL support (any current graphics driver). Needed for the transparent capture overlay. |
-| Disk space | About 200 MB for the program, plus your captures and recordings |
-| Permissions | A standard user account. No administrator rights needed. |
+| Graphics | OpenGL support (Metal/OpenGL on macOS). Needed for the transparent capture overlay. |
+| Disk space | About 120–200 MB depending on platform, plus your captures and recordings |
+| Permissions | Standard user account (macOS requires **Screen Recording** and **Accessibility** permissions) |
 | Network | None. SnapKit works fully offline. It connects to GitHub only to check for updates, when you ask it to. |
 
 ## Size and resource use

@@ -1,12 +1,13 @@
 # Build SnapKit from source
 
-SnapKit is written in Rust. You can build it with a few commands on any Windows 10 or 11 computer.
+SnapKit is written in Rust and builds natively on **Windows**, **macOS**, and **Linux**.
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs), stable toolchain.
-- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload.
-- [Git](https://git-scm.com).
+- [Rust](https://rustup.rs) (stable toolchain) and [Git](https://git-scm.com).
+- **Windows:** [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **Desktop development with C++**.
+- **macOS:** Xcode Command Line Tools (`xcode-select --install`).
+- **Linux (Debian/Ubuntu):** GTK 3, AppIndicator, ALSA, PipeWire, Fontconfig, X11/XFixes/Xrandr, and OpenSSL dev packages (`libgtk-3-dev libayatana-appindicator3-dev libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libfontconfig1-dev libssl-dev libxcb-xfixes0-dev libxrandr-dev pkg-config libclang-dev`).
 
 ## Build and run
 
