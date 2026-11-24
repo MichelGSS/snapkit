@@ -142,9 +142,8 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
 
-  # Universal macOS app (Apple silicon and Intel) built by scripts/package-macos.sh. No vendor
-  # folders are fetched for macOS yet, so the app ships without FFmpeg, Tesseract and the neural
-  # OCR engine; the script includes them when vendor/ has macOS builds.
+  # Universal macOS app (Apple silicon and Intel) built by scripts/package-macos.sh with a
+  # universal FFmpeg binary fetched by scripts/fetch-ffmpeg-macos.sh.
   macos:
     if: github.event_name == 'workflow_dispatch' || vars.RELEASE_MACOS == 'true'
     runs-on: macos-latest
@@ -172,12 +171,20 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
+      - name: Fetch universal FFmpeg
+        shell: bash
+        run: FFMPEG_ARCH=universal sh scripts/fetch-ffmpeg-macos.sh
+
       - name: Run test suite
         run: cargo test --locked
 
       - name: Build release packages
         shell: bash
-        run: bash scripts/package-macos.sh
+        run: REQUIRE_UNIVERSAL_HELPERS=1 bash scripts/package-macos.sh
+
+      - name: Verify macOS package
+        shell: bash
+        run: bash scripts/verify-macos-package.sh
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -189,11 +196,92 @@ jobs:
             dist/SHA256SUMS-macos.txt
           if-no-files-found: error
 
-  # Adds the macOS files to the release the Windows job published, and replaces SHA256SUMS.txt
-  # with one that lists every file. Waiting for both jobs keeps them from racing to create it.
-  publish-macos:
-    if: startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_MACOS == 'true'
-    needs: [release, macos]
+  # Linux portable archive (.tar.gz) and Debian/Ubuntu package (.deb) built by
+  # scripts/package-linux.sh. Runs on manual dispatch (artifacts only) and joins tagged
+  # releases only when the repository variable RELEASE_LINUX is "true".
+  linux:
+    if: github.event_name == 'workflow_dispatch' || vars.RELEASE_LINUX == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          cargo_ver="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          tag_ver="${GITHUB_REF_NAME#v}"
+          if [ "$cargo_ver" != "$tag_ver" ]; then
+            echo "Tag version ($tag_ver) does not match Cargo.toml version ($cargo_ver)" >&2
+            exit 1
+          fi
+          echo "Verified SnapKit version $cargo_ver"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libclang-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libasound2-dev \
+            libssl-dev \
+            libfontconfig1-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxrandr-dev \
+            libxkbcommon-dev \
+            libdbus-1-dev \
+            xvfb \
+            dbus-x11 \
+            xclip \
+            desktop-file-utils \
+            python3
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run test suite
+        run: xvfb-run -a -s "-screen 0 1280x720x24" dbus-run-session -- cargo test --locked
+
+      - name: Build release packages
+        shell: bash
+        run: bash scripts/package-linux.sh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SnapKit-linux
+          path: |
+            dist/SnapKit-*-linux-*.tar.gz
+            dist/SnapKit-*-linux-*.deb
+            dist/SHA256SUMS-linux.txt
+          if-no-files-found: error
+
+  # Adds any enabled macOS and Linux packages to the release the Windows job published, and
+  # replaces SHA256SUMS.txt with one that lists every file. Waiting for all builds keeps them
+  # from racing to upload SHA256SUMS.txt.
+  publish-extra:
+    if: >-
+      always() &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      (vars.RELEASE_MACOS == 'true' || vars.RELEASE_LINUX == 'true') &&
+      needs.release.result == 'success' &&
+      (needs.macos.result == 'success' || needs.macos.result == 'skipped') &&
+      (needs.linux.result == 'success' || needs.linux.result == 'skipped')
+    needs: [release, macos, linux]
     runs-on: ubuntu-latest
     steps:
       - name: Download build artifacts
@@ -201,22 +289,22 @@ jobs:
         with:
           path: artifacts
 
-      - name: Combine SHA256SUMS.txt
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat artifacts/SnapKit-windows-x64/SHA256SUMS.txt artifacts/SnapKit-macos/SHA256SUMS-macos.txt |
-            sort -k 2 >SHA256SUMS.txt
-          cat SHA256SUMS.txt
-          [ "$(wc -l <SHA256SUMS.txt)" -ge 4 ] || { echo "Expected four packages in SHA256SUMS.txt" >&2; exit 1; }
-
-      - name: Add the macOS files to the GitHub Release
+      - name: Combine SHA256SUMS.txt and upload release assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" \
-            artifacts/SnapKit-macos/SnapKit-*-macos.dmg \
-            artifacts/SnapKit-macos/SnapKit-*-macos.zip \
-            SHA256SUMS.txt \
-            --clobber --repo "$GITHUB_REPOSITORY"
+          set -euo pipefail
+          shopt -s nullglob
+          sums=(artifacts/*/SHA256SUMS*.txt)
+          [ "${#sums[@]}" -ge 2 ] || { echo "Expected Windows and extra checksums" >&2; exit 1; }
+          cat "${sums[@]}" | sort -k 2 >SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          files=(
+            artifacts/SnapKit-macos/SnapKit-*-macos.dmg
+            artifacts/SnapKit-macos/SnapKit-*-macos.zip
+            artifacts/SnapKit-linux/SnapKit-*-linux-*.tar.gz
+            artifacts/SnapKit-linux/SnapKit-*-linux-*.deb
+            SHA256SUMS.txt
+          )
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"

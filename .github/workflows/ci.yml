@@ -38,13 +38,19 @@ jobs:
         run: cargo build --locked
       - name: Test
         run: cargo test --locked
+      - name: Self-check
+        run: ./target/debug/snapkit --self-check
       # The released app is universal: the Intel half has to compile too.
       - name: Check the Intel build
         run: cargo check --locked --target x86_64-apple-darwin --all-targets
-      - name: Check the packaging script
+      - name: Check the packaging scripts
         run: |
+          sh -n scripts/fetch-ffmpeg-macos.sh
           bash -n scripts/package-macos.sh
-          if command -v shellcheck >/dev/null 2>&1; then shellcheck scripts/package-macos.sh; fi
+          bash -n scripts/verify-macos-package.sh
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck scripts/fetch-ffmpeg-macos.sh scripts/package-macos.sh scripts/verify-macos-package.sh
+          fi
 
   # The Linux version isn't released yet; building and testing it on every push keeps Windows
   # and macOS changes from breaking it.
@@ -74,10 +80,27 @@ jobs:
             libxcb-xfixes0-dev \
             libxrandr-dev \
             libxkbcommon-dev \
-            libdbus-1-dev
+            libdbus-1-dev \
+            xvfb \
+            dbus-x11 \
+            xclip \
+            desktop-file-utils \
+            shellcheck \
+            ffmpeg \
+            tesseract-ocr \
+            tesseract-ocr-eng
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --locked
-      - name: Test
-        run: cargo test --locked
+      - name: Test under Xvfb
+        run: xvfb-run -a -s "-screen 0 1280x720x24" dbus-run-session -- cargo test --locked
+      - name: Smoke test self-check and screen capture
+        run: |
+          ./target/debug/snapkit --self-check
+          xvfb-run -a -s "-screen 0 1280x720x24" ./target/debug/snapkit --test-capture /tmp/snapkit-ci-cap.png
+          test -s /tmp/snapkit-ci-cap.png
+      - name: Check the packaging script
+        run: |
+          bash -n scripts/package-linux.sh
+          shellcheck scripts/package-linux.sh

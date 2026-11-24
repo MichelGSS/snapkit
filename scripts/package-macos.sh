@@ -65,13 +65,13 @@ if command -v rustup >/dev/null 2>&1; then
     rustup target add $targets
 fi
 
-binaries=""
+binaries=()
 for target in $targets; do
     echo "Building for $target"
     cargo build --release --locked --target "$target"
     bin="$root/target/$target/release/snapkit"
     [ -f "$bin" ] || die "the build for $target didn't produce $bin"
-    binaries="$binaries $bin"
+    binaries+=("$bin")
 done
 
 # --- App bundle -----------------------------------------------------------------------------
@@ -79,8 +79,7 @@ done
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
-# shellcheck disable=SC2086 # the list of binaries is split on purpose (paths have no spaces)
-lipo -create -output "$app/Contents/MacOS/snapkit" $binaries
+lipo -create -output "$app/Contents/MacOS/snapkit" "${binaries[@]}"
 for arch in arm64 x86_64; do
     lipo "$app/Contents/MacOS/snapkit" -verify_arch "$arch" || die "the universal binary has no $arch slice"
 done
@@ -112,15 +111,19 @@ if [ ! -f "$frames/256.png" ]; then
     sips -z 256 256 "$frames/source.png" --out "$frames/256.png" >/dev/null
 fi
 # Each iconset entry comes from the image of the same size when the .ico has it, otherwise from
-# the largest one (256 px) resized.
+# the largest available one (512 px or 256 px) resized.
 for entry in 16:icon_16x16 32:icon_16x16@2x 32:icon_32x32 64:icon_32x32@2x 128:icon_128x128 \
-    256:icon_128x128@2x 256:icon_256x256 512:icon_256x256@2x 512:icon_512x512; do
+    256:icon_128x128@2x 256:icon_256x256 512:icon_256x256@2x 512:icon_512x512 1024:icon_512x512@2x; do
     size="${entry%%:*}"
     name="${entry#*:}"
     if [ -f "$frames/$size.png" ]; then
         cp "$frames/$size.png" "$iconset/$name.png"
     else
-        sips -z "$size" "$size" "$frames/256.png" --out "$iconset/$name.png" >/dev/null
+        src_frame="$frames/256.png"
+        if [ "$size" -ge 512 ] && [ -f "$frames/512.png" ]; then
+            src_frame="$frames/512.png"
+        fi
+        sips -z "$size" "$size" "$src_frame" --out "$iconset/$name.png" >/dev/null
     fi
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/SnapKit.icns"
@@ -142,6 +145,11 @@ cat >"$app/Contents/Info.plist" <<PLIST
     <string>$bundle_id</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>en</string>
+        <string>pt</string>
+    </array>
     <key>CFBundleName</key>
     <string>SnapKit</string>
     <key>CFBundlePackageType</key>
@@ -185,23 +193,27 @@ is_macho() {
     esac
 }
 
-# Warns when a helper binary lacks a slice: the app would lose that feature on that kind of Mac.
+# Warns (or fails when REQUIRE_UNIVERSAL_HELPERS=1) when a helper binary lacks a slice.
 check_archs() {
-    local archs
+    local archs missing=""
     archs="$(lipo -archs "$1" 2>/dev/null || true)"
-    case " $archs " in
-        *" arm64 "*) ;;
-        *) echo "warning: $1 has no arm64 slice ($archs)" >&2 ;;
-    esac
-    case " $archs " in
-        *" x86_64 "*) ;;
-        *) echo "warning: $1 has no x86_64 slice ($archs)" >&2 ;;
-    esac
+    for req in arm64 x86_64; do
+        case " $archs " in
+            *" $req "*) ;;
+            *) missing="$missing $req" ;;
+        esac
+    done
+    if [ -n "$missing" ]; then
+        if [ "${REQUIRE_UNIVERSAL_HELPERS:-0}" = "1" ]; then
+            die "$1 is missing required slice(s):$missing (has: $archs)"
+        else
+            echo "warning: $1 is missing slice(s):$missing (has: $archs)" >&2
+        fi
+    fi
 }
 
-# SnapKit looks for its helpers next to the executable (Contents/MacOS/<name>). The folders
-# themselves go in Contents/Resources, with a link in Contents/MacOS: data files (models,
-# tessdata) inside Contents/MacOS would be treated as code and break the signature.
+# Helpers live in Contents/Resources/<name> (with no symlinks in Contents/MacOS, which codesign
+# rejects for nested data/resources).
 add_helper() {
     local name="$1" check="$2"
     local src="$vendor/$name"
@@ -215,7 +227,6 @@ add_helper() {
     fi
     echo "Adding $name"
     ditto "$src" "$app/Contents/Resources/$name"
-    ln -s "../Resources/$name" "$app/Contents/MacOS/$name"
     if [ -n "$check" ]; then
         check_archs "$app/Contents/Resources/$name/$check"
     fi
@@ -235,14 +246,19 @@ fi
 # Extended attributes (quarantine, Finder info) make codesign refuse the bundle.
 xattr -cr "$app"
 
-# Every helper binary and library needs its own signature: Apple silicon refuses to run
-# unsigned code, and codesign --deep doesn't look inside Contents/Resources.
-find "$app/Contents/Resources" -type f -print0 | while IFS= read -r -d '' f; do
+codesign_identity="${SNAPKIT_CODESIGN_IDENTITY:--}"
+codesign_opts=(--force --sign "$codesign_identity")
+if [ "$codesign_identity" != "-" ]; then
+    codesign_opts+=(--options runtime)
+fi
+
+# Sign inside-out: every helper binary and library in Contents/Resources first, then the bundle.
+while IFS= read -r -d '' f; do
     if is_macho "$f"; then
-        codesign --force --sign - "$f"
+        codesign "${codesign_opts[@]}" "$f"
     fi
-done
-codesign --force --deep --sign - "$app"
+done < <(find "$app/Contents/Resources" -type f -print0)
+codesign "${codesign_opts[@]}" "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 
 # --- Disk image, zip and checksums ----------------------------------------------------------
