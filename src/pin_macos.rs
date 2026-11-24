@@ -39,6 +39,7 @@ use objc2_foundation::NSString;
 
 use crate::platform::{self, PxRect};
 
+/// Border width in logical points (1x pixels); scaled by `platform::scale()` for Retina crispness.
 const BORDER_PX: i32 = 2;
 const MIN_PIN_SIDE: i32 = 48;
 const ZOOM_MIN: f32 = 0.25;
@@ -71,27 +72,42 @@ fn active_list() -> std::sync::MutexGuard<'static, Vec<usize>> {
 // ---------------------------------------------------------------------------------------------
 // Pure geometry (screen pixels)
 
+fn border_px_for(scale: f64) -> i32 {
+    (BORDER_PX as f64 * scale).round() as i32
+}
+
+fn border_px() -> i32 {
+    border_px_for(platform::scale())
+}
+
 /// Window size, border included, for an image of `img_w`×`img_h` pixels at `zoom`.
-fn window_size(img_w: u32, img_h: u32, zoom: f32) -> (i32, i32) {
+fn window_size(img_w: u32, img_h: u32, zoom: f32, border: i32) -> (i32, i32) {
     let iw = ((img_w as f32 * zoom).round() as i32).max(MIN_PIN_SIDE);
     let ih = ((img_h as f32 * zoom).round() as i32).max(MIN_PIN_SIDE);
-    (iw + BORDER_PX * 2, ih + BORDER_PX * 2)
+    (iw + border * 2, ih + border * 2)
 }
 
 /// Initial zoom and window rectangle. Over `at_rect` (the captured region) the image sits exactly
 /// where it was taken; otherwise the window is centered on the cursor inside the work area, shrunk
 /// to at most 85% of it.
-fn initial_placement(img_w: u32, img_h: u32, cursor: (i32, i32), work: PxRect, at_rect: Option<PxRect>) -> (f32, PxRect) {
+fn initial_placement(
+    img_w: u32,
+    img_h: u32,
+    cursor: (i32, i32),
+    work: PxRect,
+    at_rect: Option<PxRect>,
+    border: i32,
+) -> (f32, PxRect) {
     let mut zoom = 1.0_f32;
-    let (mut win_w, mut win_h) = window_size(img_w, img_h, zoom);
-    let max_w = ((work.2 - work.0) * 85 / 100).max(MIN_PIN_SIDE + BORDER_PX * 2);
-    let max_h = ((work.3 - work.1) * 85 / 100).max(MIN_PIN_SIDE + BORDER_PX * 2);
+    let (mut win_w, mut win_h) = window_size(img_w, img_h, zoom, border);
+    let max_w = ((work.2 - work.0) * 85 / 100).max(MIN_PIN_SIDE + border * 2);
+    let max_h = ((work.3 - work.1) * 85 / 100).max(MIN_PIN_SIDE + border * 2);
     if at_rect.is_none() && (win_w > max_w || win_h > max_h) {
         zoom = (max_w as f32 / win_w as f32).min(max_h as f32 / win_h as f32).clamp(ZOOM_MIN, 1.0);
-        (win_w, win_h) = window_size(img_w, img_h, zoom);
+        (win_w, win_h) = window_size(img_w, img_h, zoom, border);
     }
     let (x, y) = match at_rect {
-        Some((l, top, _, _)) => (l - BORDER_PX, top - BORDER_PX),
+        Some((l, top, _, _)) => (l - border, top - border),
         None => {
             let cx = (cursor.0 - win_w / 2).clamp(work.0 + 8, (work.2 - win_w - 8).max(work.0 + 8));
             let cy = (cursor.1 - win_h / 2).clamp(work.1 + 8, (work.3 - win_h - 8).max(work.1 + 8));
@@ -311,7 +327,12 @@ define_class!(
             if !event.momentumPhase().is_empty() {
                 return;
             }
-            let notches = wheel_notches(event.scrollingDeltaY(), event.hasPreciseScrollingDeltas());
+            let raw_delta = if event.isDirectionInvertedFromDevice() {
+                -event.scrollingDeltaY()
+            } else {
+                event.scrollingDeltaY()
+            };
+            let notches = wheel_notches(raw_delta, event.hasPreciseScrollingDeltas());
             if notches == 0.0 {
                 return;
             }
@@ -324,17 +345,29 @@ define_class!(
             }
         }
 
+        /// Handle Cmd+C even when running as a menu-bar-only (`Accessory`) app without a main menu.
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> objc2::runtime::Bool {
+            if is_copy_shortcut(event) {
+                copy_pin_image(&self.ivars().image);
+                return objc2::runtime::Bool::YES;
+            }
+            // SAFETY: `NSView` implements `performKeyEquivalent:` taking `&NSEvent` and returning `BOOL`.
+            unsafe { msg_send![super(self), performKeyEquivalent: event] }
+        }
+
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             if event.keyCode() == KEY_ESCAPE {
                 self.request_close();
                 return;
             }
-            let mods = event.modifierFlags();
-            let key = event.charactersIgnoringModifiers().map(|s| s.to_string().to_lowercase()).unwrap_or_default();
-            if (mods.contains(NSEventModifierFlags::Command) || mods.contains(NSEventModifierFlags::Control)) && key == "c" {
+            if is_copy_shortcut(event) {
                 copy_pin_image(&self.ivars().image);
-            } else if key == "0" || key == "1" {
+                return;
+            }
+            let key = event.charactersIgnoringModifiers().map(|s| s.to_string().to_lowercase()).unwrap_or_default();
+            if key == "0" || key == "1" {
                 self.set_zoom(1.0, None);
             }
         }
@@ -364,6 +397,12 @@ define_class!(
     }
 );
 
+fn is_copy_shortcut(event: &NSEvent) -> bool {
+    let mods = event.modifierFlags();
+    let key = event.charactersIgnoringModifiers().map(|s| s.to_string().to_lowercase()).unwrap_or_default();
+    (mods.contains(NSEventModifierFlags::Command) || mods.contains(NSEventModifierFlags::Control)) && key == "c"
+}
+
 impl PinView {
     fn new(mtm: MainThreadMarker, frame: CGRect, ivars: PinIvars) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ivars);
@@ -380,7 +419,7 @@ impl PinView {
         let [r, g, b] = ivars.accent;
         CGContext::set_rgb_fill_color(Some(&cg), r, g, b, 1.0);
         CGContext::fill_rect(Some(&cg), bounds);
-        let border = BORDER_PX as f64 / platform::scale();
+        let border = border_px() as f64 / platform::scale();
         let inner = CGRect::new(
             CGPoint::new(bounds.origin.x + border, bounds.origin.y + border),
             CGSize::new((bounds.size.width - 2.0 * border).max(1.0), (bounds.size.height - 2.0 * border).max(1.0)),
@@ -400,7 +439,7 @@ impl PinView {
         let Some(window) = self.window() else { return };
         ivars.zoom.set(zoom);
         let old = frame_to_px_rect(window.frame());
-        let size = window_size(ivars.image.width(), ivars.image.height(), zoom);
+        let size = window_size(ivars.image.width(), ivars.image.height(), zoom, border_px());
         let (x, y) = resized_origin(old, size, anchor);
         window.setFrame_display(px_rect_to_frame((x, y, x + size.0, y + size.1)), true);
         self.setNeedsDisplay(true);
@@ -541,7 +580,7 @@ pub fn spawn(image: RgbaImage, accent_rgb: [u8; 3], at_rect: Option<PxRect>) -> 
     }
     let cursor = platform::cursor_pos();
     let work = platform::work_area_at(cursor).unwrap_or_else(|| platform::monitor_rect_at(cursor));
-    let (zoom, rect) = initial_placement(image.width(), image.height(), cursor, work, at_rect);
+    let (zoom, rect) = initial_placement(image.width(), image.height(), cursor, work, at_rect, border_px());
     let frame = px_rect_to_frame(rect);
     let accent = accent_rgb.map(|c| c as f64 / 255.0);
     run_on_main(move |mtm| create_pin(mtm, image, accent, zoom, frame))
@@ -572,14 +611,16 @@ mod tests {
 
     #[test]
     fn window_size_adds_the_border_and_a_minimum_side() {
-        assert_eq!(window_size(120, 80, 1.0), (124, 84));
-        assert_eq!(window_size(120, 80, 2.0), (244, 164));
-        assert_eq!(window_size(10, 10, 1.0), (MIN_PIN_SIDE + 4, MIN_PIN_SIDE + 4));
+        assert_eq!(window_size(120, 80, 1.0, BORDER_PX), (124, 84));
+        assert_eq!(window_size(120, 80, 2.0, BORDER_PX), (244, 164));
+        assert_eq!(window_size(10, 10, 1.0, BORDER_PX), (MIN_PIN_SIDE + 4, MIN_PIN_SIDE + 4));
+        assert_eq!(border_px_for(1.0), 2);
+        assert_eq!(border_px_for(2.0), 4);
     }
 
     #[test]
     fn placement_over_the_captured_region_keeps_the_image_in_place() {
-        let (zoom, rect) = initial_placement(120, 80, (0, 0), (0, 0, 1000, 800), Some((40, 40, 160, 120)));
+        let (zoom, rect) = initial_placement(120, 80, (0, 0), (0, 0, 1000, 800), Some((40, 40, 160, 120)), BORDER_PX);
         assert_eq!(zoom, 1.0);
         assert_eq!(rect, (38, 38, 162, 122));
     }
@@ -587,18 +628,18 @@ mod tests {
     #[test]
     fn placement_near_the_cursor_stays_inside_the_work_area() {
         let work = (0, 50, 1000, 800);
-        let (zoom, rect) = initial_placement(200, 100, (500, 400), work, None);
+        let (zoom, rect) = initial_placement(200, 100, (500, 400), work, None, BORDER_PX);
         assert_eq!(zoom, 1.0);
         assert_eq!(rect, (398, 348, 602, 452));
         // Near a corner it's pushed back inside, 8 px from the edges.
-        let (_, rect) = initial_placement(200, 100, (5, 60), work, None);
+        let (_, rect) = initial_placement(200, 100, (5, 60), work, None, BORDER_PX);
         assert_eq!((rect.0, rect.1), (8, 58));
         // Too big for the work area: shrunk to fit 85% of it.
-        let (zoom, rect) = initial_placement(2000, 500, (500, 400), work, None);
+        let (zoom, rect) = initial_placement(2000, 500, (500, 400), work, None, BORDER_PX);
         assert!(zoom < 1.0 && zoom >= ZOOM_MIN);
         assert!(rect.2 - rect.0 <= 850 + BORDER_PX * 2);
         // Never below the minimum zoom, even if it then overflows.
-        let (zoom, _) = initial_placement(8000, 1000, (500, 400), work, None);
+        let (zoom, _) = initial_placement(8000, 1000, (500, 400), work, None, BORDER_PX);
         assert_eq!(zoom, ZOOM_MIN);
     }
 
@@ -623,5 +664,45 @@ mod tests {
         // The cursor at the top-left corner keeps that corner fixed.
         assert_eq!(resized_origin(old, (400, 200), Some((100, 100))), (100, 100));
         assert_eq!(resized_origin(old, (100, 50), None), (150, 125));
+    }
+
+    #[test]
+    fn px_rect_survives_round_trip_through_frame() {
+        let s = platform::scale();
+        let px = |v: f64| (v * s).round() as i32;
+        let r = (px(10.0), px(20.0), px(110.0), px(220.0));
+        assert_eq!(frame_to_px_rect(px_rect_to_frame(r)), r);
+    }
+
+    #[test]
+    fn opaque_cg_image_composites_alpha_and_preserves_dimensions() {
+        let mut img = RgbaImage::new(2, 1);
+        img.put_pixel(0, 0, image::Rgba([0, 0, 0, 0]));
+        img.put_pixel(1, 0, image::Rgba([100, 150, 200, 255]));
+        let cg = opaque_cg_image(&img).expect("opaque cg image");
+        assert_eq!(CGImage::width(Some(&cg)), 2);
+        assert_eq!(CGImage::height(Some(&cg)), 1);
+
+        let space = CGColorSpace::new_device_rgb().expect("device rgb");
+        // SAFETY: null data lets CoreGraphics allocate a 2x1 RGBA buffer owned by `ctx`.
+        let ctx = unsafe {
+            CGBitmapContextCreate(
+                std::ptr::null_mut(),
+                2,
+                1,
+                8,
+                8,
+                Some(&space),
+                CGImageAlphaInfo::PremultipliedLast.0,
+            )
+        }
+        .expect("bitmap context");
+        CGContext::draw_image(Some(&ctx), CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(2.0, 1.0)), Some(&cg));
+        let ptr = CGBitmapContextGetData(Some(&ctx)).cast::<u8>();
+        assert!(!ptr.is_null());
+        // SAFETY: `ctx` is a 2x1 RGBA context (8 bytes), alive for the duration of this slice.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, 8) };
+        assert_eq!(&bytes[0..4], &[34, 30, 30, 255]);
+        assert_eq!(&bytes[4..8], &[100, 150, 200, 255]);
     }
 }

@@ -237,6 +237,17 @@ pub struct Tray {
 pub struct Tray {}
 
 #[cfg(target_os = "linux")]
+impl Drop for Tray {
+    fn drop(&mut self) {
+        let _ = crate::platform::run_on_gtk(|| {
+            GTK_TRAY.with(|cell| {
+                *cell.borrow_mut() = None;
+            });
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct GtkTrayState {
     _icon: TrayIcon,
     region: MenuItem,
@@ -253,9 +264,9 @@ std::thread_local! {
 impl Tray {
     /// Writes the menu items in the current language, with the capture shortcut next to it.
     pub fn relabel(&self, hotkey_label: &str) {
-        // Windows/Linux menus align what follows a tab to the right, like a shortcut. macOS menus
-        // don't, so the shortcut goes in parentheses there.
-        let region_text = if cfg!(target_os = "macos") {
+        // Windows menus align what follows a tab to the right, like a shortcut. macOS and GTK3
+        // menus don't, so the shortcut goes in parentheses there.
+        let region_text = if cfg!(any(target_os = "macos", target_os = "linux")) {
             tf!("Capturar região ({hotkey_label})", "Capture region ({hotkey_label})")
         } else {
             tf!("Capturar região\t{hotkey_label}", "Capture region\t{hotkey_label}")
@@ -313,7 +324,7 @@ pub fn build(
         let icon = Icon::from_rgba(icon_rgba(32), 32, 32).map_err(|e| e.to_string())?;
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_menu_on_left_click(false)
+            .with_menu_on_left_click(cfg!(target_os = "macos"))
             .with_tooltip("SnapKit")
             .with_icon(icon)
             .build()
@@ -361,7 +372,8 @@ pub fn build(
                 }
             }
         })?;
-        rx.recv().map_err(|_| "tray init channel closed".to_owned())??;
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|_| "tray init timed out".to_owned())??;
         Tray {}
     };
 
@@ -373,18 +385,20 @@ pub fn build(
             }
         }
     });
-    std::thread::spawn(move || {
-        while let Ok(event) = TrayIconEvent::receiver().recv() {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                on_action(TrayAction::Open);
+    if !cfg!(target_os = "macos") {
+        std::thread::spawn(move || {
+            while let Ok(event) = TrayIconEvent::receiver().recv() {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    on_action(TrayAction::Open);
+                }
             }
-        }
-    });
+        });
+    }
     tray.relabel(hotkey_label);
     Ok(tray)
 }

@@ -708,8 +708,15 @@ pub fn local_time() -> (u16, u16, u16, u16, u16, u16) {
 
 static CHILDREN: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
+fn prune_children(list: &mut Vec<i32>) {
+    // Forget the ones that have already ended (signal 0 only checks that the process exists).
+    // SAFETY: signal 0 is never delivered.
+    list.retain(|&pid| unsafe { libc::kill(pid, 0) } == 0);
+}
+
 extern "C" fn end_children() {
-    if let Ok(list) = CHILDREN.try_lock() {
+    if let Ok(mut list) = CHILDREN.try_lock() {
+        prune_children(&mut list);
         for &pid in list.iter() {
             // SAFETY: only sends a signal; FFmpeg finishes the file it's writing on SIGTERM.
             unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -727,9 +734,7 @@ pub fn end_with_us(child: &std::process::Child) {
         libc::atexit(end_children);
     });
     let mut list = CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
-    // Forget the ones that have already ended (signal 0 only checks that the process exists).
-    // SAFETY: signal 0 is never delivered.
-    list.retain(|&pid| unsafe { libc::kill(pid, 0) } == 0);
+    prune_children(&mut list);
     list.push(child.id() as i32);
 }
 
@@ -745,9 +750,23 @@ pub struct Instance {
     quit_requested: AtomicBool,
 }
 
+/// macOS limits `sockaddr_un.sun_path` to 104 bytes; fall back to `/tmp` if `temp_dir` is long.
+const MAX_SOCKET_PATH_BYTES: usize = 95;
+
+fn socket_path_for(base: &std::path::Path, key: &str) -> PathBuf {
+    let candidate = base.join(format!("SnapKit-{key}.sock"));
+    if candidate.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+        // SAFETY: getuid() has no preconditions and always succeeds.
+        let uid = unsafe { libc::getuid() };
+        PathBuf::from(format!("/tmp/SnapKit-{uid}-{key}.sock"))
+    } else {
+        candidate
+    }
+}
+
 fn instance_paths(key: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir();
-    (dir.join(format!("SnapKit-{key}.lock")), dir.join(format!("SnapKit-{key}.sock")))
+    (dir.join(format!("SnapKit-{key}.lock")), socket_path_for(&dir, key))
 }
 
 fn try_lock(path: &std::path::Path) -> Option<std::fs::File> {
@@ -969,5 +988,30 @@ mod tests {
         unpremultiply(&mut px);
         assert_eq!(&px[..4], &[128, 0, 0, 128]);
         assert_eq!(&px[4..8], &[10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn socket_path_falls_back_to_tmp_when_too_long() {
+        let short = std::path::Path::new("/tmp");
+        assert_eq!(socket_path_for(short, "abc"), PathBuf::from("/tmp/SnapKit-abc.sock"));
+
+        let long_base = std::path::PathBuf::from(format!("/var/folders/{}", "a".repeat(90)));
+        let fallback = socket_path_for(&long_base, "abc");
+        let fallback_str = fallback.to_string_lossy();
+        assert!(fallback_str.starts_with("/tmp/SnapKit-"), "got {fallback_str}");
+        assert!(fallback_str.ends_with("-abc.sock"), "got {fallback_str}");
+        assert!(fallback.as_os_str().len() <= 104, "too long: {}", fallback.as_os_str().len());
+    }
+
+    #[test]
+    fn end_with_us_prunes_exited_children() {
+        let mut dead = std::process::Command::new("/usr/bin/true").spawn().expect("spawn true");
+        let dead_pid = dead.id() as i32;
+        let _ = dead.wait();
+
+        let mut list = vec![dead_pid, std::process::id() as i32];
+        prune_children(&mut list);
+        assert!(!list.contains(&dead_pid));
+        assert!(list.contains(&(std::process::id() as i32)));
     }
 }

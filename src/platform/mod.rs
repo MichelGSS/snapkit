@@ -108,6 +108,21 @@ pub fn exe_name(base: &str) -> String {
     format!("{base}{}", std::env::consts::EXE_SUFFIX)
 }
 
+/// Candidate folders for a bundled helper (`ffmpeg`, `tesseract`, `onnxruntime`, `ocr-neural`):
+/// next to the executable on all platforms, plus `Contents/Resources/<name>` inside a macOS
+/// `.app` bundle so no symlinks are needed in `Contents/MacOS`.
+pub fn bundled_helper_dirs(name: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) {
+        dirs.push(exe_dir.join(name));
+        #[cfg(target_os = "macos")]
+        if let Some(res) = exe_dir.parent().map(|p| p.join("Resources").join(name)) {
+            dirs.push(res);
+        }
+    }
+    dirs
+}
+
 /// A command for a helper program that runs in the background, without a console window.
 pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]

@@ -146,14 +146,15 @@ fn open_stream(source: Source, ring: Ring) -> Result<cpal::Stream, String> {
                             .unwrap_or(false)
                     })
                 });
-                if let Some(d) = monitor {
-                    let c = d.default_input_config().map_err(|e| e.to_string())?;
-                    (d, c)
-                } else {
-                    let d = host.default_output_device().ok_or(t!("nenhum dispositivo de saída de som", "no sound output device"))?;
-                    let c = d.default_output_config().map_err(|e| e.to_string())?;
-                    (d, c)
-                }
+                let d = monitor.ok_or_else(|| {
+                    t!(
+                        "nenhum dispositivo monitor de áudio encontrado (PulseAudio/PipeWire)",
+                        "no system audio monitor device found (PulseAudio/PipeWire)"
+                    )
+                    .to_owned()
+                })?;
+                let c = d.default_input_config().map_err(|e| e.to_string())?;
+                (d, c)
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -185,6 +186,24 @@ fn open_stream(source: Source, ring: Ring) -> Result<cpal::Stream, String> {
             config.config(),
             move |data: &[i16], _: &_| {
                 let floats: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
+                push(&floats);
+            },
+            on_error,
+            None,
+        ),
+        cpal::SampleFormat::I32 => device.build_input_stream(
+            config.config(),
+            move |data: &[i32], _: &_| {
+                let floats: Vec<f32> = data.iter().map(|&s| (s as f64 / 2_147_483_648.0) as f32).collect();
+                push(&floats);
+            },
+            on_error,
+            None,
+        ),
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            config.config(),
+            move |data: &[u16], _: &_| {
+                let floats: Vec<f32> = data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0).collect();
                 push(&floats);
             },
             on_error,
@@ -314,7 +333,13 @@ impl AudioRecording {
                 }
                 drop(stream);
             });
-            match rx.recv_timeout(Duration::from_secs(5)) {
+            // macOS may display a first-time TCC permission prompt; give the user enough time to allow it.
+            let timeout = if cfg!(target_os = "macos") {
+                Duration::from_secs(20)
+            } else {
+                Duration::from_secs(5)
+            };
+            match rx.recv_timeout(timeout) {
                 Ok(Ok(())) => {
                     rings.push(ring);
                     captures.push(handle);

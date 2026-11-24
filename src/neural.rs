@@ -53,9 +53,7 @@ pub fn find_models() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("SNAPKIT_OCR_NEURAL_DIR") {
         candidates.push(PathBuf::from(dir));
     }
-    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
-        candidates.push(exe_dir.join("ocr-neural"));
-    }
+    candidates.extend(crate::platform::bundled_helper_dirs("ocr-neural"));
     #[cfg(debug_assertions)]
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor").join("ocr-neural"));
     candidates.into_iter().find(|d| d.join("det.onnx").is_file() && d.join("rec.onnx").is_file())
@@ -76,9 +74,7 @@ pub fn find_runtime() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("SNAPKIT_ONNXRUNTIME_DIR") {
         candidates.push(PathBuf::from(dir));
     }
-    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
-        candidates.push(exe_dir.join("onnxruntime"));
-    }
+    candidates.extend(crate::platform::bundled_helper_dirs("onnxruntime"));
     #[cfg(debug_assertions)]
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor").join("onnxruntime"));
     if let Some(found) = candidates.into_iter().map(|d| d.join(ONNXRUNTIME_LIB)).find(|f| f.is_file()) {
@@ -90,6 +86,8 @@ pub fn find_runtime() -> Option<PathBuf> {
             "/usr/lib/libonnxruntime.so",
             "/usr/local/lib/libonnxruntime.so",
             "/usr/lib64/libonnxruntime.so",
+            "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
+            "/usr/lib/aarch64-linux-gnu/libonnxruntime.so",
         ] {
             let p = Path::new(sys);
             if p.is_file() {

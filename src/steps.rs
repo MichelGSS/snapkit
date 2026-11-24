@@ -59,6 +59,8 @@ pub struct Shot {
 pub struct Recorder {
     stop: Arc<AtomicBool>,
     shots: Arc<Mutex<Vec<Shot>>>,
+    panel_rect: Arc<Mutex<Option<PxRect>>>,
+    panel_fg: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -76,7 +78,12 @@ impl Recorder {
     pub fn start(rect: PxRect, own_hwnd: isize, on_shot: impl Fn() + Send + 'static) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let shots = Arc::new(Mutex::new(Vec::new()));
+        // Cache the HUD's rect and foreground flag from the main thread so the polling thread
+        // never calls main-thread-dispatched window APIs (which would deadlock `finish()`/`Drop`).
+        let panel_rect = Arc::new(Mutex::new(platform::window_rect(own_hwnd)));
+        let panel_fg = Arc::new(AtomicBool::new(platform::is_foreground(own_hwnd)));
         let (stop_flag, list) = (stop.clone(), shots.clone());
+        let (panel_rect_c, panel_fg_c) = (panel_rect.clone(), panel_fg.clone());
         let thread = std::thread::spawn(move || {
             let read = || [platform::left_button_down(), platform::right_button_down(), platform::enter_down()];
             // Whatever is already pressed when it starts doesn't count: the click on Start, for
@@ -94,8 +101,8 @@ impl Recorder {
                     _ => continue,
                 };
                 let at = platform::cursor_pos();
-                let on_panel = platform::window_rect(own_hwnd).is_some_and(|panel| contains(panel, at))
-                    || (trigger == Trigger::Enter && platform::is_foreground(own_hwnd));
+                let on_panel = panel_rect_c.lock().unwrap().is_some_and(|panel| contains(panel, at))
+                    || (trigger == Trigger::Enter && panel_fg_c.load(Ordering::Relaxed));
                 // A click has to land in the area; Enter counts when the cursor or active window
                 // overlaps the area.
                 let fg_in_area = platform::foreground_window_rect()
@@ -117,7 +124,13 @@ impl Recorder {
                 }
             }
         });
-        Self { stop, shots, thread: Some(thread) }
+        Self { stop, shots, panel_rect, panel_fg, thread: Some(thread) }
+    }
+
+    /// Updates the cached HUD rectangle and foreground state from the main thread.
+    pub fn update_panel(&self, rect: Option<PxRect>, is_fg: bool) {
+        *self.panel_rect.lock().unwrap() = rect;
+        self.panel_fg.store(is_fg, Ordering::Relaxed);
     }
 
     pub fn count(&self) -> usize {

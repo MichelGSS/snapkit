@@ -1444,8 +1444,8 @@ impl VideoEditor {
                     false,
                 )
                 .on_hover_text(t!(
-                    "Abre o vídeo no reprodutor padrão do Windows com som e taxa máxima de quadros.",
-                    "Opens the video in the default Windows media player with full audio and frame rate."
+                    "Abre o vídeo no reprodutor padrão do sistema com som e taxa máxima de quadros.",
+                    "Opens the video in the default media player with full audio and frame rate."
                 ))
                 .clicked()
                 {

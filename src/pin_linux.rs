@@ -29,10 +29,12 @@ struct PinInner {
     accent_rgb: [u8; 3],
     zoom: f32,
     alpha: f64,
+    scale: f32,
+    active_menu: Option<gtk::Menu>,
 }
 
 impl PinInner {
-    fn new(image: RgbaImage, accent_rgb: [u8; 3]) -> Self {
+    fn new(image: RgbaImage, accent_rgb: [u8; 3], scale: f32) -> Self {
         let mut rgba = Vec::with_capacity(image.as_raw().len());
         for px in image.pixels() {
             let [r, g, b, a] = px.0;
@@ -51,12 +53,20 @@ impl PinInner {
         let h = image.height() as i32;
         let bytes = gtk::glib::Bytes::from_owned(rgba);
         let pixbuf = Pixbuf::from_bytes(&bytes, Colorspace::Rgb, true, 8, w, h, w * 4);
-        Self { image, pixbuf, accent_rgb, zoom: 1.0, alpha: 1.0 }
+        Self {
+            image,
+            pixbuf,
+            accent_rgb,
+            zoom: 1.0,
+            alpha: 1.0,
+            scale: scale.max(0.5),
+            active_menu: None,
+        }
     }
 
     fn window_size(&self) -> (i32, i32) {
-        let iw = ((self.image.width() as f32 * self.zoom).round() as i32).max(MIN_PIN_SIDE);
-        let ih = ((self.image.height() as f32 * self.zoom).round() as i32).max(MIN_PIN_SIDE);
+        let iw = ((self.image.width() as f32 * self.zoom / self.scale).round() as i32).max(MIN_PIN_SIDE);
+        let ih = ((self.image.height() as f32 * self.zoom / self.scale).round() as i32).max(MIN_PIN_SIDE);
         (iw + BORDER_PX * 2, ih + BORDER_PX * 2)
     }
 }
@@ -97,22 +107,36 @@ pub fn spawn(image: RgbaImage, accent_rgb: [u8; 3], at_rect: Option<PxRect>) -> 
     }
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
     platform::run_on_gtk(move || {
-        let mut inner = PinInner::new(image, accent_rgb);
-        let (mut win_w, mut win_h) = inner.window_size();
         let cursor = platform::cursor_pos();
+        let scale = platform::dpi_scale_at(cursor).max(0.5);
+        let mut inner = PinInner::new(image, accent_rgb, scale);
+        let (mut win_w, mut win_h) = inner.window_size();
         let work = platform::work_area_at(cursor).unwrap_or((0, 0, 1920, 1080));
-        let max_w = ((work.2 - work.0) * 85 / 100).max(MIN_PIN_SIDE + BORDER_PX * 2);
-        let max_h = ((work.3 - work.1) * 85 / 100).max(MIN_PIN_SIDE + BORDER_PX * 2);
+        let work_l = (
+            (work.0 as f32 / scale).round() as i32,
+            (work.1 as f32 / scale).round() as i32,
+            (work.2 as f32 / scale).round() as i32,
+            (work.3 as f32 / scale).round() as i32,
+        );
+        let cursor_l = (
+            (cursor.0 as f32 / scale).round() as i32,
+            (cursor.1 as f32 / scale).round() as i32,
+        );
+        let max_w = ((work_l.2 - work_l.0) * 85 / 100).max(MIN_PIN_SIDE + BORDER_PX * 2);
+        let max_h = ((work_l.3 - work_l.1) * 85 / 100).max(MIN_PIN_SIDE + BORDER_PX * 2);
         if at_rect.is_none() && (win_w > max_w || win_h > max_h) {
             let fit = (max_w as f32 / win_w as f32).min(max_h as f32 / win_h as f32).clamp(ZOOM_MIN, 1.0);
             inner.zoom = fit;
             (win_w, win_h) = inner.window_size();
         }
         let (x, y) = match at_rect {
-            Some((l, top, _, _)) => (l - BORDER_PX, top - BORDER_PX),
+            Some((l, top, _, _)) => (
+                (l as f32 / scale).round() as i32 - BORDER_PX,
+                (top as f32 / scale).round() as i32 - BORDER_PX,
+            ),
             None => {
-                let cx = (cursor.0 - win_w / 2).clamp(work.0 + 8, (work.2 - win_w - 8).max(work.0 + 8));
-                let cy = (cursor.1 - win_h / 2).clamp(work.1 + 8, (work.3 - win_h - 8).max(work.1 + 8));
+                let cx = (cursor_l.0 - win_w / 2).clamp(work_l.0 + 8, (work_l.2 - win_w - 8).max(work_l.0 + 8));
+                let cy = (cursor_l.1 - win_h / 2).clamp(work_l.1 + 8, (work_l.3 - win_h - 8).max(work_l.1 + 8));
                 (cx, cy)
             }
         };
@@ -129,6 +153,7 @@ pub fn spawn(image: RgbaImage, accent_rgb: [u8; 3], at_rect: Option<PxRect>) -> 
             gdk::EventMask::BUTTON_PRESS_MASK
                 | gdk::EventMask::BUTTON_RELEASE_MASK
                 | gdk::EventMask::SCROLL_MASK
+                | gdk::EventMask::SMOOTH_SCROLL_MASK
                 | gdk::EventMask::KEY_PRESS_MASK,
         );
 
@@ -190,7 +215,7 @@ pub fn spawn(image: RgbaImage, accent_rgb: [u8; 3], at_rect: Option<PxRect>) -> 
                     }
                     3 => {
                         let menu = gtk::Menu::new();
-                        let copy_item = gtk::MenuItem::with_label(t!("Copiar imagem\tCtrl+C", "Copy image\tCtrl+C"));
+                        let copy_item = gtk::MenuItem::with_label(t!("Copiar imagem (Ctrl+C)", "Copy image (Ctrl+C)"));
                         {
                             let state = state.clone();
                             copy_item.connect_activate(move |_| copy_pin_image(&state.borrow().image));
@@ -225,7 +250,7 @@ pub fn spawn(image: RgbaImage, accent_rgb: [u8; 3], at_rect: Option<PxRect>) -> 
                         }
                         menu.append(&gtk::SeparatorMenuItem::new());
 
-                        let close_item = gtk::MenuItem::with_label(t!("Fechar\tEsc", "Close\tEsc"));
+                        let close_item = gtk::MenuItem::with_label(t!("Fechar (Esc)", "Close (Esc)"));
                         let w = window_weak.clone();
                         close_item.connect_activate(move |_| {
                             if let Some(w) = w.upgrade() {
@@ -233,8 +258,16 @@ pub fn spawn(image: RgbaImage, accent_rgb: [u8; 3], at_rect: Option<PxRect>) -> 
                             }
                         });
                         menu.append(&close_item);
+                        menu.attach_to_widget(win, None);
+                        {
+                            let state = state.clone();
+                            menu.connect_deactivate(move |_| {
+                                state.borrow_mut().active_menu = None;
+                            });
+                        }
                         menu.show_all();
                         menu.popup_at_pointer(Some(ev));
+                        state.borrow_mut().active_menu = Some(menu);
                         gtk::glib::Propagation::Stop
                     }
                     _ => gtk::glib::Propagation::Proceed,

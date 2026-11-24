@@ -256,7 +256,20 @@ fn start_capture(kind: CaptureKind, shared: Arc<Shared>, ctx: egui::Context) {
                     std::thread::sleep(Duration::from_millis(250));
                 }
                 let cursor = shared.include_cursor.load(Ordering::Relaxed);
-                guarded(|| capture::grab_desktop_backdrop(cursor)).ok()
+                match guarded(|| capture::grab_desktop_backdrop(cursor)) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        *shared.pending.lock().unwrap() = Some((CaptureKind::FullScreen, Err(e)));
+                        shared.busy.store(false, Ordering::SeqCst);
+                        if was_on_screen {
+                            shared.window_visible.store(true, Ordering::SeqCst);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
             };
 
             *shared.select_request.lock().unwrap() = Some((kind, title, was_on_screen, backdrop));
@@ -519,11 +532,11 @@ struct App {
     /// macOS: whether SnapKit's icon is in the Dock right now (see `sync_dock_icon`).
     #[cfg(target_os = "macos")]
     dock_visible: bool,
-    /// `shutdown` already ran (it's also called when macOS ends the program with Quit).
-    #[cfg(target_os = "macos")]
+    /// `shutdown` already ran (it's also called when macOS/Linux ends the program without close_requested).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     shut_down: bool,
     /// For `on_exit`, which gets no context.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     egui_ctx: egui::Context,
 }
 
@@ -748,9 +761,9 @@ impl App {
             update_pending: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
             dock_visible: true,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             shut_down: false,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             egui_ctx: cc.egui_ctx.clone(),
         };
         // `snapkit --select` opens straight into region selection (shortcuts and tests).
@@ -761,18 +774,19 @@ impl App {
             Ok(()) => tf!("Pronto. Atalho global: {}", "Ready. Global shortcut: {}", app.cfg.hotkey.label()),
             Err(e) => tf!("Atalho {} indisponível: {e}", "Shortcut {} unavailable: {e}", app.cfg.hotkey.label()),
         };
-        // `--minimized` (Start with Windows): eframe shows the window after the first frame
-        // whatever was asked, so it's kept cloaked, invisible, and hidden right after that.
-        #[cfg(not(target_os = "linux"))]
-        if std::env::args().any(|a| a == autostart::MINIMIZED_ARG) && app.shared.hwnd != 0 {
+        // `--minimized` (Start with system): eframe shows the window after the first frame
+        // whatever was asked, so it's kept cloaked/hidden right after that.
+        if start_hidden && (cfg!(target_os = "linux") || app.shared.hwnd != 0) {
             app.shared.cloaked.store(true, Ordering::SeqCst);
             platform::cloak(app.shared.hwnd, true);
             app.hide_after_start = 2;
             cc.egui_ctx.request_repaint();
         }
         // macOS: without the Screen Recording permission captures only show the wallpaper. The
-        // first time, the system asks; on Windows there's nothing to ask.
-        platform::ensure_screen_permission();
+        // first time, the system asks; skip on `--minimized` login so it doesn't pop at boot.
+        if !start_hidden {
+            platform::ensure_screen_permission();
+        }
         RUNNING.store(true, Ordering::SeqCst);
         app
     }
@@ -1038,6 +1052,11 @@ impl App {
                         "Baixe o .dmg novo e substitua o SnapKit em Aplicativos.",
                         "Download the new .dmg and replace SnapKit in Applications."
                     )
+                } else if cfg!(target_os = "linux") {
+                    t!(
+                        "Baixe a nova versão na página de lançamentos.",
+                        "Download the new version from the releases page."
+                    )
                 } else {
                     t!(
                         "Esta cópia é a portátil (zip): baixe o zip novo e extraia por cima.",
@@ -1285,7 +1304,7 @@ impl App {
                         });
 
                         kit::section_card(ui, t!("Sistema", "System"), |ui| {
-                            let tray_ok = self.tray.is_some() && (!cfg!(target_os = "linux") || self.shared.hwnd != 0);
+                            let tray_ok = self.tray.is_some();
                             let mut close_to_tray = self.cfg.close_to_tray;
                             ui.add_enabled(
                                 tray_ok,
@@ -1560,7 +1579,7 @@ impl App {
     /// Stops any active recording or capture session and finishes writing pending captures before
     /// the program exits.
     fn shutdown(&mut self, ctx: &egui::Context) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             self.shut_down = true;
         }
@@ -2419,7 +2438,12 @@ impl App {
                         platform::reveal(&self.library.path(&entry.file));
                         ui.close();
                     }
-                    if ui.button(t!("Mover para a Lixeira", "Move to Recycle Bin")).clicked() {
+                    let trash_label = if cfg!(windows) {
+                        t!("Mover para a Lixeira", "Move to Recycle Bin")
+                    } else {
+                        t!("Mover para a Lixeira", "Move to Trash")
+                    };
+                    if ui.button(trash_label).clicked() {
                         to_delete = Some(entry.file.clone());
                         ui.close();
                     }
@@ -2494,7 +2518,7 @@ impl App {
         let delete_key = ui.rect_contains_pointer(ui.max_rect())
             && !editing
             && !ctx.egui_wants_keyboard_input()
-            && ctx.input(|i| i.key_pressed(egui::Key::Delete));
+            && ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
         let mut open_after = None;
         if delete_key {
             if !self.selected_files.is_empty() {
@@ -2818,8 +2842,15 @@ impl App {
         std::thread::spawn(move || {
             // Gives the window time to leave full screen before minimizing.
             std::thread::sleep(Duration::from_millis(250));
+            #[cfg(not(target_os = "linux"))]
             if shared.hwnd != 0 {
                 platform::minimize(shared.hwnd);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                shared.window_visible.store(false, Ordering::SeqCst);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.request_repaint();
             }
             std::thread::sleep(Duration::from_millis(450));
             // Frame around the area while the scrolling happens.
@@ -2834,8 +2865,15 @@ impl App {
             });
             // Delivered as "full screen": the image is already finished, with no selection step.
             *shared.pending.lock().unwrap() = Some((CaptureKind::FullScreen, result));
+            #[cfg(not(target_os = "linux"))]
             if shared.hwnd != 0 {
                 platform::show(shared.hwnd);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                shared.window_visible.store(true, Ordering::SeqCst);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             ctx.request_repaint();
         });
@@ -3415,6 +3453,9 @@ impl App {
         let Some(steps) = &mut self.steps else { return };
         ctx.request_repaint_after(Duration::from_millis(250));
         hud_setup(&ctx, hwnd, steps.rect, STEPS_HUD_SIZE, &mut steps.setup_frames);
+        if let Some(recorder) = &steps.recorder {
+            recorder.update_panel(platform::window_rect(hwnd), platform::is_foreground(hwnd));
+        }
 
         let (mut start, mut finish, mut cancel, mut undo) = (false, false, false, false);
         let pal = theme::current_palette(ui.ctx());
@@ -3607,6 +3648,7 @@ impl App {
             }
             #[cfg(target_os = "linux")]
             {
+                shared.window_visible.store(false, Ordering::SeqCst);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 ctx.request_repaint();
             }
@@ -3954,6 +3996,11 @@ impl App {
     /// `put_away`, it leaves the screen at the end without ever appearing; otherwise, it reappears
     /// ready.
     fn settle_window(&mut self, put_away: bool) {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = put_away;
+            return;
+        }
         if self.shared.hwnd == 0 {
             return;
         }
@@ -4052,7 +4099,16 @@ impl App {
         // Checked every frame: the system or winit can put the normal style back meanwhile.
         platform::set_tool_window(hwnd, true);
         #[cfg(not(target_os = "linux"))]
-        let covering = platform::window_rect(hwnd) == Some(desktop);
+        let covering = platform::window_rect(hwnd).is_some_and(|r| {
+            if cfg!(target_os = "macos") {
+                (r.0 - desktop.0).abs() <= 2
+                    && (r.1 - desktop.1).abs() <= 2
+                    && (r.2 - desktop.2).abs() <= 2
+                    && (r.3 - desktop.3).abs() <= 2
+            } else {
+                r == desktop
+            }
+        });
         #[cfg(target_os = "linux")]
         let covering = true;
         #[cfg(not(target_os = "linux"))]
@@ -5545,7 +5601,7 @@ impl eframe::App for App {
                     }
                 }
                 self.leave_pano_hud(&ctx);
-            } else if self.cfg.close_to_tray && self.tray.is_some() && self.shared.hwnd != 0 {
+            } else if self.cfg.close_to_tray && self.tray.is_some() && (cfg!(target_os = "linux") || self.shared.hwnd != 0) {
                 // Closing with the X only hides the window when there's a tray to bring it back.
                 self.flush_autosave(&ctx);
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -5606,10 +5662,10 @@ impl eframe::App for App {
         self.sync_dock_icon();
     }
 
-    /// macOS: Quit in the app menu (⌘Q) ends the event loop without a close request, and the
-    /// process exits right after; what closing does (finish a recording, save the open capture)
-    /// still has to happen.
-    #[cfg(target_os = "macos")]
+    /// macOS/Linux: Quit via the app menu or WM close ends the event loop without a close
+    /// request, and the process exits right after; what closing does (finish a recording, save
+    /// the open capture) still has to happen.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if !self.shut_down {
             let ctx = self.egui_ctx.clone();
@@ -5740,27 +5796,80 @@ fn format_duration_short(secs: f32) -> String {
     format!("{:02}:{:02}", total / 60, total % 60)
 }
 
+#[cfg(target_os = "linux")]
+fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>) -> Result<T, String> {
+    static CLIPBOARD: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
+    let lock = CLIPBOARD.get_or_init(|| Mutex::new(None));
+    let mut guard = lock.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+    }
+    f(guard.as_mut().unwrap()).map_err(|e| e.to_string())
+}
+
 fn copy_to_clipboard(img: &RgbaImage) -> Result<(), String> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-    clipboard
-        .set_image(arboard::ImageData {
-            width: img.width() as usize,
-            height: img.height() as usize,
-            bytes: std::borrow::Cow::Borrowed(img.as_raw()),
-        })
-        .map_err(|e| e.to_string())
+    let data = arboard::ImageData {
+        width: img.width() as usize,
+        height: img.height() as usize,
+        bytes: std::borrow::Cow::Borrowed(img.as_raw()),
+    };
+    #[cfg(target_os = "linux")]
+    {
+        return with_clipboard(|c| c.set_image(data));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+        clipboard.set_image(data).map_err(|e| e.to_string())
+    }
 }
 
 fn copy_text(text: &str) -> Result<(), String> {
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.set_text(text.to_owned()))
-        .map_err(|e| e.to_string())
+    #[cfg(target_os = "linux")]
+    {
+        return with_clipboard(|c| c.set_text(text.to_owned()));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        arboard::Clipboard::new()
+            .and_then(|mut c| c.set_text(text.to_owned()))
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn run_self_check() {
+    println!("snapkit {} ({}/{})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    match record::find_ffmpeg() {
+        Some(ffmpeg) => {
+            println!("ffmpeg: {}", ffmpeg.display());
+            println!("h264_encoder: {}", record::preferred_h264_encoder(&ffmpeg));
+        }
+        None => {
+            println!("ffmpeg: none");
+            println!("h264_encoder: none");
+        }
+    }
+    let mut ocr_engines = Vec::new();
+    if cfg!(target_os = "macos") {
+        ocr_engines.push("vision");
+    }
+    if ocr::has_printed_engine() {
+        ocr_engines.push("printed");
+    }
+    if neural::find_models().is_some() {
+        ocr_engines.push("neural");
+    }
+    println!("ocr: {}", if ocr_engines.is_empty() { "none".to_owned() } else { ocr_engines.join(",") });
 }
 
 fn main() -> eframe::Result {
     platform::enable_per_monitor_dpi();
-    // Self-test mode: `snapkit --test-capture output.png` captures the screen and exits.
+    // Self-test mode: `snapkit --self-check` or `snapkit --test-capture output.png`.
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--self-check") {
+        run_self_check();
+        return Ok(());
+    }
     if args.len() == 3 && args[1] == "--test-capture" {
         match capture::capture_monitor_at_cursor(0, true) {
             Ok(shot) => {
@@ -5828,6 +5937,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
+            .with_app_id("io.github.michelgss.snapkit")
             .with_icon(icon)
             .with_visible(!start_hidden)
             // Region selection uses this same window as a transparent layer over the screen.

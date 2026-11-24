@@ -9,6 +9,10 @@ use crate::icons::{self, Icon};
 use crate::render::{self, CalloutStyle, Handle, Op, Point, Rgba, Stamp, StepGlyph, StepShape};
 use crate::{theme, ui as kit};
 
+fn cmd_key(key: &str) -> String {
+    if cfg!(target_os = "macos") { format!("⌘{key}") } else { format!("Ctrl {key}") }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Tool {
     /// Picks an existing annotation to move, resize, change or delete.
@@ -1111,24 +1115,27 @@ impl Editor {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 if kit::small_ghost_button(ui, None, "100%", false)
-                    .on_hover_text(t!("Tamanho real (Ctrl 1)", "Actual size (Ctrl 1)"))
+                    .on_hover_text(tf!("Tamanho real ({})", "Actual size ({})", cmd_key("1")))
                     .clicked()
                 {
                     self.set_zoom(1.0);
                 }
                 if kit::small_ghost_button(ui, None, t!("Ajustar", "Fit"), self.zoom.is_none())
-                    .on_hover_text(t!(
-                        "Imagem inteira na janela (Ctrl 0)",
-                        "Whole image in the window (Ctrl 0)"
+                    .on_hover_text(tf!(
+                        "Imagem inteira na janela ({})",
+                        "Whole image in the window ({})",
+                        cmd_key("0")
                     ))
                     .clicked()
                 {
                     self.zoom_to_fit();
                 }
                 if kit::small_ghost_button(ui, None, "+", false)
-                    .on_hover_text(t!(
-                        "Aumentar (Ctrl + ou Ctrl e a roda do mouse)",
-                        "Zoom in (Ctrl + or Ctrl and the mouse wheel)"
+                    .on_hover_text(tf!(
+                        "Aumentar ({} ou {} e a roda do mouse)",
+                        "Zoom in ({} or {} and the mouse wheel)",
+                        cmd_key("+"),
+                        if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }
                     ))
                     .clicked()
                 {
@@ -1140,7 +1147,7 @@ impl Editor {
                         .color(pal.text_primary),
                 );
                 if kit::small_ghost_button(ui, None, "−", false)
-                    .on_hover_text(t!("Diminuir (Ctrl -)", "Zoom out (Ctrl -)"))
+                    .on_hover_text(tf!("Diminuir ({})", "Zoom out ({})", cmd_key("-")))
                     .clicked()
                 {
                     self.set_zoom(self.view_scale / ZOOM_STEP);
@@ -1253,7 +1260,7 @@ impl Editor {
         kit::ghost_menu_button(ui, Some(Icon::ImageOps), t!("Imagem", "Image"), |ui| {
             ui.set_min_width(250.0);
             if ui
-                .button(t!("Colar imagem como camada (Ctrl V)", "Paste image as layer (Ctrl V)"))
+                .button(tf!("Colar imagem como camada ({})", "Paste image as layer ({})", cmd_key("V")))
                 .on_hover_text(t!(
                     "Cola a imagem da área de transferência sobre o quadro atual como um objeto editável.",
                     "Pastes the clipboard image onto the canvas as an editable object."
@@ -1454,7 +1461,7 @@ impl Editor {
             if ui
                 .add_enabled_ui(self.history.can_undo(), |ui| kit::icon_button(ui, Icon::Undo, false, 26.0))
                 .inner
-                .on_hover_text(t!("Desfazer (Ctrl Z)", "Undo (Ctrl Z)"))
+                .on_hover_text(tf!("Desfazer ({})", "Undo ({})", cmd_key("Z")))
                 .clicked()
             {
                 self.undo();
@@ -1462,7 +1469,7 @@ impl Editor {
             if ui
                 .add_enabled_ui(self.history.can_redo(), |ui| kit::icon_button(ui, Icon::Redo, false, 26.0))
                 .inner
-                .on_hover_text(t!("Refazer (Ctrl Y)", "Redo (Ctrl Y)"))
+                .on_hover_text(tf!("Refazer ({})", "Redo ({})", cmd_key("Y")))
                 .clicked()
             {
                 self.redo();
@@ -1586,7 +1593,7 @@ impl Editor {
                     }
                 }
                 if kit::small_ghost_button(ui, Some(Icon::Duplicate), t!("Duplicar", "Duplicate"), false)
-                    .on_hover_text("Ctrl D")
+                    .on_hover_text(cmd_key("D"))
                     .clicked()
                 {
                     multi_dup = true;
@@ -1650,7 +1657,7 @@ impl Editor {
                             self.reorder(i, false, true);
                         }
                         if kit::small_ghost_button(ui, Some(Icon::Duplicate), t!("Duplicar", "Duplicate"), false)
-                            .on_hover_text("Ctrl D")
+                            .on_hover_text(cmd_key("D"))
                             .clicked()
                         {
                             let ctx = ui.ctx().clone();
@@ -1821,7 +1828,7 @@ impl Editor {
         if ui
             .add_enabled_ui(self.history.can_undo(), |ui| kit::icon_button(ui, Icon::Undo, false, 25.0))
             .inner
-            .on_hover_text(t!("Desfazer (Ctrl Z)", "Undo (Ctrl Z)"))
+            .on_hover_text(tf!("Desfazer ({})", "Undo ({})", cmd_key("Z")))
             .clicked()
         {
             self.undo();

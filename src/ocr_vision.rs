@@ -44,6 +44,12 @@ const WHOLE_LINE: f64 = 0.95;
 
 /// Recognizes the words in `img`, with their boxes in `img` pixels.
 pub fn recognize(img: &RgbaImage) -> Result<Vec<WordBox>, String> {
+    recognize_with_options(img, true)
+}
+
+/// Recognizes the words in `img`, with their boxes in `img` pixels, configuring Vision's
+/// language correction.
+pub fn recognize_with_options(img: &RgbaImage, language_correction: bool) -> Result<Vec<WordBox>, String> {
     if img.width() == 0 || img.height() == 0 {
         return Ok(Vec::new());
     }
@@ -54,7 +60,7 @@ pub fn recognize(img: &RgbaImage) -> Result<Vec<WordBox>, String> {
     for (top, bottom) in crate::ocr::split_rows(&prepared, TILE_HEIGHT) {
         let tile = image::imageops::crop_imm(&prepared, 0, top, prepared.width(), bottom - top).to_image();
         // Vision's objects are autoreleased; without a pool they would pile up on this thread.
-        let lines = autoreleasepool(|_| recognize_lines(&tile))?;
+        let lines = autoreleasepool(|_| recognize_lines(&tile, language_correction))?;
         let (tw, th) = (tile.width() as f64, tile.height() as f64);
         for (text, line_box, measure) in lines {
             for (word, norm) in line_words(&text, line_box, |r| measure.get(&r).copied().flatten()) {
@@ -82,13 +88,13 @@ impl Measured {
 }
 
 /// Runs Vision on one image: for each line, its text, its box and the boxes of its words.
-fn recognize_lines(img: &RgbaImage) -> Result<Vec<(String, Norm, Measured)>, String> {
+fn recognize_lines(img: &RgbaImage, language_correction: bool) -> Result<Vec<(String, Norm, Measured)>, String> {
     let cg = cg_image(img).ok_or_else(|| t!("não foi possível preparar a imagem", "could not prepare the image").to_owned())?;
     let min_height = (MIN_TEXT_PX / img.height() as f32).min(DEFAULT_MIN_TEXT);
-    let request = match perform(&cg, min_height, true) {
+    let request = match perform(&cg, min_height, true, language_correction) {
         Ok(request) => request,
         // Older systems don't know every language in the list; their default still reads English.
-        Err(_) => perform(&cg, min_height, false)?,
+        Err(_) => perform(&cg, min_height, false, language_correction)?,
     };
     let Some(results) = request.results() else { return Ok(Vec::new()) };
     let mut lines = Vec::new();
@@ -113,10 +119,15 @@ fn recognize_lines(img: &RgbaImage) -> Result<Vec<(String, Norm, Measured)>, Str
 }
 
 /// Builds and runs the text request on `cg`.
-fn perform(cg: &CGImage, min_height: f32, languages: bool) -> Result<Retained<VNRecognizeTextRequest>, String> {
+fn perform(
+    cg: &CGImage,
+    min_height: f32,
+    languages: bool,
+    language_correction: bool,
+) -> Result<Retained<VNRecognizeTextRequest>, String> {
     let request = VNRecognizeTextRequest::new();
     request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
-    request.setUsesLanguageCorrection(true);
+    request.setUsesLanguageCorrection(language_correction);
     request.setMinimumTextHeight(min_height);
     if languages {
         let list: Vec<Retained<NSString>> = LANGUAGES.iter().map(|l| NSString::from_str(l)).collect();
@@ -377,5 +388,56 @@ mod tests {
         // The second line is below the first.
         let y_of = |t: &str| words.iter().find(|w| w.text.to_lowercase() == t).map(|w| w.y).unwrap();
         assert!(y_of("segunda") > y_of("recorte") + 40.0, "words read: {words:?}");
+    }
+
+    #[test]
+    fn vision_reads_portuguese_diacritics() {
+        use crate::render::{self, Op};
+        let mut img = RgbaImage::from_pixel(700, 160, image::Rgba([24, 26, 31, 255]));
+        let font = crate::editor::default_font();
+        let op = Op::Text {
+            pos: (30.0, 40.0),
+            text: "ação configuração".into(),
+            color: [230, 230, 230, 255],
+            size: 44.0,
+            boxed: false,
+            angle: 0.0,
+        };
+        render::apply(&mut img, &op, &font);
+        let words = recognize_with_options(&img, true).unwrap();
+        let text: Vec<String> = words.iter().map(|w| w.text.to_lowercase()).collect();
+        assert!(
+            text.iter().any(|t| t == "ação") && text.iter().any(|t| t == "configuração"),
+            "words read: {words:?}"
+        );
+    }
+
+    #[test]
+    fn vision_reads_multi_tile_tall_image() {
+        use crate::render::{self, Op};
+        let mut img = RgbaImage::from_pixel(700, 2600, image::Rgba([24, 26, 31, 255]));
+        let font = crate::editor::default_font();
+        for (y, text) in [(100.0, "topo"), (2300.0, "fundo")] {
+            let op = Op::Text {
+                pos: (40.0, y),
+                text: text.into(),
+                color: [230, 230, 230, 255],
+                size: 48.0,
+                boxed: false,
+                angle: 0.0,
+            };
+            render::apply(&mut img, &op, &font);
+        }
+        let words = recognize(&img).unwrap();
+        let y_of = |needle: &str| {
+            words
+                .iter()
+                .find(|w| w.text.eq_ignore_ascii_case(needle))
+                .map(|w| w.y)
+        };
+        let top_y = y_of("topo").unwrap_or_else(|| panic!("missing 'topo' in {words:?}"));
+        let bottom_y = y_of("fundo").unwrap_or_else(|| panic!("missing 'fundo' in {words:?}"));
+        assert!(top_y < 300.0, "top_y={top_y}");
+        assert!(bottom_y > 2200.0, "bottom_y={bottom_y}");
     }
 }

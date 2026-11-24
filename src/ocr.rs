@@ -154,7 +154,7 @@ pub fn recognize_boxes(img: &RgbaImage) -> Result<Vec<WordBox>, String> {
     #[cfg(not(target_os = "macos"))]
     let mut last_err = None;
     #[cfg(target_os = "macos")]
-    let mut last_err = match crate::ocr_vision::recognize(img) {
+    let mut last_err = match crate::ocr_vision::recognize_with_options(img, false) {
         Ok(words) => return Ok(words),
         Err(e) => Some(e),
     };
@@ -179,6 +179,10 @@ pub fn recognize_boxes(img: &RgbaImage) -> Result<Vec<WordBox>, String> {
         "no OCR engine found (tesseract and ocr-neural folders)"
     )
     .to_owned())
+}
+
+pub fn has_printed_engine() -> bool {
+    find_tesseract().is_some()
 }
 
 /// Scans `img` locally with OCR and returns `(x1, y1, x2, y2)` pixel rectangles covering sensitive
@@ -539,9 +543,7 @@ fn find_tesseract() -> Option<TesseractInstall> {
     if let Some(dir) = std::env::var_os("SNAPKIT_TESSERACT_DIR") {
         candidates.push(PathBuf::from(dir));
     }
-    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
-        candidates.push(exe_dir.join("tesseract"));
-    }
+    candidates.extend(crate::platform::bundled_helper_dirs("tesseract"));
     // During development the binaries are in `vendor/tesseract` (see scripts/fetch-tesseract.ps1).
     #[cfg(debug_assertions)]
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor").join("tesseract"));
@@ -563,12 +565,16 @@ fn find_tesseract() -> Option<TesseractInstall> {
                 let p = PathBuf::from("/usr/bin/tesseract");
                 p.is_file().then_some(p)
             })?;
-        let tessdata = candidates
+        let env_tessdata = std::env::var_os("TESSDATA_PREFIX")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let tessdata = env_tessdata
             .into_iter()
-            .map(|d| d.join("tessdata"))
+            .chain(candidates.into_iter().map(|d| d.join("tessdata")))
             .chain(
                 [
                     "/usr/share/tessdata",
+                    "/usr/local/share/tessdata",
                     "/usr/share/tesseract-ocr/5/tessdata",
                     "/usr/share/tesseract-ocr/4.00/tessdata",
                 ]
